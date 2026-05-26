@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "VK Multi Audio Upload",
+  "version": "1.0",
+  "description": "Drag & drop и мультизагрузка музыки во ВКонтакте",
+  "content_scripts": [
+    {
+      "matches": ["https://vk.com/*"],
+      "js": ["content.js"],
+      "css": ["style.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["injected.js"],
+      "matches": ["https://vk.com/*"]
+    }
+  ]
+}
