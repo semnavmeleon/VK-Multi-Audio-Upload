@@ -13,7 +13,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected.js"],
+      "resources": ["injected.js", "done.gif"],
       "matches": ["https://vk.com/*"]
     }
   ]

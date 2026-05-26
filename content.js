@@ -202,10 +202,35 @@
     if (!isProcessing) processQueue();
   }
 
+  function showCompletionGif() {
+    const existing = document.getElementById('vmu-gif-overlay');
+    if (existing) existing.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'vmu-gif-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:999999;display:flex;align-items:center;justify-content:center;cursor:pointer;';
+
+    const img = document.createElement('img');
+    img.src = chrome.runtime.getURL('done.gif');
+    img.style.cssText = 'max-width:80vw;max-height:80vh;border-radius:8px;pointer-events:none;';
+    overlay.appendChild(img);
+    document.body.appendChild(overlay);
+
+    const dismiss = () => overlay.remove();
+    overlay.addEventListener('click', dismiss);
+    setTimeout(dismiss, 4000);
+  }
+
   async function processQueue() {
     if (isProcessing) return;
     const next = fileQueue.find(f => f.status === 'pending');
-    if (!next) { renderQueue(); return; }
+    if (!next) {
+      renderQueue();
+      if (fileQueue.length > 0 && !fileQueue.some(f => f.status === 'uploading')) {
+        showCompletionGif();
+      }
+      return;
+    }
 
     isProcessing = true;
     next.status = 'uploading';
