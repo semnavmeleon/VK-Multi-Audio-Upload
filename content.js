@@ -1,60 +1,52 @@
 (function () {
   'use strict';
 
-  // ─── inject page-context XHR interceptor + file injector ────────────────────
+  // ─── inject page-context script ──────────────────────────────────────────────
   const s = document.createElement('script');
   s.src = chrome.runtime.getURL('injected.js');
   document.documentElement.prepend(s);
   s.onload = () => s.remove();
 
   // ─── icons ───────────────────────────────────────────────────────────────────
-  const ICON_TRIGGER = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  const ICON_TRIGGER = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none">
     <path d="M12 4v11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
     <path d="M8.5 7.5L12 4l3.5 3.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
     <path d="M4 17.5h16" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
     <path d="M7 21h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
   </svg>`;
-
   const ICON_UPLOAD = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
     <path d="M7 1v8M4.5 3.5L7 1l2.5 2.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
     <path d="M2 10.5v1.5a1 1 0 001 1h8a1 1 0 001-1v-1.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
   </svg>`;
-
   const ICON_CLOSE = `<svg width="12" height="12" viewBox="0 0 12 12" fill="none">
     <path d="M1.5 1.5l9 9M10.5 1.5l-9 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
   </svg>`;
-
+  const ICON_SETTINGS = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+    <circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.4"/>
+    <path d="M8 1v1.5M8 13.5V15M15 8h-1.5M2.5 8H1M12.36 3.64l-1.06 1.06M4.7 11.3l-1.06 1.06M12.36 12.36l-1.06-1.06M4.7 4.7L3.64 3.64" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  </svg>`;
   const STATUS_ICON = {
-    pending: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <circle cx="7" cy="7" r="5.5" stroke="#555" stroke-width="1.3"/>
-      <rect x="5" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/>
-      <rect x="7.6" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/>
-    </svg>`,
-    uploading: `<svg class="vmu-spin" width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <circle cx="7" cy="7" r="5.5" stroke="rgba(38,136,235,0.2)" stroke-width="1.5"/>
-      <path d="M7 1.5A5.5 5.5 0 0112.5 7" stroke="#2688eb" stroke-width="1.5" stroke-linecap="round"/>
-    </svg>`,
-    done: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <circle cx="7" cy="7" r="5.5" fill="rgba(75,179,75,0.14)" stroke="#4bb34b" stroke-width="1.3"/>
-      <path d="M4.5 7l2 2 3-3" stroke="#4bb34b" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>`,
-    error: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-      <circle cx="7" cy="7" r="5.5" fill="rgba(230,70,70,0.12)" stroke="#e64646" stroke-width="1.3"/>
-      <path d="M5 5l4 4M9 5l-4 4" stroke="#e64646" stroke-width="1.3" stroke-linecap="round"/>
-    </svg>`,
+    pending: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="#555" stroke-width="1.3"/><rect x="5" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/><rect x="7.6" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/></svg>`,
+    uploading: `<svg class="vmu-spin" width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="rgba(38,136,235,0.2)" stroke-width="1.5"/><path d="M7 1.5A5.5 5.5 0 0112.5 7" stroke="#2688eb" stroke-width="1.5" stroke-linecap="round"/></svg>`,
+    done: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" fill="rgba(75,179,75,0.14)" stroke="#4bb34b" stroke-width="1.3"/><path d="M4.5 7l2 2 3-3" stroke="#4bb34b" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+    error: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" fill="rgba(230,70,70,0.12)" stroke="#e64646" stroke-width="1.3"/><path d="M5 5l4 4M9 5l-4 4" stroke="#e64646" stroke-width="1.3" stroke-linecap="round"/></svg>`,
   };
 
   // ─── state ───────────────────────────────────────────────────────────────────
   let fileQueue = [];
   let isProcessing = false;
   let uploadDoneCallback = null;
+  let autoPlaylistRunning = false;
 
-  // messages from injected.js
   window.addEventListener('message', (e) => {
     if (e.source !== window) return;
     if (e.data?.type === 'VK_UPLOAD_DONE' && uploadDoneCallback) {
       uploadDoneCallback(e.data);
       uploadDoneCallback = null;
+    }
+    if (e.data?.type === 'VK_COVER_DONE' && window.__vmuCoverCallback) {
+      window.__vmuCoverCallback(e.data);
+      window.__vmuCoverCallback = null;
     }
   });
 
@@ -62,6 +54,7 @@
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const isMP3 = (f) => f.type === 'audio/mpeg' || f.name.toLowerCase().endsWith('.mp3');
   const fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
+  const escHtml = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
   function getVkBtn() {
     return document.querySelector('[aria-label="Загрузить аудиозапись"]');
@@ -80,6 +73,548 @@
     });
   }
 
+  // ─── settings ────────────────────────────────────────────────────────────────
+  const SETTINGS_KEY = 'vmu_settings_v2';
+  let settings = { autoPlaylist: false, coverDataUrl: null };
+
+  function loadSettings() {
+    try {
+      const s = localStorage.getItem(SETTINGS_KEY);
+      if (s) Object.assign(settings, JSON.parse(s));
+    } catch {}
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+        autoPlaylist: settings.autoPlaylist,
+        coverDataUrl: settings.coverDataUrl,
+      }));
+    } catch {}
+  }
+
+  loadSettings();
+
+  // ─── ID3 tag reader ───────────────────────────────────────────────────────────
+  async function readID3(file) {
+    try {
+      const buf = await file.slice(0, 131072).arrayBuffer();
+      const v = new Uint8Array(buf);
+      if (v[0] !== 73 || v[1] !== 68 || v[2] !== 51) return {};
+      const ver = v[3];
+      const hasExt = !!(v[5] & 0x40);
+      const tagSize = ((v[6]&0x7f)<<21)|((v[7]&0x7f)<<14)|((v[8]&0x7f)<<7)|(v[9]&0x7f);
+      let p = 10;
+      if (hasExt) p += ((v[p]<<24)|(v[p+1]<<16)|(v[p+2]<<8)|v[p+3]) + 4;
+      const end = Math.min(10 + tagSize, v.length);
+      const tags = {};
+      while (p < end - 10 && v[p]) {
+        const id = String.fromCharCode(v[p],v[p+1],v[p+2],v[p+3]);
+        const sz = ver >= 4
+          ? ((v[p+4]&0x7f)<<21)|((v[p+5]&0x7f)<<14)|((v[p+6]&0x7f)<<7)|(v[p+7]&0x7f)
+          : (v[p+4]<<24)|(v[p+5]<<16)|(v[p+6]<<8)|v[p+7];
+        p += 10;
+        if (sz > 0 && sz < 32768 && id[0] === 'T') {
+          const enc = v[p];
+          const bytes = v.slice(p+1, p+sz);
+          try {
+            tags[id] = new TextDecoder(
+              enc === 0 ? 'iso-8859-1' : enc === 3 ? 'utf-8' : 'utf-16'
+            ).decode(bytes).replace(/\0/g,'').trim();
+          } catch {
+            tags[id] = new TextDecoder('utf-8',{fatal:false}).decode(bytes).replace(/\0/g,'').trim();
+          }
+        }
+        p += Math.max(0, sz);
+      }
+      return tags;
+    } catch { return {}; }
+  }
+
+  // ─── cover compositor ─────────────────────────────────────────────────────────
+  function makePerezalitoCover(coverDataUrl) {
+    return new Promise(resolve => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1000; canvas.height = 1000;
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, 1000, 1000);
+        ctx.save();
+        ctx.translate(500, 500);
+        ctx.rotate(-Math.PI / 4);
+        ctx.font = 'bold italic 132px Georgia,"Times New Roman",serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.shadowColor = 'rgba(0,0,0,0.55)';
+        ctx.shadowBlur = 12;
+        ctx.fillStyle = 'rgba(230,0,0,0.92)';
+        ctx.fillText('перезалито', 0, 0);
+        ctx.restore();
+        canvas.toBlob(resolve, 'image/jpeg', 0.92);
+      };
+      img.onerror = () => resolve(null);
+      img.src = coverDataUrl;
+    });
+  }
+
+  // ─── VK API ───────────────────────────────────────────────────────────────────
+  const VK_CLIENT_ID = '6287487';
+
+  function getVkToken() {
+    try {
+      return JSON.parse(localStorage.getItem(`${VK_CLIENT_ID}:web_token:login:auth`) || '{}').access_token || null;
+    } catch { return null; }
+  }
+
+  function getVkUserId() {
+    try {
+      for (const k of Object.keys(localStorage)) {
+        if (k.startsWith('audio_v21_track_')) {
+          const id = k.slice('audio_v21_track_'.length);
+          if (/^\d+$/.test(id)) return id;
+        }
+      }
+    } catch {}
+    const m = location.href.match(/audios(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  async function vkApi(method, params) {
+    const token = getVkToken();
+    if (!token) throw new Error('VK-токен не найден — перезайдите в аккаунт');
+    const body = new URLSearchParams({ v: '5.131', access_token: token, ...params });
+    const res = await fetch(`https://api.vk.com/method/${method}`, { method: 'POST', body });
+    const data = await res.json();
+    if (data.error) throw new Error(`${method}: ${data.error.error_msg} (${data.error.error_code})`);
+    return data.response;
+  }
+
+  // ─── auto-playlist: get audio IDs after upload ────────────────────────────────
+  async function getRecentAudioIds(count, ownerId) {
+    await sleep(3000);
+    const data = await vkApi('audio.get', {
+      owner_id: ownerId,
+      count: String(count + 15),
+      offset: '0',
+    });
+    const items = data.items || [];
+    // audio.get returns newest-added first → uploading A,B,C gives [C,B,A]
+    // Reverse to restore upload order [A,B,C] for correct playlist order
+    return items.slice(0, count).reverse().map(a => `${ownerId}_${a.id}`);
+  }
+
+  // ─── cover upload via VK dialog ───────────────────────────────────────────────
+  async function uploadCoverViaDialog(coverBlob) {
+    const buf = await coverBlob.arrayBuffer();
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        window.__vmuCoverCallback = null;
+        reject(new Error('Timeout загрузки обложки'));
+      }, 45000);
+      window.__vmuCoverCallback = (data) => {
+        clearTimeout(t);
+        data.ok ? resolve() : reject(new Error(data.error || 'Ошибка обложки'));
+      };
+      window.postMessage({ type: 'VK_UPLOAD_COVER', buffer: buf }, '*', [buf]);
+    });
+  }
+
+  // Try to upload cover via VK photos API then editPlaylist
+  async function uploadCoverViaApi(ownerId, playlistId, coverBlob) {
+    const serverData = await vkApi('photos.getWallUploadServer', { user_id: ownerId });
+    const fd = new FormData();
+    fd.append('photo', coverBlob, 'cover.jpg');
+    const uploadRes = await fetch(serverData.upload_url, { method: 'POST', body: fd });
+    const uploadData = await uploadRes.json();
+    if (!uploadData.photo) throw new Error('Ошибка загрузки фото');
+    const saved = await vkApi('photos.saveWallPhoto', {
+      user_id: ownerId,
+      server: uploadData.server,
+      photo: uploadData.photo,
+      hash: uploadData.hash,
+    });
+    if (!saved[0]) throw new Error('Ошибка сохранения фото');
+    const photoRef = `photo${saved[0].owner_id}_${saved[0].id}`;
+    await vkApi('audio.editPlaylist', {
+      owner_id: ownerId,
+      playlist_id: String(playlistId),
+      photo: photoRef,
+    });
+  }
+
+  // ─── status helpers ───────────────────────────────────────────────────────────
+  function setPlaylistStatus(text, isError) {
+    const el = document.getElementById('vmu-pl-status');
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = isError ? '#e64646' : '#4bb34b';
+    el.style.display = text ? 'block' : 'none';
+  }
+
+  // ─── auto-playlist flow ───────────────────────────────────────────────────────
+  async function runAutoPlaylist(uploadedItems) {
+    const done = uploadedItems.filter(i => i.status === 'done');
+    if (!done.length) return;
+
+    const ownerId = getVkUserId();
+    if (!ownerId) { setPlaylistStatus('Ошибка: ID пользователя не найден', true); return; }
+
+    setPlaylistStatus('Читаем метаданные…');
+
+    try {
+      const tagsList = done.map(i => i.tags || {});
+
+      const albums = [...new Set(tagsList.map(t => t.TALB).filter(Boolean))];
+      const artists = [...new Set([
+        ...tagsList.map(t => t.TPE2).filter(Boolean),
+        ...tagsList.map(t => t.TPE1).filter(Boolean),
+      ])].slice(0, 5);
+
+      const title = albums[0]
+        || tagsList[0]?.TIT2
+        || done[0].file.name.replace(/\.mp3$/i, '')
+        || 'Плейлист';
+      const descLine = artists.length ? artists.join(', ') + '\n' : '';
+      const description = descLine + 'человек паук поможет каждому [vk.com/reuploadunder]';
+
+      setPlaylistStatus('Создаём плейлист…');
+      const playlist = await vkApi('audio.createPlaylist', {
+        owner_id: ownerId,
+        title: title.slice(0, 255),
+        description: description.slice(0, 1000),
+      });
+
+      setPlaylistStatus('Получаем ID треков…');
+      const audioIds = await getRecentAudioIds(done.length, ownerId);
+
+      if (audioIds.length) {
+        setPlaylistStatus(`Добавляем ${audioIds.length} треков…`);
+        await vkApi('audio.addToPlaylist', {
+          owner_id: ownerId,
+          playlist_id: String(playlist.id),
+          audio_ids: audioIds.join(','),
+        });
+      }
+
+      if (settings.coverDataUrl) {
+        setPlaylistStatus('Загружаем обложку…');
+        try {
+          const coverBlob = await makePerezalitoCover(settings.coverDataUrl);
+          if (coverBlob) {
+            // Try API approach first, fall back to dialog inject
+            try {
+              await uploadCoverViaApi(ownerId, playlist.id, coverBlob);
+            } catch {
+              // For dialog approach, open the playlist edit
+              // Reload playlist section and try via dialog
+              await openAndInjectCover(ownerId, playlist.id, coverBlob);
+            }
+          }
+        } catch (ce) {
+          console.warn('[VKU] Cover:', ce.message);
+          setPlaylistStatus(`✓ Плейлист «${title.slice(0,25)}» создан (обложку установите вручную)`);
+          return;
+        }
+      }
+
+      setPlaylistStatus(`✓ Плейлист «${title.slice(0,30)}» создан!`);
+    } catch (err) {
+      setPlaylistStatus(`Ошибка: ${err.message}`, true);
+      console.error('[VK Multi Upload]', err);
+    }
+  }
+
+  async function openAndInjectCover(ownerId, playlistId, coverBlob) {
+    // Navigate to force playlist list reload
+    const targetUrl = `https://vk.com/audios${ownerId}?section=all&block=my_playlists`;
+    if (location.href !== targetUrl) {
+      history.pushState(null, '', targetUrl);
+      await sleep(1500);
+    }
+
+    // Find the edit button for our newly created playlist
+    // VK playlist items sometimes have the playlist ID in their links
+    let editBtn = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      editBtn = findPlaylistEditBtn(playlistId);
+      if (editBtn) break;
+      await sleep(700);
+    }
+
+    if (!editBtn) {
+      throw new Error('Кнопка редактирования плейлиста не найдена');
+    }
+
+    editBtn.click();
+    await sleep(800);
+
+    const coverEl = await waitForElement('.ape_cover', 3000);
+    if (!coverEl) throw new Error('.ape_cover не найден в диалоге');
+
+    await uploadCoverViaDialog(coverBlob);
+  }
+
+  function findPlaylistEditBtn(playlistId) {
+    // Look for edit buttons near elements referencing our playlist ID
+    const allLinks = document.querySelectorAll(`[href*="_${playlistId}"], [data-id="${playlistId}"], [data-playlist-id="${playlistId}"]`);
+    for (const el of allLinks) {
+      let parent = el;
+      for (let i = 0; i < 6; i++) {
+        parent = parent.parentElement;
+        if (!parent) break;
+        const btn = parent.querySelector('button');
+        if (btn && (btn.textContent.includes('едактир') || btn.getAttribute('aria-label')?.includes('edit'))) {
+          return btn;
+        }
+      }
+    }
+    return null;
+  }
+
+  // ─── duplicate finder ─────────────────────────────────────────────────────────
+  function getPlaylistInfoFromUrl() {
+    const url = location.href;
+    const m1 = url.match(/playlist\/([-\d]+)_(\d+)/);
+    if (m1) return { ownerId: m1[1], playlistId: m1[2] };
+    const m2 = url.match(/playlist_id=(\d+)/);
+    const m3 = url.match(/[?&]owner_id=([-\d]+)/);
+    if (m2 && m3) return { ownerId: m3[1], playlistId: m2[1] };
+    return null;
+  }
+
+  async function scanForDuplicates() {
+    const pl = getPlaylistInfoFromUrl();
+    if (!pl) {
+      setPlaylistStatus('Перейдите на страницу плейлиста для поиска дубликатов', true);
+      return;
+    }
+
+    setPlaylistStatus('Загружаем треки плейлиста…');
+
+    try {
+      const all = [];
+      let offset = 0;
+      let total = Infinity;
+      while (all.length < total) {
+        const data = await vkApi('audio.get', {
+          owner_id: pl.ownerId,
+          playlist_id: pl.playlistId,
+          count: '200',
+          offset: String(offset),
+        });
+        total = data.count;
+        all.push(...(data.items || []));
+        offset += 200;
+        if (data.items?.length < 200) break;
+      }
+
+      const seen = new Map();
+      const dupes = [];
+      for (const track of all) {
+        const key = `${track.artist}|||${track.title}`.toLowerCase().trim();
+        if (seen.has(key)) {
+          dupes.push({ track, original: seen.get(key) });
+        } else {
+          seen.set(key, track);
+        }
+      }
+
+      if (!dupes.length) {
+        setPlaylistStatus(`Дубликаты не найдены в ${all.length} треках ✓`);
+        return;
+      }
+
+      setPlaylistStatus(`Найдено ${dupes.length} дубликатов из ${all.length} треков`);
+      showDupesDialog(dupes, pl.ownerId, pl.playlistId);
+    } catch (err) {
+      setPlaylistStatus(`Ошибка: ${err.message}`, true);
+    }
+  }
+
+  function showDupesDialog(dupes, ownerId, playlistId) {
+    document.getElementById('vmu-dupes-backdrop')?.remove();
+    const wrap = document.createElement('div');
+    wrap.id = 'vmu-dupes-backdrop';
+    wrap.innerHTML = `
+      <div id="vmu-dupes-modal">
+        <div id="vmu-dupes-header">
+          <span>Найдено дубликатов: ${dupes.length}</span>
+          <button id="vmu-dupes-close">${ICON_CLOSE}</button>
+        </div>
+        <div id="vmu-dupes-list">
+          ${dupes.map((d, i) => `
+            <label class="vmu-dupe-item">
+              <input type="checkbox" class="vmu-dupe-cb" data-idx="${i}" checked>
+              <span class="vmu-dupe-name">${escHtml(d.track.artist)} — ${escHtml(d.track.title)}</span>
+              <span class="vmu-dupe-id">id:${d.track.id}</span>
+            </label>`).join('')}
+        </div>
+        <div id="vmu-dupes-footer">
+          <span id="vmu-dupes-status"></span>
+          <div style="display:flex;gap:8px">
+            <button id="vmu-dupes-selall">Все</button>
+            <button id="vmu-dupes-delete">Удалить выбранные</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(wrap);
+
+    wrap.addEventListener('click', e => { if (e.target === wrap) wrap.remove(); });
+    document.getElementById('vmu-dupes-close').onclick = () => wrap.remove();
+    document.getElementById('vmu-dupes-selall').onclick = () => {
+      const cbs = wrap.querySelectorAll('.vmu-dupe-cb');
+      const anyUnchecked = [...cbs].some(c => !c.checked);
+      cbs.forEach(c => c.checked = anyUnchecked);
+    };
+
+    document.getElementById('vmu-dupes-delete').onclick = async () => {
+      const checked = [...wrap.querySelectorAll('.vmu-dupe-cb:checked')];
+      if (!checked.length) return;
+      const btn = document.getElementById('vmu-dupes-delete');
+      const st = document.getElementById('vmu-dupes-status');
+      btn.disabled = true;
+      let removed = 0;
+      for (const cb of checked) {
+        const track = dupes[parseInt(cb.dataset.idx)].track;
+        try {
+          await vkApi('audio.removeFromPlaylist', {
+            owner_id: ownerId,
+            playlist_id: playlistId,
+            audio_ids: `${track.owner_id}_${track.id}`,
+          });
+          cb.closest('.vmu-dupe-item').style.opacity = '0.35';
+          st.textContent = `Удалено: ${++removed}`;
+        } catch (e) {
+          st.textContent = `Ошибка: ${e.message}`;
+        }
+        await sleep(350);
+      }
+      st.textContent = `✓ Удалено ${removed} дубликатов`;
+      btn.disabled = false;
+    };
+  }
+
+  // ─── settings panel ───────────────────────────────────────────────────────────
+  let settingsPanelOpen = false;
+
+  function toggleSettings() {
+    settingsPanelOpen = !settingsPanelOpen;
+    const panel = document.getElementById('vmu-settings-panel');
+    const btn = document.getElementById('vmu-settings-btn');
+    if (panel) panel.style.display = settingsPanelOpen ? 'block' : 'none';
+    if (btn) btn.style.color = settingsPanelOpen ? '#2688eb' : '';
+  }
+
+  function buildSettingsPanel() {
+    const hasCover = !!settings.coverDataUrl;
+    return `
+      <div id="vmu-settings-panel" style="display:none">
+        <div class="vmu-settings-section">
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Авто-плейлист</span>
+              <span class="vmu-setting-hint">Создать плейлист после загрузки</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-ap-toggle" ${settings.autoPlaylist ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+
+          <div id="vmu-cover-row" class="vmu-setting-row ${settings.autoPlaylist ? '' : 'vmu-row-disabled'}">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Обложка</span>
+              <span class="vmu-setting-hint">Выберите базовый JPG/PNG (1000×1000)</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+              ${hasCover ? `<div id="vmu-cover-preview" title="Нажмите для смены"></div>` : ''}
+              <label class="vmu-cover-pick-btn" title="Выбрать обложку">
+                ${hasCover ? '↺' : '+ Выбрать'}
+                <input type="file" id="vmu-cover-input" accept="image/*" style="display:none">
+              </label>
+              ${hasCover ? `<button id="vmu-cover-clear" title="Удалить обложку">✕</button>` : ''}
+            </div>
+          </div>
+        </div>
+
+        <div class="vmu-settings-section">
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Дубликаты</span>
+              <span class="vmu-setting-hint">${getPlaylistInfoFromUrl() ? 'Текущий плейлист' : 'Откройте страницу плейлиста'}</span>
+            </div>
+            <button id="vmu-scan-dupes" class="vmu-scan-btn" ${getPlaylistInfoFromUrl() ? '' : 'disabled'}>Найти</button>
+          </div>
+        </div>
+
+        <div id="vmu-pl-status" style="display:none;padding:6px 12px 8px;font-size:11.5px;color:#4bb34b;font-family:inherit"></div>
+      </div>`;
+  }
+
+  function attachSettingsHandlers() {
+    const toggle = document.getElementById('vmu-ap-toggle');
+    if (toggle) {
+      toggle.addEventListener('change', () => {
+        settings.autoPlaylist = toggle.checked;
+        saveSettings();
+        const coverRow = document.getElementById('vmu-cover-row');
+        if (coverRow) coverRow.classList.toggle('vmu-row-disabled', !settings.autoPlaylist);
+      });
+    }
+
+    const coverInput = document.getElementById('vmu-cover-input');
+    if (coverInput) {
+      coverInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          settings.coverDataUrl = reader.result;
+          saveSettings();
+          // Rebuild settings panel to show preview
+          const panel = document.getElementById('vmu-settings-panel');
+          if (panel) {
+            const wasOpen = settingsPanelOpen;
+            rebuildSettingsPanel();
+            if (wasOpen) document.getElementById('vmu-settings-panel').style.display = 'block';
+          }
+        };
+        reader.readAsDataURL(file);
+        e.target.value = '';
+      });
+    }
+
+    const coverClear = document.getElementById('vmu-cover-clear');
+    if (coverClear) {
+      coverClear.addEventListener('click', () => {
+        settings.coverDataUrl = null;
+        saveSettings();
+        rebuildSettingsPanel();
+        if (settingsPanelOpen) document.getElementById('vmu-settings-panel').style.display = 'block';
+      });
+    }
+
+    const coverPreview = document.getElementById('vmu-cover-preview');
+    if (coverPreview && settings.coverDataUrl) {
+      coverPreview.style.cssText = `width:32px;height:32px;border-radius:4px;background:url('${settings.coverDataUrl}') center/cover;cursor:pointer;flex-shrink:0`;
+    }
+
+    const scanBtn = document.getElementById('vmu-scan-dupes');
+    if (scanBtn) {
+      scanBtn.addEventListener('click', () => scanForDuplicates());
+    }
+  }
+
+  function rebuildSettingsPanel() {
+    const panel = document.getElementById('vmu-settings-panel');
+    if (!panel) return;
+    const newPanel = document.createElement('div');
+    newPanel.innerHTML = buildSettingsPanel();
+    panel.replaceWith(newPanel.firstElementChild);
+    attachSettingsHandlers();
+  }
+
   // ─── modal ───────────────────────────────────────────────────────────────────
   function openModal() {
     if (!document.getElementById('vmu-backdrop')) buildModal();
@@ -90,6 +625,9 @@
   function closeModal() {
     const el = document.getElementById('vmu-backdrop');
     if (el) el.style.display = 'none';
+    settingsPanelOpen = false;
+    const panel = document.getElementById('vmu-settings-panel');
+    if (panel) panel.style.display = 'none';
   }
 
   function buildModal() {
@@ -99,8 +637,13 @@
       <div id="vmu-modal">
         <div id="vmu-header">
           <span id="vmu-title">Загрузить несколько треков</span>
-          <button id="vmu-close">${ICON_CLOSE}</button>
+          <div style="display:flex;align-items:center;gap:6px">
+            <button id="vmu-settings-btn" title="Настройки">${ICON_SETTINGS}</button>
+            <button id="vmu-close">${ICON_CLOSE}</button>
+          </div>
         </div>
+
+        ${buildSettingsPanel()}
 
         <div id="vmu-dropzone">
           <div class="vmu-dz-label">Перетащите MP3 файлы сюда</div>
@@ -125,6 +668,7 @@
 
     wrap.addEventListener('click', e => { if (e.target === wrap) closeModal(); });
     document.getElementById('vmu-close').addEventListener('click', closeModal);
+    document.getElementById('vmu-settings-btn').addEventListener('click', toggleSettings);
 
     document.getElementById('vmu-clear').addEventListener('click', () => {
       fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
@@ -138,26 +682,18 @@
 
     const dz = document.getElementById('vmu-dropzone');
     const modal = document.getElementById('vmu-modal');
-
     let dragCounter = 0;
     modal.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dz.classList.add('vmu-over'); });
     modal.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dz.classList.remove('vmu-over'); } });
-    modal.addEventListener('dragover',  e => e.preventDefault());
+    modal.addEventListener('dragover', e => e.preventDefault());
     modal.addEventListener('drop', e => {
       e.preventDefault();
-      dragCounter = 0;
-      dz.classList.remove('vmu-over');
+      e.stopPropagation();
+      dragCounter = 0; dz.classList.remove('vmu-over');
       addFiles([...e.dataTransfer.files].filter(isMP3));
     });
-
-    // accept on backdrop too so users can drop anywhere in the overlay
     wrap.addEventListener('dragover', e => e.preventDefault());
-    wrap.addEventListener('drop', e => {
-      e.preventDefault();
-      dragCounter = 0;
-      dz.classList.remove('vmu-over');
-      addFiles([...e.dataTransfer.files].filter(isMP3));
-    });
+    wrap.addEventListener('drop', e => { e.preventDefault(); });
 
     document.getElementById('vmu-list').addEventListener('click', e => {
       const btn = e.target.closest('.vmu-retry-btn');
@@ -168,9 +704,11 @@
       if (e.target.closest('#vmu-copy-failed')) copyFailed();
       else if (e.target.closest('#vmu-retry-all')) retryAll();
     });
+
+    attachSettingsHandlers();
   }
 
-  // ─── retry / copy helpers ─────────────────────────────────────────────────
+  // ─── retry / copy helpers ──────────────────────────────────────────────────
   function retryOne(idx) {
     if (fileQueue[idx] && fileQueue[idx].status === 'error') {
       fileQueue[idx].status = 'pending';
@@ -209,12 +747,8 @@
     list.innerHTML = fileQueue.map((item, idx) => {
       const raw = item.file.name.replace(/\.mp3$/i, '');
       const name = raw.length > 48 ? raw.slice(0, 46) + '…' : raw;
-      const errHtml = item.errorMsg
-        ? `<span class="vmu-errmsg">${item.errorMsg}</span>`
-        : '';
-      const retryBtn = item.status === 'error'
-        ? `<button class="vmu-retry-btn" data-idx="${idx}" title="Повторить">↺</button>`
-        : '';
+      const errHtml = item.errorMsg ? `<span class="vmu-errmsg">${item.errorMsg}</span>` : '';
+      const retryBtn = item.status === 'error' ? `<button class="vmu-retry-btn" data-idx="${idx}" title="Повторить">↺</button>` : '';
       return `<div class="vmu-item vmu-${item.status}">
         <span class="vmu-icon">${STATUS_ICON[item.status]}</span>
         <span class="vmu-info">
@@ -253,7 +787,13 @@
   // ─── queue ────────────────────────────────────────────────────────────────────
   function addFiles(files) {
     if (!files.length) return;
-    files.forEach(f => fileQueue.push({ file: f, status: 'pending', errorMsg: null }));
+    autoPlaylistRunning = false;
+    files.forEach(f => {
+      const item = { file: f, status: 'pending', errorMsg: null, tags: {} };
+      fileQueue.push(item);
+      // Read ID3 tags asynchronously (non-blocking)
+      readID3(f).then(tags => { item.tags = tags; }).catch(() => {});
+    });
     renderQueue();
     if (!isProcessing) processQueue();
   }
@@ -261,17 +801,14 @@
   function showCompletionGif() {
     const existing = document.getElementById('vmu-gif-overlay');
     if (existing) existing.remove();
-
     const overlay = document.createElement('div');
     overlay.id = 'vmu-gif-overlay';
     overlay.style.cssText = 'position:fixed;inset:0;z-index:999999;display:flex;align-items:center;justify-content:center;cursor:pointer;';
-
     const img = document.createElement('img');
     img.src = chrome.runtime.getURL('done.gif');
     img.style.cssText = 'max-width:80vw;max-height:80vh;border-radius:8px;pointer-events:none;';
     overlay.appendChild(img);
     document.body.appendChild(overlay);
-
     const dismiss = () => overlay.remove();
     overlay.addEventListener('click', dismiss);
     setTimeout(dismiss, 4000);
@@ -284,6 +821,12 @@
       renderQueue();
       if (fileQueue.length > 0 && !fileQueue.some(f => f.status === 'uploading')) {
         showCompletionGif();
+        // Trigger auto-playlist if enabled (once per completed batch)
+        if (settings.autoPlaylist && !autoPlaylistRunning) {
+          autoPlaylistRunning = true;
+          if (!settingsPanelOpen) toggleSettings();
+          runAutoPlaylist([...fileQueue]).finally(() => { autoPlaylistRunning = false; });
+        }
       }
       return;
     }
@@ -315,10 +858,8 @@
     const input = await waitForElement('input[type="file"][accept*="mp3"]', 4000);
     if (!input) throw new Error('Диалог ВК не открылся');
 
-    // Small pause: let React fully finish rendering the dialog before injecting
     await sleep(300);
 
-    // inject file via page context (injected.js) to avoid isolated-world DataTransfer issue
     const buffer = await file.arrayBuffer();
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('Timeout инжекта')), 5000);
@@ -332,8 +873,6 @@
       window.postMessage({ type: 'VK_INJECT_FILE', name: file.name, mimeType: file.type || 'audio/mpeg', buffer }, '*', [buffer]);
     });
 
-    // Close VK's native dialog — it served its purpose (giving us the upload URL).
-    // Pressing Escape dismisses it without cancelling the in-flight XHR.
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 
     await new Promise((resolve, reject) => {
@@ -351,7 +890,7 @@
     await sleep(1500);
   }
 
-  // ─── tooltip (body-level to escape VK's overflow:hidden containers) ──────────
+  // ─── tooltip ──────────────────────────────────────────────────────────────────
   function ensureTooltip() {
     let tip = document.getElementById('vmu-tooltip');
     if (!tip) {
@@ -373,7 +912,6 @@
       tip.style.left = Math.round(r.left + r.width / 2 - tip.offsetWidth / 2) + 'px';
       tip.style.top  = Math.round(r.bottom + 14) + 'px';
       tip.classList.add('vmu-tooltip-visible');
-      // Reposition after measuring (first paint may have 0 width)
       requestAnimationFrame(() => {
         tip.style.left = Math.round(r.left + r.width / 2 - tip.offsetWidth / 2) + 'px';
       });
