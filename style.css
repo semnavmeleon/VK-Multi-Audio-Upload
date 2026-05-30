@@ -66,7 +66,7 @@
   border: 1px solid rgba(255,255,255,0.09);
   border-radius: 14px;
   box-shadow: 0 12px 48px rgba(0,0,0,0.7);
-  width: 380px;
+  width: 500px;
   max-height: 82vh;
   display: flex;
   flex-direction: column;
@@ -219,6 +219,47 @@
   font-family: inherit;
 }
 #vmu-clear:hover { color: #e1e3e6; background: rgba(255,255,255,0.07); }
+
+/* ── Retry button on error items ─────────────────────────────────────────── */
+.vmu-retry-btn {
+  flex-shrink: 0;
+  background: rgba(38,136,235,0.15);
+  border: 1px solid rgba(38,136,235,0.3);
+  border-radius: 5px;
+  color: #2688eb;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 7px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+  font-family: inherit;
+}
+.vmu-retry-btn:hover {
+  background: rgba(38,136,235,0.3);
+  color: #fff;
+}
+
+/* ── Footer action buttons (copy / retry-all) ─────────────────────────────── */
+#vmu-footer-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.vmu-action-btn {
+  font-size: 12px;
+  font-family: inherit;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  color: #c0c2c4;
+  cursor: pointer;
+  padding: 4px 10px;
+  transition: background .12s, color .12s;
+  white-space: nowrap;
+}
+.vmu-action-btn:hover { background: rgba(255,255,255,0.14); color: #e1e3e6; }
+#vmu-retry-all { border-color: rgba(38,136,235,0.4); color: #2688eb; }
+#vmu-retry-all:hover { background: rgba(38,136,235,0.2); color: #fff; }
 
 /* ── Spinner ──────────────────────────────────────────────────────────────── */
 @keyframes vmu-spin { to { transform: rotate(360deg); } }

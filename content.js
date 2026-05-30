@@ -116,6 +116,7 @@
 
         <div id="vmu-footer">
           <span id="vmu-status">Перетащите файлы или нажмите «Выбрать»</span>
+          <div id="vmu-footer-actions"></div>
           <button id="vmu-clear">Очистить</button>
         </div>
       </div>
@@ -157,6 +158,47 @@
       dz.classList.remove('vmu-over');
       addFiles([...e.dataTransfer.files].filter(isMP3));
     });
+
+    document.getElementById('vmu-list').addEventListener('click', e => {
+      const btn = e.target.closest('.vmu-retry-btn');
+      if (btn) retryOne(parseInt(btn.dataset.idx, 10));
+    });
+
+    document.getElementById('vmu-footer').addEventListener('click', e => {
+      if (e.target.closest('#vmu-copy-failed')) copyFailed();
+      else if (e.target.closest('#vmu-retry-all')) retryAll();
+    });
+  }
+
+  // ─── retry / copy helpers ─────────────────────────────────────────────────
+  function retryOne(idx) {
+    if (fileQueue[idx] && fileQueue[idx].status === 'error') {
+      fileQueue[idx].status = 'pending';
+      fileQueue[idx].errorMsg = null;
+      renderQueue();
+      if (!isProcessing) processQueue();
+    }
+  }
+
+  function retryAll() {
+    let any = false;
+    fileQueue.forEach(item => {
+      if (item.status === 'error') { item.status = 'pending'; item.errorMsg = null; any = true; }
+    });
+    if (any) { renderQueue(); if (!isProcessing) processQueue(); }
+  }
+
+  function copyFailed() {
+    const names = fileQueue.filter(f => f.status === 'error').map(f => f.file.name);
+    if (!names.length) return;
+    navigator.clipboard.writeText(names.join('\n')).then(() => {
+      const btn = document.getElementById('vmu-copy-failed');
+      if (btn) {
+        const orig = btn.textContent;
+        btn.textContent = '✓ Скопировано';
+        setTimeout(() => { if (btn.isConnected) btn.textContent = orig; }, 1500);
+      }
+    }).catch(() => {});
   }
 
   // ─── render ───────────────────────────────────────────────────────────────────
@@ -164,11 +206,14 @@
     const list = document.getElementById('vmu-list');
     if (!list) return;
 
-    list.innerHTML = fileQueue.map(item => {
+    list.innerHTML = fileQueue.map((item, idx) => {
       const raw = item.file.name.replace(/\.mp3$/i, '');
-      const name = raw.length > 38 ? raw.slice(0, 36) + '…' : raw;
+      const name = raw.length > 48 ? raw.slice(0, 46) + '…' : raw;
       const errHtml = item.errorMsg
         ? `<span class="vmu-errmsg">${item.errorMsg}</span>`
+        : '';
+      const retryBtn = item.status === 'error'
+        ? `<button class="vmu-retry-btn" data-idx="${idx}" title="Повторить">↺</button>`
         : '';
       return `<div class="vmu-item vmu-${item.status}">
         <span class="vmu-icon">${STATUS_ICON[item.status]}</span>
@@ -176,6 +221,7 @@
           <span class="vmu-name" title="${item.file.name}">${name}</span>${errHtml}
         </span>
         <span class="vmu-sz">${fmtSize(item.file.size)}</span>
+        ${retryBtn}
       </div>`;
     }).join('');
 
@@ -192,6 +238,16 @@
 
     const st = document.getElementById('vmu-status');
     if (st) st.textContent = txt;
+
+    const allSettled = fileQueue.length > 0 && !fileQueue.some(f => f.status === 'pending' || f.status === 'uploading');
+    const fa = document.getElementById('vmu-footer-actions');
+    if (fa) {
+      if (allSettled && counts.error > 0) {
+        fa.innerHTML = `<button class="vmu-action-btn" id="vmu-copy-failed">📋 Скопировать</button><button class="vmu-action-btn" id="vmu-retry-all">↺ Повторить все</button>`;
+      } else {
+        fa.innerHTML = '';
+      }
+    }
   }
 
   // ─── queue ────────────────────────────────────────────────────────────────────
