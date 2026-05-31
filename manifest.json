@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "VK Multi Audio Upload",
-  "version": "1.0",
-  "description": "Drag & drop и мультизагрузка музыки во ВКонтакте",
+  "version": "2.0",
+  "description": "Мультизагрузка музыки во ВКонтакте + авто-плейлист + поиск дубликатов",
   "content_scripts": [
     {
       "matches": ["https://vk.com/*"],

@@ -1,4 +1,4 @@
-/* ── Trigger button — exact match to VK's icon buttons ───────────────────── */
+/* ── Trigger button ───────────────────────────────────────────────────────── */
 #vmu-trigger {
   display: flex;
   align-items: center;
@@ -17,7 +17,7 @@
 }
 #vmu-trigger:active { opacity: 0.7; }
 
-/* Tooltip is rendered as a body-level DOM element via JS to escape overflow:hidden */
+/* ── Tooltip ──────────────────────────────────────────────────────────────── */
 #vmu-tooltip {
   position: fixed;
   background: rgb(50, 50, 50);
@@ -67,7 +67,7 @@
   border-radius: 14px;
   box-shadow: 0 12px 48px rgba(0,0,0,0.7);
   width: 500px;
-  max-height: 82vh;
+  max-height: 88vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -86,13 +86,26 @@
   border-bottom: 1px solid rgba(255,255,255,0.07);
   flex-shrink: 0;
 }
-
 #vmu-title {
   font-size: 15px;
   font-weight: 600;
   color: #e1e3e6;
 }
-
+#vmu-settings-btn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: rgba(255,255,255,0.06);
+  border-radius: 50%;
+  color: #76787a;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+  padding: 0;
+}
+#vmu-settings-btn:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
 #vmu-close {
   width: 28px;
   height: 28px;
@@ -105,13 +118,104 @@
   color: #76787a;
   cursor: pointer;
   transition: background .12s, color .12s;
-  flex-shrink: 0;
   padding: 0;
 }
-#vmu-close:hover {
-  background: rgba(255,255,255,0.13);
-  color: #e1e3e6;
+#vmu-close:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
+
+/* ── Settings panel ───────────────────────────────────────────────────────── */
+#vmu-settings-panel {
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  flex-shrink: 0;
 }
+.vmu-settings-section {
+  padding: 10px 16px;
+}
+.vmu-settings-section + .vmu-settings-section {
+  border-top: 1px solid rgba(255,255,255,0.05);
+}
+.vmu-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+}
+.vmu-row-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+.vmu-setting-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.vmu-setting-label { font-size: 13px; color: #d0d2d4; font-weight: 500; }
+.vmu-setting-hint  { font-size: 11px; color: #555; }
+
+/* Toggle switch */
+.vmu-toggle { position: relative; display: inline-block; width: 38px; height: 22px; flex-shrink: 0; cursor: pointer; }
+.vmu-toggle input { opacity: 0; width: 0; height: 0; }
+.vmu-toggle-track {
+  position: absolute; inset: 0;
+  background: rgba(255,255,255,0.12);
+  border-radius: 11px;
+  transition: background .2s;
+}
+.vmu-toggle-track::before {
+  content: '';
+  position: absolute;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: #888;
+  top: 3px; left: 3px;
+  transition: transform .2s, background .2s;
+}
+.vmu-toggle input:checked ~ .vmu-toggle-track { background: rgba(38,136,235,0.35); }
+.vmu-toggle input:checked ~ .vmu-toggle-track::before { transform: translateX(16px); background: #2688eb; }
+
+/* Cover picker */
+.vmu-cover-pick-btn {
+  display: inline-flex;
+  align-items: center;
+  font-size: 12px;
+  font-family: inherit;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  color: #c0c2c4;
+  cursor: pointer;
+  padding: 4px 10px;
+  transition: background .12s;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.vmu-cover-pick-btn:hover { background: rgba(255,255,255,0.13); }
+#vmu-cover-clear {
+  width: 22px; height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  border: none;
+  background: rgba(255,255,255,0.06);
+  border-radius: 50%;
+  color: #666;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0;
+  flex-shrink: 0;
+  transition: color .12s, background .12s;
+}
+#vmu-cover-clear:hover { color: #e1e3e6; background: rgba(255,255,255,0.13); }
+
+/* Scan dupes button */
+.vmu-scan-btn {
+  font-size: 12px;
+  font-family: inherit;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 6px;
+  color: #c0c2c4;
+  cursor: pointer;
+  padding: 4px 12px;
+  transition: background .12s;
+  flex-shrink: 0;
+}
+.vmu-scan-btn:hover { background: rgba(255,255,255,0.14); }
+.vmu-scan-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* ── Drop zone ────────────────────────────────────────────────────────────── */
 #vmu-dropzone {
@@ -123,23 +227,9 @@
   transition: border-color .15s, background .15s;
   flex-shrink: 0;
 }
-#vmu-dropzone.vmu-over {
-  border-color: #2688eb;
-  background: rgba(38,136,235,0.07);
-}
-
-.vmu-dz-label {
-  font-size: 14px;
-  font-weight: 500;
-  color: #e1e3e6;
-  margin-bottom: 4px;
-}
-.vmu-dz-hint {
-  font-size: 12px;
-  color: #6d6d6d;
-  margin-bottom: 14px;
-}
-
+#vmu-dropzone.vmu-over { border-color: #2688eb; background: rgba(38,136,235,0.07); }
+.vmu-dz-label  { font-size: 14px; font-weight: 500; color: #e1e3e6; margin-bottom: 4px; }
+.vmu-dz-hint   { font-size: 12px; color: #6d6d6d; margin-bottom: 14px; }
 .vmu-pick-btn {
   display: inline-flex;
   align-items: center;
@@ -157,13 +247,12 @@
 }
 .vmu-pick-btn:hover { background: #1a7ad4; }
 .vmu-pick-btn:active { background: #1567b5; }
-
 #vmu-input { display: none; }
 
 /* ── File list ────────────────────────────────────────────────────────────── */
 #vmu-list {
   margin: 0 12px;
-  max-height: 230px;
+  max-height: 200px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -172,24 +261,19 @@
 #vmu-list::-webkit-scrollbar { width: 3px; }
 #vmu-list::-webkit-scrollbar-track { background: transparent; }
 #vmu-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
-
 .vmu-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 8px;
-  border-radius: 7px;
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px; border-radius: 7px;
   background: rgba(255,255,255,0.03);
 }
-.vmu-icon { flex-shrink: 0; display: flex; align-items: center; line-height: 0; }
-.vmu-info { flex: 1; overflow: hidden; display: flex; flex-direction: column; gap: 1px; }
-.vmu-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: #d0d2d4; }
+.vmu-icon  { flex-shrink: 0; display: flex; align-items: center; line-height: 0; }
+.vmu-info  { flex: 1; overflow: hidden; display: flex; flex-direction: column; gap: 1px; }
+.vmu-name  { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: #d0d2d4; }
 .vmu-errmsg { font-size: 10.5px; color: #e64646; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.vmu-sz   { color: #555; flex-shrink: 0; font-size: 11px; }
-
+.vmu-sz    { color: #555; flex-shrink: 0; font-size: 11px; }
 .vmu-uploading { background: rgba(38,136,235,0.08); }
-.vmu-done      { background: rgba(75,179,75,0.06);  }
-.vmu-error     { background: rgba(230,70,70,0.07);  }
+.vmu-done      { background: rgba(75,179,75,0.06); }
+.vmu-error     { background: rgba(230,70,70,0.07); }
 
 /* ── Footer ───────────────────────────────────────────────────────────────── */
 #vmu-footer {
@@ -202,64 +286,49 @@
   flex-shrink: 0;
   margin-top: 6px;
 }
-#vmu-status {
-  font-size: 12px;
-  color: #6d6d6d;
-  flex: 1;
-}
+#vmu-status { font-size: 12px; color: #6d6d6d; flex: 1; }
 #vmu-clear {
-  font-size: 12px;
-  color: #6d6d6d;
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 3px 8px;
-  border-radius: 5px;
+  font-size: 12px; color: #6d6d6d;
+  background: none; border: none; cursor: pointer;
+  padding: 3px 8px; border-radius: 5px;
   transition: color .12s, background .12s;
   font-family: inherit;
 }
 #vmu-clear:hover { color: #e1e3e6; background: rgba(255,255,255,0.07); }
 
-/* ── Retry button on error items ─────────────────────────────────────────── */
+/* ── Retry button ─────────────────────────────────────────────────────────── */
 .vmu-retry-btn {
   flex-shrink: 0;
   background: rgba(38,136,235,0.15);
   border: 1px solid rgba(38,136,235,0.3);
-  border-radius: 5px;
-  color: #2688eb;
-  font-size: 14px;
-  line-height: 1;
-  padding: 2px 7px;
-  cursor: pointer;
-  transition: background .12s, color .12s;
+  border-radius: 5px; color: #2688eb;
+  font-size: 14px; line-height: 1; padding: 2px 7px;
+  cursor: pointer; transition: background .12s, color .12s;
   font-family: inherit;
 }
-.vmu-retry-btn:hover {
-  background: rgba(38,136,235,0.3);
-  color: #fff;
-}
+.vmu-retry-btn:hover { background: rgba(38,136,235,0.3); color: #fff; }
 
-/* ── Footer action buttons (copy / retry-all) ─────────────────────────────── */
-#vmu-footer-actions {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
+/* ── Footer actions ───────────────────────────────────────────────────────── */
+#vmu-footer-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .vmu-action-btn {
-  font-size: 12px;
-  font-family: inherit;
+  font-size: 12px; font-family: inherit;
   background: rgba(255,255,255,0.07);
   border: 1px solid rgba(255,255,255,0.12);
-  border-radius: 6px;
-  color: #c0c2c4;
-  cursor: pointer;
-  padding: 4px 10px;
+  border-radius: 6px; color: #c0c2c4;
+  cursor: pointer; padding: 4px 10px;
   transition: background .12s, color .12s;
   white-space: nowrap;
 }
 .vmu-action-btn:hover { background: rgba(255,255,255,0.14); color: #e1e3e6; }
 #vmu-retry-all { border-color: rgba(38,136,235,0.4); color: #2688eb; }
 #vmu-retry-all:hover { background: rgba(38,136,235,0.2); color: #fff; }
+
+/* ── Playlist status bar ──────────────────────────────────────────────────── */
+#vmu-pl-status {
+  font-size: 11.5px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding: 6px 12px 8px;
+}
 
 /* ── Spinner ──────────────────────────────────────────────────────────────── */
 @keyframes vmu-spin { to { transform: rotate(360deg); } }
@@ -268,3 +337,82 @@
   transform-origin: 7px 7px;
   display: block;
 }
+
+/* ── Duplicates modal ─────────────────────────────────────────────────────── */
+#vmu-dupes-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(5px);
+}
+#vmu-dupes-modal {
+  background: #232324;
+  border: 1px solid rgba(255,255,255,0.09);
+  border-radius: 14px;
+  box-shadow: 0 12px 48px rgba(0,0,0,0.7);
+  width: 480px;
+  max-height: 75vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  color: #e1e3e6;
+}
+#vmu-dupes-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  font-size: 14px; font-weight: 600;
+  flex-shrink: 0;
+}
+#vmu-dupes-close {
+  width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
+  border: none; background: rgba(255,255,255,0.06); border-radius: 50%;
+  color: #76787a; cursor: pointer; transition: background .12s; padding: 0;
+}
+#vmu-dupes-close:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
+#vmu-dupes-list {
+  overflow-y: auto;
+  flex: 1;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#vmu-dupes-list::-webkit-scrollbar { width: 3px; }
+#vmu-dupes-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
+.vmu-dupe-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-radius: 7px;
+  background: rgba(255,255,255,0.03); cursor: pointer;
+  transition: background .1s;
+}
+.vmu-dupe-item:hover { background: rgba(255,255,255,0.06); }
+.vmu-dupe-cb { accent-color: #2688eb; flex-shrink: 0; cursor: pointer; }
+.vmu-dupe-name { flex: 1; font-size: 12px; color: #c0c2c4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vmu-dupe-id   { font-size: 10px; color: #555; flex-shrink: 0; }
+#vmu-dupes-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 16px; border-top: 1px solid rgba(255,255,255,0.07);
+  gap: 8px; flex-shrink: 0;
+}
+#vmu-dupes-status { font-size: 12px; color: #6d6d6d; flex: 1; }
+#vmu-dupes-selall {
+  font-size: 12px; font-family: inherit;
+  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px; color: #888; cursor: pointer; padding: 4px 10px;
+}
+#vmu-dupes-selall:hover { background: rgba(255,255,255,0.12); color: #e1e3e6; }
+#vmu-dupes-delete {
+  font-size: 12px; font-family: inherit;
+  background: rgba(230,70,70,0.15); border: 1px solid rgba(230,70,70,0.35);
+  border-radius: 6px; color: #e64646; cursor: pointer; padding: 4px 12px;
+  transition: background .12s;
+}
+#vmu-dupes-delete:hover { background: rgba(230,70,70,0.3); }
+#vmu-dupes-delete:disabled { opacity: 0.4; cursor: not-allowed; }

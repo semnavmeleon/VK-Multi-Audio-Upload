@@ -158,16 +158,21 @@
     });
   }
 
-  // ─── VK API ───────────────────────────────────────────────────────────────────
-  const VK_CLIENT_ID = '6287487';
+  // ─── VK internal API via al_audio.php (browser-native, no external tokens) ────
 
-  function getVkToken() {
-    try {
-      return JSON.parse(localStorage.getItem(`${VK_CLIENT_ID}:web_token:login:auth`) || '{}').access_token || null;
-    } catch { return null; }
+  function getPageHash() {
+    for (const s of document.querySelectorAll('script:not([src])')) {
+      const m = s.textContent.match(/"hash"\s*:\s*"([a-zA-Z0-9_\-]{30,70})"/);
+      if (m) return m[1];
+    }
+    return '';
   }
 
   function getVkUserId() {
+    // URL-first: works for any user (/audiosXXX) or group (/audios-XXX) page
+    const m = location.href.match(/audios(-?\d+)/);
+    if (m) return m[1];
+    // Fallback: localStorage key for personal pages only
     try {
       for (const k of Object.keys(localStorage)) {
         if (k.startsWith('audio_v21_track_')) {
@@ -176,32 +181,62 @@
         }
       }
     } catch {}
-    const m = location.href.match(/audios(\d+)/);
-    return m ? m[1] : null;
+    return null;
   }
 
-  async function vkApi(method, params) {
-    const token = getVkToken();
-    if (!token) throw new Error('VK-токен не найден — перезайдите в аккаунт');
-    const body = new URLSearchParams({ v: '5.131', access_token: token, ...params });
-    const res = await fetch(`https://api.vk.com/method/${method}`, { method: 'POST', body });
-    const data = await res.json();
-    if (data.error) throw new Error(`${method}: ${data.error.error_msg} (${data.error.error_code})`);
-    return data.response;
+  function translateError(msg) {
+    const map = {
+      btn_create_playlist_not_found: 'Кнопка "Создать плейлист" не найдена. Перейдите на страницу своей музыки (/audios) и попробуйте снова.',
+      dialog_not_opened: 'Диалог создания плейлиста не открылся.',
+      save_btn_not_found: 'Кнопка "Сохранить" не найдена в диалоге.',
+      save_playlist_timeout: 'Плейлист не был сохранён за 20 секунд.',
+      playlist_id_not_found: 'Не удалось получить ID созданного плейлиста.',
+    };
+    return map[msg] || msg;
   }
 
-  // ─── auto-playlist: get audio IDs after upload ────────────────────────────────
-  async function getRecentAudioIds(count, ownerId) {
-    await sleep(3000);
-    const data = await vkApi('audio.get', {
-      owner_id: ownerId,
-      count: String(count + 15),
-      offset: '0',
+  // Generic al_audio.php call (works for read operations; write ops may need UI)
+  async function alAudio(act, params) {
+    const hash = getPageHash();
+    const body = new URLSearchParams({ act, al: '1', hash, ...params });
+    const res = await fetch('/al_audio.php', {
+      method: 'POST',
+      body,
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
     });
-    const items = data.items || [];
-    // audio.get returns newest-added first → uploading A,B,C gives [C,B,A]
-    // Reverse to restore upload order [A,B,C] for correct playlist order
-    return items.slice(0, count).reverse().map(a => `${ownerId}_${a.id}`);
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { throw new Error(`al_audio.php ответил не JSON`); }
+    if (data.payload?.[0] !== 0) {
+      throw new Error(`al_audio.php ${act}: код ${data.payload?.[0]}`);
+    }
+    return data.payload?.[1] ?? [];
+  }
+
+  // Send message to injected.js and wait for response
+  function pageCall(sendType, responseType, payload, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        window.removeEventListener('message', handler);
+        reject(new Error(`Timeout: ${responseType}`));
+      }, timeoutMs);
+      function handler(e) {
+        if (e.source !== window || e.data?.type !== responseType) return;
+        window.removeEventListener('message', handler);
+        clearTimeout(t);
+        const d = e.data;
+        d.ok !== false ? resolve(d) : reject(new Error(d.error || responseType + ' failed'));
+      }
+      window.addEventListener('message', handler);
+      // Collect all transferable ArrayBuffers from payload
+      const transfers = [];
+      if (payload) {
+        for (const v of Object.values(payload)) {
+          if (v instanceof ArrayBuffer) transfers.push(v);
+        }
+      }
+      window.postMessage({ type: sendType, ...payload }, '*', transfers);
+    });
   }
 
   // ─── cover upload via VK dialog ───────────────────────────────────────────────
@@ -217,29 +252,6 @@
         data.ok ? resolve() : reject(new Error(data.error || 'Ошибка обложки'));
       };
       window.postMessage({ type: 'VK_UPLOAD_COVER', buffer: buf }, '*', [buf]);
-    });
-  }
-
-  // Try to upload cover via VK photos API then editPlaylist
-  async function uploadCoverViaApi(ownerId, playlistId, coverBlob) {
-    const serverData = await vkApi('photos.getWallUploadServer', { user_id: ownerId });
-    const fd = new FormData();
-    fd.append('photo', coverBlob, 'cover.jpg');
-    const uploadRes = await fetch(serverData.upload_url, { method: 'POST', body: fd });
-    const uploadData = await uploadRes.json();
-    if (!uploadData.photo) throw new Error('Ошибка загрузки фото');
-    const saved = await vkApi('photos.saveWallPhoto', {
-      user_id: ownerId,
-      server: uploadData.server,
-      photo: uploadData.photo,
-      hash: uploadData.hash,
-    });
-    if (!saved[0]) throw new Error('Ошибка сохранения фото');
-    const photoRef = `photo${saved[0].owner_id}_${saved[0].id}`;
-    await vkApi('audio.editPlaylist', {
-      owner_id: ownerId,
-      playlist_id: String(playlistId),
-      photo: photoRef,
     });
   }
 
@@ -264,90 +276,70 @@
 
     try {
       const tagsList = done.map(i => i.tags || {});
-
-      const albums = [...new Set(tagsList.map(t => t.TALB).filter(Boolean))];
+      const albums  = [...new Set(tagsList.map(t => t.TALB).filter(Boolean))];
       const artists = [...new Set([
         ...tagsList.map(t => t.TPE2).filter(Boolean),
         ...tagsList.map(t => t.TPE1).filter(Boolean),
       ])].slice(0, 5);
 
-      const title = albums[0]
-        || tagsList[0]?.TIT2
-        || done[0].file.name.replace(/\.mp3$/i, '')
-        || 'Плейлист';
-      const descLine = artists.length ? artists.join(', ') + '\n' : '';
-      const description = descLine + 'человек паук поможет каждому [vk.com/reuploadunder]';
+      // Template: "Альбом (Год) Исполнитель"
+      const album  = albums[0] || '';
+      const year   = [...new Set(tagsList.map(t => t.TYER || t.TDRC?.substring(0,4)).filter(Boolean))][0] || '';
+      const artist = artists[0] || '';
+      let title = album;
+      if (year)   title += ' (' + year + ')';
+      if (artist) title += ' ' + artist;
+      if (!title) title = done[0].file.name.replace(/\.mp3$/i,'') || 'Плейлист';
 
-      setPlaylistStatus('Создаём плейлист…');
-      const playlist = await vkApi('audio.createPlaylist', {
-        owner_id: ownerId,
-        title: title.slice(0, 255),
-        description: description.slice(0, 1000),
+      // Description: название + подпись
+      const description = title + '\nчеловек паук поможет каждому [vk.com/reuploadunder]';
+
+      // Build track names list for matching in the edit dialog (in upload order)
+      const trackNames = done.map(i => {
+        const tags = i.tags || {};
+        const tagArtist = tags.TPE1 || tags.TPE2 || '';
+        const tagTitle = tags.TIT2 || '';
+        if (tagArtist && tagTitle) return { artist: tagArtist, title: tagTitle };
+        const name = i.file.name.replace(/\.mp3$/i, '');
+        const parts = name.split(/\s*[-–—]\s*/);
+        if (parts.length >= 2) return { artist: parts[0].trim(), title: parts.slice(1).join(' - ').trim() };
+        return { artist: '', title: name };
       });
 
-      setPlaylistStatus('Получаем ID треков…');
-      const audioIds = await getRecentAudioIds(done.length, ownerId);
-
-      if (audioIds.length) {
-        setPlaylistStatus(`Добавляем ${audioIds.length} треков…`);
-        await vkApi('audio.addToPlaylist', {
-          owner_id: ownerId,
-          playlist_id: String(playlist.id),
-          audio_ids: audioIds.join(','),
-        });
-      }
-
+      // Prepare cover blob BEFORE opening the dialog (inject it during creation)
+      let coverBlob = null;
       if (settings.coverDataUrl) {
-        setPlaylistStatus('Загружаем обложку…');
-        try {
-          const coverBlob = await makePerezalitoCover(settings.coverDataUrl);
-          if (coverBlob) {
-            // Try API approach first, fall back to dialog inject
-            try {
-              await uploadCoverViaApi(ownerId, playlist.id, coverBlob);
-            } catch {
-              // For dialog approach, open the playlist edit
-              // Reload playlist section and try via dialog
-              await openAndInjectCover(ownerId, playlist.id, coverBlob);
-            }
-          }
-        } catch (ce) {
-          console.warn('[VKU] Cover:', ce.message);
-          setPlaylistStatus(`✓ Плейлист «${title.slice(0,25)}» создан (обложку установите вручную)`);
-          return;
-        }
+        setPlaylistStatus('Готовим обложку…');
+        coverBlob = await makePerezalitoCover(settings.coverDataUrl);
       }
+
+      // Create playlist: opens VK dialog, fills fields, injects cover, selects tracks, saves
+      setPlaylistStatus('Создаём плейлист…');
+      const created = await pageCall('VK_CREATE_PLAYLIST', 'VK_PLAYLIST_CREATED', {
+        title: title.slice(0, 255),
+        description: description.slice(0, 1000),
+        trackNames,
+        coverBuf: coverBlob ? await coverBlob.arrayBuffer() : null,
+      }, 60000);
 
       setPlaylistStatus(`✓ Плейлист «${title.slice(0,30)}» создан!`);
     } catch (err) {
-      setPlaylistStatus(`Ошибка: ${err.message}`, true);
+      setPlaylistStatus(`Ошибка: ${translateError(err.message)}`, true);
       console.error('[VK Multi Upload]', err);
     }
   }
 
   async function openAndInjectCover(ownerId, playlistId, coverBlob) {
-    // Navigate to force playlist list reload
-    const targetUrl = `https://vk.com/audios${ownerId}?section=all&block=my_playlists`;
-    if (location.href !== targetUrl) {
-      history.pushState(null, '', targetUrl);
-      await sleep(1500);
-    }
-
-    // Find the edit button for our newly created playlist
-    // VK playlist items sometimes have the playlist ID in their links
     let editBtn = null;
-    for (let attempt = 0; attempt < 8; attempt++) {
+    for (let i = 0; i < 10; i++) {
       editBtn = findPlaylistEditBtn(playlistId);
       if (editBtn) break;
-      await sleep(700);
+      await sleep(600);
     }
-
-    if (!editBtn) {
-      throw new Error('Кнопка редактирования плейлиста не найдена');
-    }
+    if (!editBtn) throw new Error('Кнопка редактирования плейлиста не найдена');
 
     editBtn.click();
-    await sleep(800);
+    await sleep(700);
 
     const coverEl = await waitForElement('.ape_cover', 3000);
     if (!coverEl) throw new Error('.ape_cover не найден в диалоге');
@@ -356,17 +348,14 @@
   }
 
   function findPlaylistEditBtn(playlistId) {
-    // Look for edit buttons near elements referencing our playlist ID
-    const allLinks = document.querySelectorAll(`[href*="_${playlistId}"], [data-id="${playlistId}"], [data-playlist-id="${playlistId}"]`);
-    for (const el of allLinks) {
+    const links = document.querySelectorAll(`[href*="_${playlistId}"], [data-id="${playlistId}"], [data-playlist-id="${playlistId}"]`);
+    for (const el of links) {
       let parent = el;
       for (let i = 0; i < 6; i++) {
         parent = parent.parentElement;
         if (!parent) break;
         const btn = parent.querySelector('button');
-        if (btn && (btn.textContent.includes('едактир') || btn.getAttribute('aria-label')?.includes('edit'))) {
-          return btn;
-        }
+        if (btn && btn.textContent.includes('едактир')) return btn;
       }
     }
     return null;
@@ -383,6 +372,58 @@
     return null;
   }
 
+  // Parse tracks from DOM on the current playlist page
+  function getTracksFromDOM() {
+    const tracks = [];
+    const seen = new Set();
+
+    // Try various VK audio row selectors
+    const rows = document.querySelectorAll(
+      '.audio_row[data-full-id], [data-full-id], [data-audio-id], .AudioRow'
+    );
+
+    for (const row of rows) {
+      const fullId = row.dataset.fullId || row.dataset.audioId;
+      if (!fullId || seen.has(fullId)) continue;
+
+      const titleEl = row.querySelector('.audio_title, .ai_title, [class*="audio_title"], [class*="AudioRow__title"]');
+      const artistEl = row.querySelector('.audio_artist, .ai_artist, [class*="audio_artist"], [class*="AudioRow__artist"]');
+
+      if (titleEl || artistEl) {
+        seen.add(fullId);
+        tracks.push({
+          id: fullId.split('_')[1] || fullId,
+          owner_id: fullId.split('_')[0] || '',
+          fullId,
+          title: titleEl?.textContent?.trim() || '',
+          artist: artistEl?.textContent?.trim() || '',
+        });
+      }
+    }
+
+    // Fallback: parse from audio link hrefs
+    if (!tracks.length) {
+      const links = document.querySelectorAll('a[href^="/audio"]');
+      for (const link of links) {
+        const m = link.href.match(/\/audio(-?\d+)_(\d+)/);
+        if (!m) continue;
+        const fullId = `${m[1]}_${m[2]}`;
+        if (seen.has(fullId)) continue;
+        seen.add(fullId);
+        const row = link.closest('[class*="audio"], [class*="Audio"]') || link.parentElement;
+        tracks.push({
+          id: m[2],
+          owner_id: m[1],
+          fullId,
+          title: link.textContent?.trim() || '',
+          artist: '',
+        });
+      }
+    }
+
+    return tracks;
+  }
+
   async function scanForDuplicates() {
     const pl = getPlaylistInfoFromUrl();
     if (!pl) {
@@ -390,29 +431,45 @@
       return;
     }
 
-    setPlaylistStatus('Загружаем треки плейлиста…');
+    setPlaylistStatus('Читаем треки со страницы…');
 
     try {
-      const all = [];
-      let offset = 0;
-      let total = Infinity;
-      while (all.length < total) {
-        const data = await vkApi('audio.get', {
-          owner_id: pl.ownerId,
-          playlist_id: pl.playlistId,
-          count: '200',
-          offset: String(offset),
-        });
-        total = data.count;
-        all.push(...(data.items || []));
-        offset += 200;
-        if (data.items?.length < 200) break;
+      // Primary: read from DOM (user is on the playlist page)
+      let tracks = getTracksFromDOM();
+
+      // If DOM is empty, try al_audio.php load_section
+      if (!tracks.length) {
+        setPlaylistStatus('Загружаем через API…');
+        try {
+          const result = await pageCall('VK_LOAD_PLAYLIST', 'VK_PLAYLIST_LOADED', {
+            ownerId: pl.ownerId,
+            playlistId: pl.playlistId,
+            offset: 0,
+          }, 10000);
+          // Parse the raw response if possible
+          try {
+            const raw = JSON.parse(result.raw || '{}');
+            const list = raw?.payload?.[1];
+            if (Array.isArray(list)) {
+              tracks = parseTracksFromPayload(list);
+            }
+          } catch {}
+        } catch (apiErr) {
+          setPlaylistStatus(`Не удалось загрузить треки: ${apiErr.message}`, true);
+          return;
+        }
+      }
+
+      if (!tracks.length) {
+        setPlaylistStatus('Треки не найдены — откройте страницу плейлиста', true);
+        return;
       }
 
       const seen = new Map();
       const dupes = [];
-      for (const track of all) {
+      for (const track of tracks) {
         const key = `${track.artist}|||${track.title}`.toLowerCase().trim();
+        if (!key.includes('|||') || (!track.artist && !track.title)) continue;
         if (seen.has(key)) {
           dupes.push({ track, original: seen.get(key) });
         } else {
@@ -421,15 +478,32 @@
       }
 
       if (!dupes.length) {
-        setPlaylistStatus(`Дубликаты не найдены в ${all.length} треках ✓`);
+        setPlaylistStatus(`Дубликаты не найдены в ${tracks.length} треках ✓`);
         return;
       }
 
-      setPlaylistStatus(`Найдено ${dupes.length} дубликатов из ${all.length} треков`);
+      setPlaylistStatus(`Найдено ${dupes.length} дубликатов из ${tracks.length} треков`);
       showDupesDialog(dupes, pl.ownerId, pl.playlistId);
     } catch (err) {
       setPlaylistStatus(`Ошибка: ${err.message}`, true);
     }
+  }
+
+  function parseTracksFromPayload(list) {
+    const tracks = [];
+    for (const item of list) {
+      if (Array.isArray(item) && item.length >= 5) {
+        // VK internal format: [id, owner_id, url, url2, title, artist, ...]
+        tracks.push({
+          id: String(item[0]),
+          owner_id: String(item[1]),
+          fullId: `${item[1]}_${item[0]}`,
+          title: String(item[3] || item[4] || ''),
+          artist: String(item[4] || item[5] || ''),
+        });
+      }
+    }
+    return tracks;
   }
 
   function showDupesDialog(dupes, ownerId, playlistId) {
@@ -477,18 +551,20 @@
       let removed = 0;
       for (const cb of checked) {
         const track = dupes[parseInt(cb.dataset.idx)].track;
+        const audioId = track.fullId || `${track.owner_id}_${track.id}`;
         try {
-          await vkApi('audio.removeFromPlaylist', {
-            owner_id: ownerId,
-            playlist_id: playlistId,
-            audio_ids: `${track.owner_id}_${track.id}`,
-          });
+          const res = await pageCall('VK_REMOVE_FROM_PLAYLIST', 'VK_REMOVE_PLAYLIST_DONE', {
+            ownerId,
+            playlistId,
+            audioId,
+          }, 10000);
+          if (!res.ok) throw new Error('Сервер вернул ошибку');
           cb.closest('.vmu-dupe-item').style.opacity = '0.35';
           st.textContent = `Удалено: ${++removed}`;
         } catch (e) {
           st.textContent = `Ошибка: ${e.message}`;
         }
-        await sleep(350);
+        await sleep(400);
       }
       st.textContent = `✓ Удалено ${removed} дубликатов`;
       btn.disabled = false;
@@ -820,7 +896,6 @@
     if (!next) {
       renderQueue();
       if (fileQueue.length > 0 && !fileQueue.some(f => f.status === 'uploading')) {
-        showCompletionGif();
         // Trigger auto-playlist if enabled (once per completed batch)
         if (settings.autoPlaylist && !autoPlaylistRunning) {
           autoPlaylistRunning = true;
@@ -846,19 +921,27 @@
 
     renderQueue();
     isProcessing = false;
-    await sleep(1000);
+    await sleep(2000);
     processQueue();
   }
 
   async function uploadOne(file) {
+    // Wait for any previous upload dialog to fully close
+    for (let i = 0; i < 10; i++) {
+      const oldInput = document.querySelector('input[type="file"][accept*="mp3"]');
+      if (!oldInput) break;
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await sleep(300);
+    }
+
     const btn = getVkBtn();
     if (!btn) throw new Error('Кнопка загрузки не найдена');
     btn.click();
 
-    const input = await waitForElement('input[type="file"][accept*="mp3"]', 4000);
+    const input = await waitForElement('input[type="file"][accept*="mp3"]', 5000);
     if (!input) throw new Error('Диалог ВК не открылся');
 
-    await sleep(300);
+    await sleep(500);
 
     const buffer = await file.arrayBuffer();
     await new Promise((resolve, reject) => {
@@ -873,7 +956,12 @@
       window.postMessage({ type: 'VK_INJECT_FILE', name: file.name, mimeType: file.type || 'audio/mpeg', buffer }, '*', [buffer]);
     });
 
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    // Close the dialog and wait until it's actually gone
+    for (let i = 0; i < 15; i++) {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await sleep(300);
+      if (!document.querySelector('input[type="file"][accept*="mp3"]')) break;
+    }
 
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('Timeout загрузки (90s)')), 90_000);
@@ -887,7 +975,7 @@
       };
     });
 
-    await sleep(1500);
+    await sleep(2000);
   }
 
   // ─── tooltip ──────────────────────────────────────────────────────────────────
