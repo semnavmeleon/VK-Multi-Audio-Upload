@@ -42,8 +42,9 @@
     if (!this._vkUrl) return origSend.call(this, body);
     const url = this._vkUrl;
 
-    // Audio file upload
-    if (url.includes('pu.vk.com')) {
+    // Audio file upload — match pu.vk.com, vkontakte.ru, or any upload.php endpoint
+    const isUploadUrl = url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php');
+    if (isUploadUrl) {
       const xhr = this;
       this.addEventListener('load', () => window.postMessage({ type: 'VK_UPLOAD_DONE', response: xhr.responseText }, '*'));
       this.addEventListener('error', () => window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*'));
@@ -88,6 +89,21 @@
   const origFetch = window.fetch;
   window.fetch = async function (...args) {
     const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+
+    // Audio file upload — match pu.vk.com, vkontakte.ru, or any upload.php endpoint
+    const isUploadUrl = url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php');
+    if (isUploadUrl) {
+      return origFetch.apply(this, args).then(result => {
+        result.clone().text().then(text => {
+          window.postMessage({ type: 'VK_UPLOAD_DONE', response: text }, '*');
+        }).catch(() => window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*'));
+        return result;
+      }, err => {
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*');
+        throw err;
+      });
+    }
+
     const result = await origFetch.apply(this, args);
 
     if (url.includes('al_audio.php')) {
@@ -143,7 +159,8 @@
         const file = new File([buffer], name, { type: mimeType || 'audio/mpeg' });
         let tries = 0;
         (function tryInject() {
-          const input = document.querySelector('input[type="file"]');
+          // Prefer the VK-native input (marked during embedding), fall back to any file input
+          const input = document.querySelector('[data-vmu-vk="1"]') || document.querySelector('input[type="file"]');
           if (input) {
             const dt = new DataTransfer();
             dt.items.add(file);

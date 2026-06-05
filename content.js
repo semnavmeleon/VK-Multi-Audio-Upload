@@ -21,9 +21,9 @@
   const ICON_CLOSE = `<svg width="12" height="12" viewBox="0 0 12 12" fill="none">
     <path d="M1.5 1.5l9 9M10.5 1.5l-9 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
   </svg>`;
-  const ICON_SETTINGS = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-    <circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.4"/>
-    <path d="M8 1v1.5M8 13.5V15M15 8h-1.5M2.5 8H1M12.36 3.64l-1.06 1.06M4.7 11.3l-1.06 1.06M12.36 12.36l-1.06-1.06M4.7 4.7L3.64 3.64" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+  const ICON_SETTINGS = `<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+    <path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/>
+    <path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.892 3.433-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.892-1.64-.901-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.42 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.42-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.47l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"/>
   </svg>`;
   const STATUS_ICON = {
     pending: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="#555" stroke-width="1.3"/><rect x="5" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/><rect x="7.6" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/></svg>`,
@@ -691,99 +691,6 @@
     attachSettingsHandlers();
   }
 
-  // ─── modal ───────────────────────────────────────────────────────────────────
-  function openModal() {
-    if (!document.getElementById('vmu-backdrop')) buildModal();
-    document.getElementById('vmu-backdrop').style.display = 'flex';
-    renderQueue();
-  }
-
-  function closeModal() {
-    const el = document.getElementById('vmu-backdrop');
-    if (el) el.style.display = 'none';
-    settingsPanelOpen = false;
-    const panel = document.getElementById('vmu-settings-panel');
-    if (panel) panel.style.display = 'none';
-  }
-
-  function buildModal() {
-    const wrap = document.createElement('div');
-    wrap.id = 'vmu-backdrop';
-    wrap.innerHTML = `
-      <div id="vmu-modal">
-        <div id="vmu-header">
-          <span id="vmu-title">Загрузить несколько треков</span>
-          <div style="display:flex;align-items:center;gap:6px">
-            <button id="vmu-settings-btn" title="Настройки">${ICON_SETTINGS}</button>
-            <button id="vmu-close">${ICON_CLOSE}</button>
-          </div>
-        </div>
-
-        ${buildSettingsPanel()}
-
-        <div id="vmu-dropzone">
-          <div class="vmu-dz-label">Перетащите MP3 файлы сюда</div>
-          <div class="vmu-dz-hint">не более 200 МБ каждый</div>
-          <label class="vmu-pick-btn">
-            ${ICON_UPLOAD}
-            Выбрать файлы
-            <input type="file" id="vmu-input" accept=".mp3,audio/mpeg" multiple>
-          </label>
-        </div>
-
-        <div id="vmu-list"></div>
-
-        <div id="vmu-footer">
-          <span id="vmu-status">Перетащите файлы или нажмите «Выбрать»</span>
-          <div id="vmu-footer-actions"></div>
-          <button id="vmu-clear">Очистить</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(wrap);
-
-    wrap.addEventListener('click', e => { if (e.target === wrap) closeModal(); });
-    document.getElementById('vmu-close').addEventListener('click', closeModal);
-    document.getElementById('vmu-settings-btn').addEventListener('click', toggleSettings);
-
-    document.getElementById('vmu-clear').addEventListener('click', () => {
-      fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
-      renderQueue();
-    });
-
-    document.getElementById('vmu-input').addEventListener('change', e => {
-      addFiles([...e.target.files]);
-      e.target.value = '';
-    });
-
-    const dz = document.getElementById('vmu-dropzone');
-    const modal = document.getElementById('vmu-modal');
-    let dragCounter = 0;
-    modal.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dz.classList.add('vmu-over'); });
-    modal.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dz.classList.remove('vmu-over'); } });
-    modal.addEventListener('dragover', e => e.preventDefault());
-    modal.addEventListener('drop', e => {
-      e.preventDefault();
-      e.stopPropagation();
-      dragCounter = 0; dz.classList.remove('vmu-over');
-      addFiles([...e.dataTransfer.files].filter(isMP3));
-    });
-    wrap.addEventListener('dragover', e => e.preventDefault());
-    wrap.addEventListener('drop', e => { e.preventDefault(); });
-
-    document.getElementById('vmu-list').addEventListener('click', e => {
-      const btn = e.target.closest('.vmu-retry-btn');
-      if (btn) retryOne(parseInt(btn.dataset.idx, 10));
-    });
-
-    document.getElementById('vmu-footer').addEventListener('click', e => {
-      if (e.target.closest('#vmu-copy-failed')) copyFailed();
-      else if (e.target.closest('#vmu-retry-all')) retryAll();
-    });
-
-    attachSettingsHandlers();
-  }
-
   // ─── retry / copy helpers ──────────────────────────────────────────────────
   function retryOne(idx) {
     if (fileQueue[idx] && fileQueue[idx].status === 'error') {
@@ -926,22 +833,22 @@
   }
 
   async function uploadOne(file) {
-    // Wait for any previous upload dialog to fully close
-    for (let i = 0; i < 10; i++) {
-      const oldInput = document.querySelector('input[type="file"][accept*="mp3"]');
-      if (!oldInput) break;
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      await sleep(300);
-    }
-
-    const btn = getVkBtn();
-    if (!btn) throw new Error('Кнопка загрузки не найдена');
-    btn.click();
-
-    const input = await waitForElement('input[type="file"][accept*="mp3"]', 5000);
-    if (!input) throw new Error('Диалог ВК не открылся');
-
-    await sleep(500);
+    // Dialog is already open — just inject directly into VK's hidden input.
+    // Set the callback before injection to avoid losing a fast upload response.
+    const uploadPromise = new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        uploadDoneCallback = null;
+        reject(new Error('Timeout загрузки (90s)'));
+      }, 90_000);
+      uploadDoneCallback = data => {
+        clearTimeout(t);
+        if (data.error) { reject(new Error('Ошибка сети')); return; }
+        try {
+          const r = JSON.parse(data.response);
+          r.error_code ? reject(new Error(`VK ${r.error_code}: ${r.error_msg}`)) : resolve(r);
+        } catch { resolve(); }
+      };
+    });
 
     const buffer = await file.arrayBuffer();
     await new Promise((resolve, reject) => {
@@ -956,90 +863,120 @@
       window.postMessage({ type: 'VK_INJECT_FILE', name: file.name, mimeType: file.type || 'audio/mpeg', buffer }, '*', [buffer]);
     });
 
-    // Close the dialog and wait until it's actually gone
-    for (let i = 0; i < 15; i++) {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-      await sleep(300);
-      if (!document.querySelector('input[type="file"][accept*="mp3"]')) break;
-    }
-
-    await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('Timeout загрузки (90s)')), 90_000);
-      uploadDoneCallback = data => {
-        clearTimeout(t);
-        if (data.error) { reject(new Error('Ошибка сети')); return; }
-        try {
-          const r = JSON.parse(data.response);
-          r.error_code ? reject(new Error(`VK ${r.error_code}: ${r.error_msg}`)) : resolve(r);
-        } catch { resolve(); }
-      };
-    });
-
+    await uploadPromise;
     await sleep(2000);
   }
 
-  // ─── tooltip ──────────────────────────────────────────────────────────────────
-  function ensureTooltip() {
-    let tip = document.getElementById('vmu-tooltip');
-    if (!tip) {
-      tip = document.createElement('div');
-      tip.id = 'vmu-tooltip';
-      tip.textContent = 'Загрузить несколько треков';
-      document.body.appendChild(tip);
+  // ─── Embed full UI into VK's native upload dialog ────────────────────────────
+  function buildEmbeddedUI() {
+    const wrap = document.createElement('div');
+    wrap.id = 'vmu-embedded';
+    wrap.innerHTML = `
+      <div id="vmu-header">
+        <span id="vmu-title">Загрузить несколько треков</span>
+        <button id="vmu-settings-btn" title="Настройки">${ICON_SETTINGS}</button>
+      </div>
+
+      ${buildSettingsPanel()}
+
+      <div id="vmu-dropzone">
+        <div class="vmu-dz-label">Перетащите MP3 файлы сюда</div>
+        <div class="vmu-dz-hint">не более 200 МБ каждый</div>
+        <label class="vmu-pick-btn">
+          ${ICON_UPLOAD}
+          Выбрать файлы
+          <input type="file" id="vmu-input" accept=".mp3,audio/mpeg" multiple>
+        </label>
+      </div>
+
+      <div id="vmu-list"></div>
+
+      <div id="vmu-footer">
+        <span id="vmu-status">Перетащите файлы или нажмите «Выбрать»</span>
+        <div id="vmu-footer-actions"></div>
+        <button id="vmu-clear">Очистить</button>
+      </div>
+    `;
+    return wrap;
+  }
+
+  function injectIntoVkDialog(box) {
+    if (box.dataset.vmuInjected) return;
+    box.dataset.vmuInjected = '1';
+
+    // Save VK's original file input (with its VK event listeners intact)
+    const vkInput = box.querySelector('input[type="file"]');
+    if (vkInput) {
+      vkInput.setAttribute('data-vmu-vk', '1');
+      vkInput.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:0;height:0;overflow:hidden;';
     }
-    return tip;
+
+    // Clear VK's content and inject our UI
+    box.innerHTML = '';
+    box.appendChild(buildEmbeddedUI());
+
+    // Re-append VK's input so it stays in the DOM with its event listeners
+    if (vkInput) box.appendChild(vkInput);
+
+    attachEmbeddedHandlers();
+    renderQueue();
   }
 
-  let tooltipTimer = null;
+  function attachEmbeddedHandlers() {
+    document.getElementById('vmu-settings-btn')?.addEventListener('click', toggleSettings);
 
-  function showTooltip(anchorEl) {
-    const tip = ensureTooltip();
-    clearTimeout(tooltipTimer);
-    tooltipTimer = setTimeout(() => {
-      const r = anchorEl.getBoundingClientRect();
-      tip.style.left = Math.round(r.left + r.width / 2 - tip.offsetWidth / 2) + 'px';
-      tip.style.top  = Math.round(r.bottom + 14) + 'px';
-      tip.classList.add('vmu-tooltip-visible');
-      requestAnimationFrame(() => {
-        tip.style.left = Math.round(r.left + r.width / 2 - tip.offsetWidth / 2) + 'px';
+    document.getElementById('vmu-clear')?.addEventListener('click', () => {
+      fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
+      renderQueue();
+    });
+
+    document.getElementById('vmu-input')?.addEventListener('change', e => {
+      addFiles([...e.target.files].filter(isMP3));
+      e.target.value = '';
+    });
+
+    const dz = document.getElementById('vmu-dropzone');
+    const embedded = document.getElementById('vmu-embedded');
+    if (dz && embedded) {
+      let dragCounter = 0;
+      embedded.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dz.classList.add('vmu-over'); });
+      embedded.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dz.classList.remove('vmu-over'); } });
+      embedded.addEventListener('dragover', e => e.preventDefault());
+      embedded.addEventListener('drop', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        dragCounter = 0; dz.classList.remove('vmu-over');
+        addFiles([...e.dataTransfer.files].filter(isMP3));
       });
-    }, 300);
+    }
+
+    document.getElementById('vmu-list')?.addEventListener('click', e => {
+      const btn = e.target.closest('.vmu-retry-btn');
+      if (btn) retryOne(parseInt(btn.dataset.idx, 10));
+    });
+
+    document.getElementById('vmu-footer')?.addEventListener('click', e => {
+      if (e.target.closest('#vmu-copy-failed')) copyFailed();
+      else if (e.target.closest('#vmu-retry-all')) retryAll();
+    });
+
+    attachSettingsHandlers();
   }
 
-  function hideTooltip() {
-    clearTimeout(tooltipTimer);
-    document.getElementById('vmu-tooltip')?.classList.remove('vmu-tooltip-visible');
-  }
-
-  // ─── trigger button ───────────────────────────────────────────────────────────
-  function injectTrigger() {
-    if (document.getElementById('vmu-trigger')) return;
-    const vkBtn = getVkBtn();
-    if (!vkBtn) return;
-
-    const btn = document.createElement('button');
-    btn.id = 'vmu-trigger';
-    btn.innerHTML = ICON_TRIGGER;
-    btn.addEventListener('click', e => { e.stopPropagation(); hideTooltip(); openModal(); });
-    btn.addEventListener('mouseenter', () => showTooltip(btn));
-    btn.addEventListener('mouseleave', hideTooltip);
-
-    vkBtn.insertAdjacentElement('afterend', btn);
-  }
-
-  // ─── SPA watcher ─────────────────────────────────────────────────────────────
+  // ─── SPA watcher + dialog watcher ────────────────────────────────────────────
   let lastHref = location.href;
   new MutationObserver(() => {
+    // SPA navigation: reset state
     if (location.href !== lastHref) {
       lastHref = location.href;
-      document.getElementById('vmu-trigger')?.remove();
-      closeModal();
+      fileQueue = [];
+      autoPlaylistRunning = false;
+      isProcessing = false;
+      uploadDoneCallback = null;
     }
-    injectTrigger();
-  }).observe(document.body, { childList: true, subtree: true });
 
-  injectTrigger();
-  setTimeout(injectTrigger, 500);
-  setTimeout(injectTrigger, 1500);
-  setTimeout(injectTrigger, 3000);
+    // Inject into VK's upload dialog whenever it appears
+    const box = document.querySelector('.audio_add_box:not([data-vmu-injected])');
+    if (box) injectIntoVkDialog(box);
+  }).observe(document.body, { childList: true, subtree: true });
 })();
