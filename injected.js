@@ -82,6 +82,12 @@
       }
     }
 
+    // Capture audio data for playlist download (fires on any al_audio.php response)
+    {
+      const _xhrDl = this, _urlDl = url;
+      _xhrDl.addEventListener('load', () => { try { processForAudioData(_urlDl, _xhrDl.responseText); } catch {} });
+    }
+
     return origSend.call(this, body);
   };
 
@@ -135,6 +141,11 @@
       }
     }
 
+    // Capture audio data for playlist download
+    if (url.includes('al_audio') || url.includes('api.vk.com')) {
+      result.clone().text().then(t => { try { processForAudioData(url, t); } catch {} }).catch(() => {});
+    }
+
     return result;
   };
 
@@ -146,6 +157,183 @@
       }
       walkForHashes(v, depth + 1);
     }
+  }
+
+  // ── Audio capture for playlist download ──────────────────────────────────────
+
+  const _dlSeen = new Set();
+
+  function decodeVKAudioUrl(url) {
+    if (!url || typeof url !== 'string') return null;
+    if (!url.includes('audio_api_unavailable')) return url;
+    try {
+      const m = url.match(/[?&]extra=([^&#]*)/);
+      if (!m) return null;
+      let b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (b64.length % 4) b64 += '=';
+      const raw = atob(b64);
+      const sep = raw.indexOf('\t');
+      if (sep < 0) return null;
+      return applyDecodeKey(raw.substring(0, sep), raw.substring(sep + 1));
+    } catch { return null; }
+  }
+
+  function applyDecodeKey(s, key) {
+    if (!key) return s;
+    let r = s;
+    for (const op of (key.match(/([a-z])(\d*)/g) || [])) {
+      const t = op[0], n = parseInt(op.slice(1) || '0', 10) || 0;
+      if (t === 'i') r = r.split('').reverse().join('');
+      else if (t === 'r') { const sh = r.length > 0 ? n % r.length : 0; if (sh > 0) r = r.slice(-sh) + r.slice(0, -sh); }
+      else if (t === 's') { if (n > 0 && n < r.length) r = r.slice(n) + r.slice(0, n); }
+      else if (t === 'x') r = r.split('').map(c => String.fromCharCode(c.charCodeAt(0) ^ n)).join('');
+    }
+    return r;
+  }
+
+  // ── Capture playlist access_hash from execute responses ────────────────────
+  function capturePlaylistMeta(obj, depth) {
+    if (!obj || depth > 10) return;
+    if (typeof obj === 'object' && !Array.isArray(obj)) {
+      if (typeof obj.id === 'number' && typeof obj.owner_id === 'number') {
+        const h = obj.access_hash || obj.access_key;
+        if (typeof h === 'string' && h.length >= 6) {
+          window.__vmuHashes['ph_' + obj.owner_id + '_' + obj.id] = h;
+        }
+      }
+      for (const v of Object.values(obj)) capturePlaylistMeta(v, depth + 1);
+    } else if (Array.isArray(obj)) {
+      for (const v of obj) capturePlaylistMeta(v, depth + 1);
+    }
+  }
+
+  function processForAudioData(url, text) {
+    if (!text || text.length < 20) return;
+    if (!url.includes('al_audio') && !url.includes('/method/') && !url.includes('api.vk.com')) return;
+    try {
+      const stripped = text.replace(/^<!--[\s\S]*?-->/, '').trim();
+      const parsed = JSON.parse(stripped);
+      capturePlaylistMeta(parsed, 0);
+      walkForAudio(parsed, 0);
+    } catch {
+      try {
+        const parsed = JSON.parse(text);
+        capturePlaylistMeta(parsed, 0);
+        walkForAudio(parsed, 0);
+      } catch {}
+    }
+  }
+
+  function walkForAudio(obj, depth) {
+    if (!obj || depth > 12) return;
+    if (Array.isArray(obj)) {
+      if (!tryEmitTrack(obj)) obj.forEach(v => walkForAudio(v, depth + 1));
+    } else if (typeof obj === 'object') {
+      if (!tryEmitTrackObj(obj)) {
+        for (const v of Object.values(obj)) walkForAudio(v, depth + 1);
+      }
+    }
+  }
+
+  function tryEmitTrackObj(obj) {
+    const id = obj.id, ownerId = obj.owner_id, title = obj.title, artist = obj.artist;
+    if (typeof id !== 'number' || typeof ownerId !== 'number') return false;
+    if (typeof title !== 'string' || typeof artist !== 'string') return false;
+    const trackId = `${ownerId}_${id}`;
+    if (_dlSeen.has(trackId)) return true;
+    _dlSeen.add(trackId);
+    const decoded = decodeVKAudioUrl(obj.url || '');
+    const cs = s => typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : String(s || '').trim();
+    window.postMessage({ type: 'VKD_TRACK', track: { id: trackId, title: cs(title), artist: cs(artist), duration: obj.duration || 0, url: decoded } }, '*');
+    return true;
+  }
+
+  function tryEmitTrack(arr) {
+    if (!Array.isArray(arr) || arr.length < 5) return false;
+    const [id, ownerId, url, title, artist, duration] = arr;
+    if (typeof id !== 'number' || typeof ownerId !== 'number') return false;
+    if (typeof title !== 'string' || typeof artist !== 'string') return false;
+    const trackId = `${ownerId}_${id}`;
+    if (_dlSeen.has(trackId)) return true;
+    _dlSeen.add(trackId);
+    const decoded = decodeVKAudioUrl(url);
+    const cs = s => typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : String(s || '').trim();
+    window.postMessage({
+      type: 'VKD_TRACK',
+      track: { id: trackId, title: cs(title), artist: cs(artist), duration: duration || 0, url: decoded }
+    }, '*');
+    return true;
+  }
+
+  // ── Sniff decoded audio URL via VK's own player ────────────────────────────
+  // VK decodes the obfuscated URL internally and sets it as <audio>.src.
+  // We briefly trigger playback for the target track, read the decoded URL,
+  // then restore the previous player state.
+  async function sniffDecodedUrl(trackId, reloadId) {
+    const ap = typeof getAudioPlayer === 'function' ? getAudioPlayer() : null;
+    if (!ap) throw new Error('no audio player');
+
+    const impl = ap._impl;
+    const audioEl = impl && impl._currentAudioEl;
+
+    // Remember current state to restore later
+    const prevAudio = ap._currentAudio;
+    const wasPlaying = ap._isPlaying;
+    const prevSrc = audioEl ? audioEl.src : null;
+
+    // Find the audio row in DOM by trackId and click play
+    const [ownerId, audioId] = trackId.split('_');
+    let row = document.querySelector('[class*="_audio_row_' + trackId + '"]');
+    if (!row) {
+      // vkit rows: find by fiber
+      for (const r of document.querySelectorAll('[class*="vkitAudioRow__root"]')) {
+        const fk = Object.keys(r).find(k => k.startsWith('__reactFiber$'));
+        if (!fk) continue;
+        const p = r[fk].memoizedProps || r[fk].pendingProps;
+        const id = p?.track?.entity?.data?.identity;
+        if (id && String(id.ownerId) === ownerId && String(id.id) === audioId) { row = r; break; }
+      }
+    }
+
+    let playBtn = row && (row.querySelector('._audio_row__play_btn') || row.querySelector('[class*="PlaybackControls"] button'));
+    if (!playBtn && row) playBtn = row.querySelector('button');
+    if (!playBtn) throw new Error('play button not found');
+
+    // Mute to avoid audible blip
+    const prevVol = audioEl ? audioEl.volume : 1;
+    if (audioEl) audioEl.volume = 0;
+
+    playBtn.click();
+
+    // Poll <audio>.src for up to 6s until it changes to a real URL
+    let url = null;
+    for (let i = 0; i < 60; i++) {
+      await pause(100);
+      if (!audioEl) continue;
+      const s = audioEl.src;
+      if (s && s !== prevSrc && !s.startsWith('blob:') && !s.includes('audio_api_unavailable')) {
+        url = s;
+        break;
+      }
+      // Also accept HLS URLs (vkuseraudio /a2/)
+      if (s && s !== prevSrc && s.startsWith('http') && (s.includes('/a2/') || s.includes('vkuseraudio'))) {
+        url = s;
+        break;
+      }
+    }
+
+    // Restore previous state
+    try {
+      if (audioEl) audioEl.volume = prevVol;
+      if (!wasPlaying) ap.pause();
+      // If a different track was playing before, resume it
+      if (wasPlaying && prevAudio && prevAudio !== ap._currentAudio) {
+        ap.play(prevAudio, ap._currentPlaylist);
+      }
+    } catch {}
+
+    if (!url) throw new Error('url not captured');
+    return url;
   }
 
   // ── Message dispatcher ────────────────────────────────────────────────────────
@@ -216,8 +404,573 @@
         injectCoverFile(new File([e.data.buffer], 'cover.jpg', { type: 'image/jpeg' }));
         break;
       }
+
+      case 'VKD_RESET_DL': {
+        _dlSeen.clear();
+        break;
+      }
+
+      case 'VKD_LOAD_SECTIONS': {
+        const { ownerId, playlistId, accessHash } = e.data;
+        loadPlaylistSections(ownerId, playlistId, accessHash);
+        break;
+      }
+
+      case 'VKD_EXTRACT_DOM': {
+        const tracks = extractTracksFromFiber();
+        window.postMessage({ type: 'VKD_EXTRACT_DOM_DONE', ok: true, tracks }, '*');
+        break;
+      }
+
+      case 'VKD_MARK_ROWS': {
+        const marked = markRowTrackData();
+        window.postMessage({ type: 'VKD_MARK_ROWS_DONE', ok: true, marked }, '*');
+        break;
+      }
+
+      case 'VKD_HLS_DOWNLOAD': {
+        const { url, trackId } = e.data;
+        downloadHlsAsBlob(url).then(result => {
+          window.postMessage({ type: 'VKD_HLS_DOWNLOAD_DONE', ok: true, trackId, blobUrl: result.blobUrl, ext: result.ext }, '*');
+        }).catch(err => {
+          window.postMessage({ type: 'VKD_HLS_DOWNLOAD_DONE', ok: false, trackId, error: err.message }, '*');
+        });
+        break;
+      }
+
+      case 'VKD_FETCH_BLOB': {
+        const { url, trackId } = e.data;
+        origFetch(url, { headers: { Referer: 'https://vk.com/' } })
+          .then(resp => {
+            if (!resp.ok) throw new Error('fetch failed: ' + resp.status);
+            return resp.blob();
+          })
+          .then(blob => {
+            const blobUrl = URL.createObjectURL(blob);
+            window.postMessage({ type: 'VKD_FETCH_BLOB_DONE', ok: true, trackId, blobUrl, size: blob.size }, '*');
+          })
+          .catch(err => {
+            window.postMessage({ type: 'VKD_FETCH_BLOB_DONE', ok: false, trackId, error: err.message }, '*');
+          });
+        break;
+      }
+
+      case 'VKD_RELOAD_AUDIO': {
+        const { ids } = e.data;
+        reloadAudioUrls(ids).then(resolved => {
+          window.postMessage({ type: 'VKD_RELOAD_AUDIO_DONE', ok: true, resolved }, '*');
+        }).catch(err => {
+          window.postMessage({ type: 'VKD_RELOAD_AUDIO_DONE', ok: false, error: err.message, resolved: {} }, '*');
+        });
+        break;
+      }
+
+      case 'VKD_SNIFF_URL': {
+        // Briefly ask VK's own player to resolve the track URL, then read
+        // the decoded URL from <audio>.src and restore previous state.
+        const { trackId, reloadId } = e.data;
+        sniffDecodedUrl(trackId, reloadId)
+          .then(url => window.postMessage({ type: 'VKD_SNIFF_URL_DONE', ok: true, url }, '*'))
+          .catch(err => window.postMessage({ type: 'VKD_SNIFF_URL_DONE', ok: false, error: err.message }, '*'));
+        break;
+      }
+
+      case 'VKD_SCROLL_LOAD': {
+        // Fallback scroll (legacy path)
+        const sc = document.querySelector('.audio_page, .AudioPageDynamic, [class*="AudioList"]')
+          || document.scrollingElement || document.body;
+        sc.scrollTop = sc.scrollHeight;
+        if (document.scrollingElement) document.scrollingElement.scrollTop = document.scrollingElement.scrollHeight;
+        break;
+      }
     }
   });
+
+  // ── HLS download: fetch m3u8 → download .ts segments → decrypt AES-128 → concat → blob URL ──
+
+  function resolveUrl(uri, baseUrl) {
+    if (uri.startsWith('http')) return uri;
+    try { return new URL(uri, baseUrl).href; } catch {}
+    return baseUrl + uri;
+  }
+
+  function parseM3u8(text, baseUrl) {
+    const segments = [];
+    let currentKey = null;
+    let mediaSequence = 0;
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+        mediaSequence = parseInt(line.split(':')[1], 10) || 0;
+      }
+      if (line.startsWith('#EXT-X-KEY:')) {
+        const methodMatch = line.match(/METHOD=([^,]+)/);
+        const uriMatch = line.match(/URI="([^"]+)"/);
+        const ivMatch = line.match(/IV=0x([0-9a-fA-F]+)/);
+        const method = methodMatch?.[1] || 'NONE';
+        if (method === 'AES-128' && uriMatch) {
+          currentKey = { method, uri: resolveUrl(uriMatch[1], baseUrl), iv: ivMatch?.[1] || null };
+        } else {
+          currentKey = null;
+        }
+      }
+      if (line && !line.startsWith('#')) {
+        segments.push({ url: resolveUrl(line, baseUrl), key: currentKey, seqNum: mediaSequence + segments.length });
+      }
+    }
+    return segments;
+  }
+
+  async function downloadHlsAsBlob(m3u8Url) {
+    // Fix doubled /index.m3u8 (content.js may append it when URL already has .m3u8?query)
+    m3u8Url = m3u8Url.replace(/(\.m3u8[^/]*?)\/index\.m3u8$/, '$1');
+    const hlsFetch = (url) => origFetch(url, { headers: { Referer: 'https://vk.com/' } });
+
+    const m3u8Resp = await hlsFetch(m3u8Url);
+    if (!m3u8Resp.ok) throw new Error('m3u8 fetch failed: ' + m3u8Resp.status);
+    let m3u8Text = await m3u8Resp.text();
+    let baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf('/') + 1);
+
+    // Handle master playlist: pick highest bandwidth stream
+    if (m3u8Text.includes('#EXT-X-STREAM-INF')) {
+      const lines = m3u8Text.split('\n');
+      let bestBw = -1, bestUri = null;
+      for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/#EXT-X-STREAM-INF.*?BANDWIDTH=(\d+)/);
+        if (m) {
+          const bw = parseInt(m[1], 10);
+          const uri = (lines[i + 1] || '').trim();
+          if (uri && !uri.startsWith('#') && bw > bestBw) { bestBw = bw; bestUri = uri; }
+        }
+      }
+      if (!bestUri) throw new Error('no streams in master m3u8');
+      const mediaUrl = resolveUrl(bestUri, baseUrl);
+      console.log('[vmu] HLS master playlist, selected stream:', bestBw, 'bps');
+      const mediaResp = await hlsFetch(mediaUrl);
+      if (!mediaResp.ok) throw new Error('media m3u8 fetch failed: ' + mediaResp.status);
+      m3u8Text = await mediaResp.text();
+      baseUrl = mediaUrl.substring(0, mediaUrl.lastIndexOf('/') + 1);
+    }
+
+    console.log('[vmu] m3u8 content:\n', m3u8Text.substring(0, 500));
+    const segments = parseM3u8(m3u8Text, baseUrl);
+    if (segments.length === 0) throw new Error('no segments in m3u8');
+
+    const encrypted = segments.some(s => s.key);
+    console.log('[vmu] HLS:', segments.length, 'segments,', encrypted ? 'AES-128 encrypted' : 'no encryption');
+    if (encrypted) console.log('[vmu] key URI:', segments[0].key?.uri?.substring(0, 120));
+
+    // Cache decryption keys (usually one key per playlist)
+    const keyCache = {};
+    let decryptionAvailable = true;
+
+    async function getKey(uri) {
+      if (keyCache[uri]) return keyCache[uri];
+      try {
+        const resp = await hlsFetch(uri);
+        if (!resp.ok) { console.warn('[vmu] key fetch HTTP', resp.status); return null; }
+        const rawKey = await resp.arrayBuffer();
+        if (rawKey.byteLength !== 16 && rawKey.byteLength !== 32) {
+          console.warn('[vmu] bad key size:', rawKey.byteLength);
+          return null;
+        }
+        const cryptoKey = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-CBC' }, false, ['decrypt']);
+        keyCache[uri] = cryptoKey;
+        return cryptoKey;
+      } catch (e) {
+        console.warn('[vmu] getKey error:', e.message);
+        return null;
+      }
+    }
+
+    function hexToIv(hex) {
+      const bytes = new Uint8Array(16);
+      const h = hex.padStart(32, '0');
+      for (let i = 0; i < 32; i += 2) bytes[i / 2] = parseInt(h.substr(i, 2), 16);
+      return bytes;
+    }
+
+    function seqNumToIv(n) {
+      const iv = new Uint8Array(16);
+      iv[15] = n & 0xff; iv[14] = (n >> 8) & 0xff;
+      iv[13] = (n >> 16) & 0xff; iv[12] = (n >> 24) & 0xff;
+      return iv;
+    }
+
+    // Download and optionally decrypt segments
+    const chunks = [];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const resp = await hlsFetch(seg.url);
+      if (!resp.ok) throw new Error(`segment ${i} failed: ${resp.status}`);
+      let data = await resp.arrayBuffer();
+
+      if (seg.key && decryptionAvailable) {
+        const cryptoKey = await getKey(seg.key.uri);
+        if (cryptoKey) {
+          const standardIv = seg.key.iv ? hexToIv(seg.key.iv) : seqNumToIv(seg.seqNum);
+          try {
+            data = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: standardIv }, cryptoKey, data);
+          } catch {
+            try {
+              const vkIv = new Uint8Array(data.slice(0, 16));
+              data = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: vkIv }, cryptoKey, data.slice(16));
+            } catch (e2) {
+              console.warn('[vmu] decrypt failed seg', i, e2.message);
+            }
+          }
+        } else if (i === 0) {
+          console.warn('[vmu] key not available, downloading without decryption');
+          decryptionAvailable = false;
+        }
+      }
+
+      chunks.push(data);
+      if (i % 5 === 4) await pause(50);
+    }
+
+    // Concatenate all segments
+    const totalSize = chunks.reduce((s, c) => s + c.byteLength, 0);
+    const combined = new Uint8Array(totalSize);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(new Uint8Array(chunk), offset);
+      offset += chunk.byteLength;
+    }
+    console.log('[vmu] HLS raw TS size:', (totalSize / 1024 / 1024).toFixed(1), 'MB');
+
+    // Check if data is already raw audio (not TS container)
+    if (combined[0] !== 0x47) {
+      if (combined[0] === 0xFF && (combined[1] & 0xE0) === 0xE0) {
+        const blob = new Blob([combined], { type: 'audio/mpeg' });
+        return { blobUrl: URL.createObjectURL(blob), ext: 'mp3' };
+      }
+      if (combined[0] === 0xFF && (combined[1] & 0xF0) === 0xF0) {
+        const blob = new Blob([combined], { type: 'audio/aac' });
+        return { blobUrl: URL.createObjectURL(blob), ext: 'aac' };
+      }
+    }
+
+    // Extract raw audio frames from MPEG-TS container
+    const audioResult = extractAacFromTs(combined);
+    if (audioResult) {
+      const { data: audio, codec } = audioResult;
+      const ext = codec === 'mp3' ? 'mp3' : 'aac';
+      const mime = codec === 'mp3' ? 'audio/mpeg' : 'audio/aac';
+      console.log('[vmu] extracted', ext + ':', (audio.byteLength / 1024 / 1024).toFixed(1), 'MB');
+      const blob = new Blob([audio], { type: mime });
+      return { blobUrl: URL.createObjectURL(blob), ext };
+    }
+    // Fallback: return raw TS
+    console.warn('[vmu] audio extraction failed, returning raw TS');
+    const blob = new Blob([combined], { type: 'video/mp2t' });
+    return { blobUrl: URL.createObjectURL(blob), ext: 'ts' };
+  }
+
+  // Extract audio frames from MPEG-TS data. Returns { data: Uint8Array, codec: 'mp3'|'aac' } or null
+  function extractAacFromTs(tsData) {
+    const bytes = tsData instanceof Uint8Array ? tsData : new Uint8Array(tsData);
+    if (bytes.length < 188) return null;
+
+    // Step 1: find audio PID from PAT → PMT
+    let audioPid = -1;
+    const TS = 188;
+    const findSync = (start) => {
+      for (let i = start; i < bytes.length - TS; i++) {
+        if (bytes[i] === 0x47 && bytes[i + TS] === 0x47) return i;
+      }
+      return -1;
+    };
+
+    let syncOff = findSync(0);
+    if (syncOff < 0) return null;
+
+    // Parse PAT to get PMT PID
+    let pmtPid = -1;
+    for (let pos = syncOff; pos + TS <= bytes.length; pos += TS) {
+      if (bytes[pos] !== 0x47) { syncOff = findSync(pos); if (syncOff < 0) break; pos = syncOff; }
+      const pid = ((bytes[pos + 1] & 0x1F) << 8) | bytes[pos + 2];
+      if (pid !== 0) continue; // PAT is PID 0
+      const pusi = !!(bytes[pos + 1] & 0x40);
+      const afc = (bytes[pos + 3] >> 4) & 0x03;
+      let payOff = pos + 4;
+      if (afc === 3) payOff += 1 + bytes[pos + 4];
+      if (pusi) payOff += 1 + bytes[payOff]; // pointer field
+      // PAT: skip 8 bytes header, then 4-byte entries
+      payOff += 8;
+      if (payOff + 4 <= pos + TS) {
+        pmtPid = ((bytes[payOff + 2] & 0x1F) << 8) | bytes[payOff + 3];
+      }
+      break;
+    }
+    if (pmtPid < 0) return null;
+
+    // Parse PMT to find audio PID (stream_type 0x0F=AAC, 0x11=AAC-LATM, 0x03/0x04=MP3)
+    let audioStreamType = 0;
+    for (let pos = syncOff; pos + TS <= bytes.length; pos += TS) {
+      if (bytes[pos] !== 0x47) continue;
+      const pid = ((bytes[pos + 1] & 0x1F) << 8) | bytes[pos + 2];
+      if (pid !== pmtPid) continue;
+      const pusi = !!(bytes[pos + 1] & 0x40);
+      const afc = (bytes[pos + 3] >> 4) & 0x03;
+      let payOff = pos + 4;
+      if (afc === 3) payOff += 1 + bytes[pos + 4];
+      if (pusi) payOff += 1 + bytes[payOff];
+      // PMT header
+      const secLen = ((bytes[payOff + 1] & 0x0F) << 8) | bytes[payOff + 2];
+      const progInfoLen = ((bytes[payOff + 10] & 0x0F) << 8) | bytes[payOff + 11];
+      let p = payOff + 12 + progInfoLen;
+      const secEnd = payOff + 3 + secLen - 4; // minus CRC
+      while (p + 5 <= secEnd && p < pos + TS) {
+        const sType = bytes[p];
+        const sPid = ((bytes[p + 1] & 0x1F) << 8) | bytes[p + 2];
+        const esLen = ((bytes[p + 3] & 0x0F) << 8) | bytes[p + 4];
+        if (sType === 0x0F || sType === 0x11 || sType === 0x03 || sType === 0x04) {
+          audioPid = sPid;
+          audioStreamType = sType;
+          console.log('[vmu] TS audio PID:', audioPid, 'type:', sType === 0x0F ? 'AAC' : sType === 0x03 ? 'MP3' : '0x' + sType.toString(16));
+          break;
+        }
+        p += 5 + esLen;
+      }
+      break;
+    }
+    if (audioPid < 0) return null;
+
+    // Step 2: collect PES payloads from audio PID
+    const pesChunks = [];
+    for (let pos = syncOff; pos + TS <= bytes.length; pos += TS) {
+      if (bytes[pos] !== 0x47) continue;
+      const pid = ((bytes[pos + 1] & 0x1F) << 8) | bytes[pos + 2];
+      if (pid !== audioPid) continue;
+      const pusi = !!(bytes[pos + 1] & 0x40);
+      const afc = (bytes[pos + 3] >> 4) & 0x03;
+      let payOff = pos + 4;
+      if (afc === 3) payOff += 1 + bytes[pos + 4];
+      if (afc === 2) continue; // no payload
+      if (pusi) {
+        // PES header: skip start code (3) + stream_id (1) + PES_length (2) + flags (3) + header_data_length
+        const pesHdrLen = bytes[payOff + 8];
+        payOff += 9 + pesHdrLen;
+      }
+      if (payOff < pos + TS) {
+        pesChunks.push(bytes.subarray(payOff, pos + TS));
+      }
+    }
+
+    if (pesChunks.length === 0) return null;
+    const audioTotal = pesChunks.reduce((s, c) => s + c.length, 0);
+    const audioData = new Uint8Array(audioTotal);
+    let off = 0;
+    for (const c of pesChunks) { audioData.set(c, off); off += c.length; }
+    const codec = (audioStreamType === 0x03 || audioStreamType === 0x04) ? 'mp3' : 'aac';
+    return { data: audioData, codec };
+  }
+
+  // ── Stamp data-vmu-track on audio rows so the content script (isolated world,
+  // no access to React fiber expandos) can read track data from the DOM ──
+  function markRowTrackData() {
+    let marked = 0;
+    for (const row of document.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow')) {
+      try {
+        const fiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+        if (!fiberKey) continue;
+        const fiber = row[fiberKey];
+        const props = fiber.memoizedProps || fiber.pendingProps;
+        const entity = props?.track?.entity;
+        if (!entity) continue;
+        const identity = entity.data?.identity;
+        const ownerId = identity?.ownerId;
+        const audioId = identity?.id;
+        if (!ownerId || !audioId) continue;
+        // Always overwrite — virtualized lists recycle row elements for other tracks
+        row.dataset.vmuTrack = JSON.stringify({
+          id: `${ownerId}_${audioId}`,
+          title: entity.title || '',
+          artist: entity.authors?.main?.[0]?.name || entity.subtitle || '',
+          url: entity.url || null,
+        });
+        marked++;
+      } catch {}
+    }
+    return marked;
+  }
+
+  // ── Extract tracks from popup DOM via React fiber (runs in page context) ──
+  function extractTracksFromFiber() {
+    const tracks = [];
+    const seen = new Set();
+
+    const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+      .find(m => m.getBoundingClientRect().width > 0);
+    const container = modal || document;
+    const rows = container.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
+
+    for (const row of rows) {
+      try {
+        const fiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+        if (fiberKey) {
+          const fiber = row[fiberKey];
+          const props = fiber.memoizedProps || fiber.pendingProps;
+          const entity = props?.track?.entity;
+          if (entity) {
+            const identity = entity.data?.identity;
+            const ownerId = identity?.ownerId;
+            const audioId = identity?.id;
+            const trackId = (ownerId && audioId) ? `${ownerId}_${audioId}` : `dom_${tracks.length}`;
+            if (seen.has(trackId)) continue;
+            seen.add(trackId);
+
+            const artistName = entity.authors?.main?.[0]?.name || entity.subtitle || '';
+            tracks.push({
+              id: trackId,
+              title: entity.title || '',
+              artist: artistName,
+              url: entity.url || null,
+              duration: entity.duration || 0,
+            });
+            continue;
+          }
+        }
+
+        // Fallback: data-full-id (old VK)
+        const fullId = row.dataset?.fullId;
+        if (!fullId || seen.has(fullId)) continue;
+        seen.add(fullId);
+        const titleEl = row.querySelector('[class*="title_inner"], .ai_title');
+        const artistEl = row.querySelector('[class*="performers"], .ai_artist');
+        tracks.push({
+          id: fullId,
+          title: (titleEl?.textContent || '').trim(),
+          artist: (artistEl?.textContent || '').trim(),
+          url: null,
+          duration: 0,
+        });
+      } catch {}
+    }
+    return tracks;
+  }
+
+  // ── Resolve direct audio URLs via al_audio.php?act=reload_audio ──────────
+  async function reloadAudioUrls(ids) {
+    // No page-level hash: reload_audio authorizes via per-track hashes inside ids
+    // (owner_audio_actionHash_urlHash) — sending a page hash yields "bad_hash"
+    const resolved = {};
+    // Batch in groups of 10
+    for (let i = 0; i < ids.length; i += 10) {
+      const batch = ids.slice(i, i + 10);
+      try {
+        const body = new URLSearchParams({
+          act: 'reload_audio',
+          al: '1',
+          ids: batch.join(','),
+        });
+        const res = await origFetch('/al_audio.php', {
+          method: 'POST',
+          body,
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        });
+        const text = await res.text();
+        console.log('[vmu] reload_audio response:', text.substring(0, 150));
+
+        // Parse response — VK returns track arrays
+        const stripped = text.replace(/^<!--[\s\S]*?-->/, '').trim();
+        let data;
+        try { data = JSON.parse(stripped); } catch { data = JSON.parse(text); }
+
+        // Walk through response to find track arrays and extract URLs
+        const walkReload = (obj, depth) => {
+          if (!obj || depth > 8) return;
+          if (Array.isArray(obj)) {
+            if (obj.length >= 5 && typeof obj[0] === 'number' && typeof obj[1] === 'number') {
+              const trackId = `${obj[1]}_${obj[0]}`;
+              const rawUrl = obj[2];
+              if (typeof rawUrl === 'string' && rawUrl) {
+                // Keep HLS URLs too — single-track download handles them via
+                // VKD_HLS_DOWNLOAD; a direct URL still wins over an HLS one
+                const put = (u) => {
+                  if (!u || !u.startsWith('http')) return;
+                  const isHls = u.includes('/a2/') || u.includes('.m3u8');
+                  const cur = resolved[trackId];
+                  const curIsHls = cur && (cur.includes('/a2/') || cur.includes('.m3u8'));
+                  if (!cur || (curIsHls && !isHls)) resolved[trackId] = u;
+                };
+                if (rawUrl.startsWith('http') && !rawUrl.includes('audio_api_unavailable')) {
+                  put(rawUrl);
+                } else {
+                  put(decodeVKAudioUrl(rawUrl));
+                }
+              }
+            } else {
+              for (const v of obj) walkReload(v, depth + 1);
+            }
+          } else if (typeof obj === 'object') {
+            for (const v of Object.values(obj)) walkReload(v, depth + 1);
+          }
+        };
+        walkReload(data, 0);
+      } catch (e) {
+        console.warn('[vmu] reload_audio batch error:', e.message);
+      }
+      if (i + 10 < ids.length) await pause(300);
+    }
+    console.log('[vmu] reload_audio resolved:', Object.keys(resolved).length, 'of', ids.length);
+    return resolved;
+  }
+
+  async function loadPlaylistSections(ownerId, playlistId, accessHash) {
+    const BATCH = 50;
+    const hash = window.__vmuHashes.load_section || window.__vmuHashes._page || getPageHashFromDOM();
+    if (!hash) {
+      console.warn('[vmu] loadPlaylistSections: no CSRF hash found');
+      window.postMessage({ type: 'VKD_SECTIONS_DONE' }, '*'); return;
+    }
+
+    // access_hash: from caller, or captured from execute response, or from URL hash
+    const aHash = accessHash || window.__vmuHashes['ph_' + ownerId + '_' + playlistId] || null;
+    console.log('[vmu] loadPlaylistSections', ownerId, playlistId, 'access_hash:', aHash ? aHash.substring(0, 10) + '…' : 'none', 'csrf:', hash.substring(0, 12) + '…');
+
+    // Try playlist-specific type values — do NOT fall back to generic types (0/1/2 load wrong sections)
+    const TYPES = ['playlist', 'album'];
+    let workingType = null;
+    for (const type of TYPES) {
+      try {
+        const params = { act: 'load_section', al: '1', hash, id: playlistId, owner_id: ownerId, type, offset: 0, utf8: '1' };
+        if (aHash) params.access_hash = aHash;
+        const body = new URLSearchParams(params);
+        const res = await origFetch('/al_audio.php', { method: 'POST', body, headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+        const text = await res.text();
+        console.log('[vmu] load_section type=' + type, 'resp:', text.substring(0, 120));
+        if (text.includes('"ERR_') || text.includes('ERR_1')) continue;
+        const before = _dlSeen.size;
+        processForAudioData('/al_audio.php', text);
+        if (_dlSeen.size > before) { workingType = type; break; }
+      } catch (e) { console.warn('[vmu] load_section type=' + type + ' error:', e); continue; }
+    }
+
+    if (!workingType) {
+      console.warn('[vmu] loadPlaylistSections: all types failed, falling back to preloaded');
+      window.postMessage({ type: 'VKD_SECTIONS_DONE' }, '*'); return;
+    }
+
+    // Paginate remaining batches
+    for (let offset = BATCH; ; offset += BATCH) {
+      try {
+        const params = { act: 'load_section', al: '1', hash, id: playlistId, owner_id: ownerId, type: workingType, offset, utf8: '1' };
+        if (aHash) params.access_hash = aHash;
+        const body = new URLSearchParams(params);
+        const res = await origFetch('/al_audio.php', { method: 'POST', body, headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+        const text = await res.text();
+        const before = _dlSeen.size;
+        processForAudioData('/al_audio.php', text);
+        const added = _dlSeen.size - before;
+        if (added < BATCH) break;
+        await pause(250);
+      } catch { break; }
+    }
+    window.postMessage({ type: 'VKD_SECTIONS_DONE' }, '*');
+  }
 
   // ── Create playlist via VK UI automation ─────────────────────────────────────
   // Pure ASCII/unicode-escape strings — no Cyrillic source bytes
@@ -818,4 +1571,27 @@
       if (++n >= 25) { clearInterval(t); window.postMessage({ type: 'VK_COVER_DONE', ok: true }, '*'); }
     }, 400);
   }
+
+  // ── Monitor <audio> element src for resolved CDN URLs ────────────────────────
+  (function () {
+    function watchAudio(el) {
+      new MutationObserver(() => {
+        const src = el.src;
+        if (src && !src.includes('audio_api_unavailable') && src.startsWith('http')) {
+          window.postMessage({ type: 'VKD_AUDIO_SRC', src }, '*');
+        }
+      }).observe(el, { attributes: true, attributeFilter: ['src'] });
+    }
+    const dObs = new MutationObserver(muts => {
+      for (const m of muts) for (const n of m.addedNodes) {
+        if (n.nodeName === 'AUDIO') watchAudio(n);
+        else if (n.querySelectorAll) n.querySelectorAll('audio').forEach(watchAudio);
+      }
+    });
+    const start = () => {
+      document.querySelectorAll('audio').forEach(watchAudio);
+      dObs.observe(document.documentElement, { childList: true, subtree: true });
+    };
+    document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', start) : start();
+  })();
 })();
