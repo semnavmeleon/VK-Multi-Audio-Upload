@@ -455,13 +455,32 @@
     return null;
   }
 
-  // Parse tracks from DOM on the current playlist page
-  function getTracksFromDOM() {
+  // Find the playlist container in DOM to scope track search
+  function findPlaylistContainer(plInfo) {
+    if (plInfo) {
+      const plKey = `${plInfo.ownerId}_${plInfo.playlistId}`;
+      // Playlist opened in a modal dialog
+      const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+        .find(m => m.getBoundingClientRect().width > 0);
+      if (modal) return modal;
+      // Old VK playlist container with matching class
+      const oldPl = document.querySelector(`[class*="_audio_pl_${plKey}"]`);
+      if (oldPl) return oldPl.closest('.audio_pl_snippet, .AudioPlaylistSnippet') || oldPl;
+      // Playlist page container
+      const plPage = document.querySelector(`.audio_pl_snippet__list, .AudioPlaylistSnippet__list, [class*="PlaylistAudioList"]`);
+      if (plPage) return plPage;
+    }
+    // Playlist page — use main content area, not the whole page (excludes player bar, recommendations, etc.)
+    return document.querySelector('#content, .page_block, [class*="AudioBlock"], [class*="CatalogBlock"]') || document;
+  }
+
+  // Parse tracks from DOM scoped to the playlist container
+  function getTracksFromDOM(plInfo) {
+    const container = findPlaylistContainer(plInfo);
     const tracks = [];
     const seen = new Set();
 
-    // Try various VK audio row selectors
-    const rows = document.querySelectorAll(
+    const rows = container.querySelectorAll(
       '.audio_row[data-full-id], [data-full-id], [data-audio-id], .AudioRow'
     );
 
@@ -484,16 +503,15 @@
       }
     }
 
-    // Fallback: parse from audio link hrefs
+    // Fallback: parse from audio link hrefs within container
     if (!tracks.length) {
-      const links = document.querySelectorAll('a[href^="/audio"]');
+      const links = container.querySelectorAll('a[href^="/audio"]');
       for (const link of links) {
         const m = link.href.match(/\/audio(-?\d+)_(\d+)/);
         if (!m) continue;
         const fullId = `${m[1]}_${m[2]}`;
         if (seen.has(fullId)) continue;
         seen.add(fullId);
-        const row = link.closest('[class*="audio"], [class*="Audio"]') || link.parentElement;
         tracks.push({
           id: m[2],
           owner_id: m[1],
@@ -519,7 +537,7 @@
     report('Читаем треки со страницы…');
 
     try {
-      let tracks = getTracksFromDOM();
+      let tracks = getTracksFromDOM(pl);
 
       if (!tracks.length) {
         report('Загружаем через API…');
