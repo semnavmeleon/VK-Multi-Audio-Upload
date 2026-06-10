@@ -356,21 +356,15 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
   flex: 1;
   min-width: 0;
+  height: 32px;
   background: #ffffff;
   color: #000000;
   border: none;
   border-radius: 8px;
-  font-size: 13px;
-  font-weight: 400;
-  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
-  padding: 9px 10px;
+  padding: 0;
   cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   transition: background .1s;
   box-sizing: border-box;
 }
@@ -539,20 +533,24 @@
   flex-shrink: 0;
   box-sizing: content-box;
 }
-/* New VK (vkit) — visual size stays 28px, padding adds clickable area */
+/* New VK (vkit) — match native vkitIconButton: 24×24, border-box, 8px right gap */
 .vmu-single-dl-vkit {
-  width: 28px;
-  height: 28px;
-  padding: 6px;
-  margin: -6px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  margin: 0 8px 0 0;
+  box-sizing: border-box;
 }
-/* Old VK — visual size stays 24px, padding adds clickable area */
+/* Old VK — match native .audio_row__action exactly: 24×24, border-box, margin 0 2px */
 .vmu-single-dl-act {
   width: 24px;
   height: 24px;
-  padding: 6px;
-  margin: -6px -4px -6px 0;
+  padding: 0;
+  margin: 0 2px;
   color: #828282;
+  box-sizing: border-box;
+  display: block;
+  line-height: 0;
 }
 /* Show on row hover */
 [class*="vkitAudioRow__root"]:hover .vmu-single-dl,
@@ -564,13 +562,70 @@
 .vmu-single-dl:hover {
   color: #e1e3e6;
 }
+/* Tooltip shared */
+.vmu-single-dl {
+  position: relative;
+}
+.vmu-single-dl::after,
+.vmu-single-dl::before {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .15s;
+  z-index: 100;
+}
+.vmu-single-dl::after {
+  content: attr(data-vmu-tip);
+  white-space: nowrap;
+  font-weight: 400;
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+}
+.vmu-single-dl::before {
+  content: '';
+  border: 6px solid transparent;
+}
+.vmu-single-dl:hover::after,
+.vmu-single-dl:hover::before {
+  opacity: 1;
+}
+/* Old VK tooltip — above button, matches .tt_w.tt_black */
+.vmu-single-dl-act::after {
+  bottom: calc(100% + 5px);
+  background: rgba(0,0,0,0.6);
+  color: #fff;
+  font-size: 13px;
+  padding: 9px 12px 10px;
+  border-radius: 2px;
+}
+.vmu-single-dl-act::before {
+  bottom: calc(100% - 1px);
+  border-top-color: rgba(0,0,0,0.6);
+  border-bottom: none;
+}
+/* Vkit tooltip — below button, matches vkuiTooltipBase__content */
+.vmu-single-dl-vkit::after {
+  top: calc(100% + 5px);
+  background: rgb(50,50,50);
+  color: #e1e3e6;
+  font-size: 13px;
+  padding: 9px 12px 10px;
+  border-radius: 8px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
+}
+.vmu-single-dl-vkit::before {
+  top: calc(100% - 1px);
+  border-bottom-color: rgb(50,50,50);
+  border-top: none;
+}
 /* Native VK actions sit at .7 opacity until directly hovered — match that */
 .audio_row__actions .vmu-single-dl-act {
   opacity: 0.7;
 }
 .audio_row__actions .vmu-single-dl-act:hover {
   opacity: 1;
-  color: #828282;
+  color: #e1e3e6;
 }
 .vmu-single-dl-loading {
   opacity: 1 !important;

@@ -1112,7 +1112,7 @@
     const btn = document.createElement('button');
     btn.className = 'vmu-dupes-dialog-btn';
     btn.setAttribute('data-vmu-dupes-dialog', '1');
-    btn.textContent = 'Дубликаты';
+    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="10" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>`;
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
@@ -1128,7 +1128,7 @@
     const btn = document.createElement('button');
     btn.className = 'vmu-dl-dialog-btn';
     btn.setAttribute('data-vmu-dl-dialog', '1');
-    btn.textContent = 'Скачать';
+    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v10M7 10l3 3 3-3"/><path d="M3 15h14"/></svg>`;
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
@@ -1157,8 +1157,15 @@
     const btnGroup = listenBtn.closest('[class*="vkuiButtonGroup"]');
     if (!btnGroup) return;
 
-    btnGroup.appendChild(makeDupesBtn(plInfo));
-    btnGroup.appendChild(makeDlDialogBtn(plInfo));
+    // Create a new row below the existing buttons
+    const flexParent = btnGroup.parentElement?.parentElement;
+    if (!flexParent) return;
+
+    const newRow = document.createElement('div');
+    newRow.style.cssText = 'display:flex;gap:8px;flex-basis:100%;';
+    newRow.appendChild(makeDupesBtn(plInfo));
+    newRow.appendChild(makeDlDialogBtn(plInfo));
+    flexParent.appendChild(newRow);
   }
 
   // ─── playlist download feature ────────────────────────────────────────────────
@@ -1594,8 +1601,14 @@
 
   async function downloadSingleTrack(track, btnEl) {
     if (!track.url) {
-      // Ask injected.js (page context) to briefly trigger VK's player on this track,
-      // grab the decoded URL from <audio>.src, then restore previous playback state
+      // Try reload_audio API first (no playback needed, same as playlist download)
+      try {
+        const result = await pageCall('VKD_RELOAD_AUDIO', 'VKD_RELOAD_AUDIO_DONE', { ids: [track.id] }, 8000);
+        if (result?.resolved?.[track.id]) track.url = result.resolved[track.id];
+      } catch {}
+    }
+    if (!track.url) {
+      // Fallback: briefly trigger VK's player to sniff the decoded URL
       try {
         const result = await pageCall('VKD_SNIFF_URL', 'VKD_SNIFF_URL_DONE', { trackId: track.id, reloadId: track.reloadId }, 12000);
         if (result?.url) track.url = result.url;
@@ -1641,16 +1654,20 @@
     const btn = document.createElement('button');
     btn.className = 'vmu-single-dl' + (extraClass ? ' ' + extraClass : '');
     btn.innerHTML = ICON_DL_SINGLE;
-    btn.title = 'Скачать';
+    btn.setAttribute('data-vmu-tip', 'Скачать');
+    // Stop mousedown/pointerdown so VK doesn't start playback through our button
+    for (const evt of ['mousedown', 'pointerdown', 'touchstart']) {
+      btn.addEventListener(evt, e => { e.stopPropagation(); e.stopImmediatePropagation(); }, true);
+    }
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
+      e.stopImmediatePropagation();
       if (btn.classList.contains('vmu-single-dl-loading')) return;
-      // Read fresh — virtualized lists recycle row elements for other tracks
       const track = getTrackDataFromRow(row);
       if (!track) { showToast('Не удалось определить трек', true); return; }
       downloadSingleTrack(track, btn);
-    });
+    }, true);
     return btn;
   }
 
