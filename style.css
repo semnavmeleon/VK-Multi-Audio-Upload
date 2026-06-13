@@ -9,21 +9,14 @@
   padding: 4px 0 0;
 }
 
-/* ── Header ───────────────────────────────────────────────────────────────── */
-#vmu-header {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  padding: 0 4px 10px;
-  border-bottom: 1px solid rgba(255,255,255,0.07);
-  flex-shrink: 0;
-}
-#vmu-settings-btn {
+/* ── Settings gear injected into VK's native dialog header ──────────────────── */
+.vmu-settings-btn-header {
   width: 28px;
   height: 28px;
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
+  vertical-align: middle;
   border: none;
   background: rgba(255,255,255,0.06);
   border-radius: 50%;
@@ -31,8 +24,10 @@
   cursor: pointer;
   transition: background .12s, color .12s;
   padding: 0;
+  margin-left: 8px;
+  flex-shrink: 0;
 }
-#vmu-settings-btn:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
+.vmu-settings-btn-header:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
 #vmu-close {
   width: 28px;
   height: 28px;
@@ -51,14 +46,10 @@
 
 /* ── Settings panel ───────────────────────────────────────────────────────── */
 #vmu-settings-panel {
-  border-bottom: 1px solid rgba(255,255,255,0.07);
   flex-shrink: 0;
 }
 .vmu-settings-section {
   padding: 10px 16px;
-}
-.vmu-settings-section + .vmu-settings-section {
-  border-top: 1px solid rgba(255,255,255,0.05);
 }
 .vmu-setting-row {
   display: flex;
@@ -179,7 +170,8 @@
 /* ── "Очистить" placed next to VK's native "Выбрать из своих аудиозаписей" ── */
 .vmu-clear-native {
   font-size: 13px;
-  color: #818c99;
+  color: #71aaeb;
+  text-decoration: underline;
   background: none;
   border: none;
   cursor: pointer;
@@ -188,7 +180,7 @@
   font-family: inherit;
   transition: color .12s;
 }
-.vmu-clear-native:hover { color: #e1e3e6; }
+.vmu-clear-native:hover { color: #1a7ad4; }
 
 /* ── File list ────────────────────────────────────────────────────────────── */
 #vmu-list {
@@ -219,7 +211,6 @@
 /* ── Footer ───────────────────────────────────────────────────────────────── */
 #vmu-footer {
   padding: 8px 0 2px;
-  border-top: 1px solid rgba(255,255,255,0.06);
   display: flex;
   align-items: center;
   justify-content: space-between;

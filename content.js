@@ -886,33 +886,19 @@
   }
 
   // ─── global drag & drop interceptor ──────────────────────────────────────────
-  // VK's own upload dialog (.audio_add_box) has its own drop handling that, if
-  // allowed to see the event, grabs the dropped files into VK's native uploader
-  // (via the preserved vkInput listeners) — tracks then upload silently without
-  // ever reaching our queue/UI. Intercept on document in the CAPTURE phase, which
-  // runs before any listener on .audio_add_box, and stop propagation entirely
-  // whenever the drop happens over our embedded panel.
-  let dndCounter = 0;
-  for (const evt of ['dragenter', 'dragover', 'dragleave', 'drop']) {
-    document.addEventListener(evt, e => {
-      const embedded = document.getElementById('vmu-embedded');
-      if (!embedded || !embedded.contains(e.target)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      const dz = document.getElementById('vmu-dropzone');
-      if (evt === 'dragenter') {
-        dndCounter++;
-        dz?.classList.add('vmu-over');
-      } else if (evt === 'dragleave') {
-        dndCounter--;
-        if (dndCounter <= 0) { dndCounter = 0; dz?.classList.remove('vmu-over'); }
-      } else if (evt === 'drop') {
-        dndCounter = 0;
-        dz?.classList.remove('vmu-over');
-        addFiles([...e.dataTransfer.files].filter(isMP3));
-      }
-    }, true);
-  }
+  // VK's own upload dialog (.audio_add_box) overlays an invisible native drop
+  // target on top of our embedded panel, so e.target during drop is VK's element,
+  // not ours — `embedded.contains(e.target)` never matches. VK's handler then
+  // grabs the dropped files into its native uploader (via the preserved vkInput
+  // listeners), so tracks upload silently without ever reaching our queue/UI.
+  // The actual interception (window-capture + preventDefault/stopImmediatePropagation,
+  // matched by drop COORDINATES against our panel's bounding box) lives in
+  // injector_early.js, which runs at document_start — before VK's own bundle
+  // attaches its window-level drag/drop listeners, so ours fire first regardless
+  // of same-node listener order. It forwards matches here via a custom event.
+  window.addEventListener('vmu-files-dropped', e => {
+    addFiles([...e.detail.files].filter(isMP3));
+  });
 
   function showCompletionGif() {
     const existing = document.getElementById('vmu-gif-overlay');
@@ -1021,10 +1007,6 @@
     const wrap = document.createElement('div');
     wrap.id = 'vmu-embedded';
     wrap.innerHTML = `
-      <div id="vmu-header">
-        <button id="vmu-settings-btn" title="Настройки">${ICON_SETTINGS}</button>
-      </div>
-
       ${buildSettingsPanel()}
 
       <div id="vmu-dropzone">
@@ -1065,6 +1047,25 @@
     pickLink.insertAdjacentElement('afterend', btn);
   }
 
+  // Move the settings gear into VK's native dialog header, right after the title
+  // "Выберите аудиозапись на вашем компьютере" (outside .audio_add_box, so it
+  // survives box.innerHTML reset)
+  function tryInjectSettingsIntoHeader() {
+    if (document.getElementById('vmu-settings-btn')) return;
+    const titleEl = [...document.querySelectorAll('div, span, h1, h2, h3, p')]
+      .find(el => el.children.length === 0 && (el.textContent || '').trim() === 'Выберите аудиозапись на вашем компьютере');
+    if (!titleEl) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'vmu-settings-btn';
+    btn.className = 'vmu-settings-btn-header';
+    btn.title = 'Настройки';
+    btn.innerHTML = ICON_SETTINGS;
+    btn.addEventListener('click', toggleSettings);
+
+    titleEl.appendChild(btn);
+  }
+
   function injectIntoVkDialog(box) {
     if (box.dataset.vmuInjected) return;
     box.dataset.vmuInjected = '1';
@@ -1088,8 +1089,6 @@
   }
 
   function attachEmbeddedHandlers() {
-    document.getElementById('vmu-settings-btn')?.addEventListener('click', toggleSettings);
-
     document.getElementById('vmu-input')?.addEventListener('change', e => {
       addFiles([...e.target.files].filter(isMP3));
       e.target.value = '';
@@ -1770,6 +1769,9 @@
 
     // Place "Очистить" next to VK's native "Выбрать из своих аудиозаписей" link
     if (document.querySelector('.audio_add_box') && !document.getElementById('vmu-clear')) tryInjectClearButton();
+
+    // Move settings gear into the dialog's native header row
+    if (document.querySelector('.audio_add_box') && !document.getElementById('vmu-settings-btn')) tryInjectSettingsIntoHeader();
 
     // Inject download button on music/playlist pages
     if (!document.getElementById('vmu-dl-btn')) tryInjectDlButton();
