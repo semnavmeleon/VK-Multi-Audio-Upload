@@ -13,15 +13,10 @@
 #vmu-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   padding: 0 4px 10px;
   border-bottom: 1px solid rgba(255,255,255,0.07);
   flex-shrink: 0;
-}
-#vmu-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: #e1e3e6;
 }
 #vmu-settings-btn {
   width: 28px;
@@ -181,6 +176,20 @@
 .vmu-pick-btn:active { background: #1567b5; }
 #vmu-input { display: none; }
 
+/* ── "Очистить" placed next to VK's native "Выбрать из своих аудиозаписей" ── */
+.vmu-clear-native {
+  font-size: 13px;
+  color: #818c99;
+  background: none;
+  border: none;
+  cursor: pointer;
+  margin-left: 12px;
+  padding: 0;
+  font-family: inherit;
+  transition: color .12s;
+}
+.vmu-clear-native:hover { color: #e1e3e6; }
+
 /* ── File list ────────────────────────────────────────────────────────────── */
 #vmu-list {
   margin: 0;
@@ -219,14 +228,6 @@
   margin-top: 6px;
 }
 #vmu-status { font-size: 12px; color: #6d6d6d; flex: 1; }
-#vmu-clear {
-  font-size: 12px; color: #6d6d6d;
-  background: none; border: none; cursor: pointer;
-  padding: 3px 8px; border-radius: 5px;
-  transition: color .12s, background .12s;
-  font-family: inherit;
-}
-#vmu-clear:hover { color: #e1e3e6; background: rgba(255,255,255,0.07); }
 
 /* ── Retry button ─────────────────────────────────────────────────────────── */
 .vmu-retry-btn {
@@ -629,8 +630,4 @@
 }
 .vmu-single-dl-loading {
   opacity: 1 !important;
-  animation: vmu-spin 1s linear infinite;
-}
-@keyframes vmu-spin {
-  to { transform: rotate(360deg); }
 }

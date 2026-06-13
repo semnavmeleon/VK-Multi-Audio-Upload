@@ -163,34 +163,6 @@
 
   const _dlSeen = new Set();
 
-  function decodeVKAudioUrl(url) {
-    if (!url || typeof url !== 'string') return null;
-    if (!url.includes('audio_api_unavailable')) return url;
-    try {
-      const m = url.match(/[?&]extra=([^&#]*)/);
-      if (!m) return null;
-      let b64 = m[1].replace(/-/g, '+').replace(/_/g, '/');
-      while (b64.length % 4) b64 += '=';
-      const raw = atob(b64);
-      const sep = raw.indexOf('\t');
-      if (sep < 0) return null;
-      return applyDecodeKey(raw.substring(0, sep), raw.substring(sep + 1));
-    } catch { return null; }
-  }
-
-  function applyDecodeKey(s, key) {
-    if (!key) return s;
-    let r = s;
-    for (const op of (key.match(/([a-z])(\d*)/g) || [])) {
-      const t = op[0], n = parseInt(op.slice(1) || '0', 10) || 0;
-      if (t === 'i') r = r.split('').reverse().join('');
-      else if (t === 'r') { const sh = r.length > 0 ? n % r.length : 0; if (sh > 0) r = r.slice(-sh) + r.slice(0, -sh); }
-      else if (t === 's') { if (n > 0 && n < r.length) r = r.slice(n) + r.slice(0, n); }
-      else if (t === 'x') r = r.split('').map(c => String.fromCharCode(c.charCodeAt(0) ^ n)).join('');
-    }
-    return r;
-  }
-
   // ── Capture playlist access_hash from execute responses ────────────────────
   function capturePlaylistMeta(obj, depth) {
     if (!obj || depth > 10) return;
@@ -242,9 +214,8 @@
     const trackId = `${ownerId}_${id}`;
     if (_dlSeen.has(trackId)) return true;
     _dlSeen.add(trackId);
-    const decoded = decodeVKAudioUrl(obj.url || '');
     const cs = s => typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : String(s || '').trim();
-    window.postMessage({ type: 'VKD_TRACK', track: { id: trackId, title: cs(title), artist: cs(artist), duration: obj.duration || 0, url: decoded } }, '*');
+    window.postMessage({ type: 'VKD_TRACK', track: { id: trackId, title: cs(title), artist: cs(artist), duration: obj.duration || 0, url: obj.url || null } }, '*');
     return true;
   }
 
@@ -256,84 +227,12 @@
     const trackId = `${ownerId}_${id}`;
     if (_dlSeen.has(trackId)) return true;
     _dlSeen.add(trackId);
-    const decoded = decodeVKAudioUrl(url);
     const cs = s => typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : String(s || '').trim();
     window.postMessage({
       type: 'VKD_TRACK',
-      track: { id: trackId, title: cs(title), artist: cs(artist), duration: duration || 0, url: decoded }
+      track: { id: trackId, title: cs(title), artist: cs(artist), duration: duration || 0, url: url || null }
     }, '*');
     return true;
-  }
-
-  // ── Sniff decoded audio URL via VK's own player ────────────────────────────
-  // VK decodes the obfuscated URL internally and sets it as <audio>.src.
-  // We briefly trigger playback for the target track, read the decoded URL,
-  // then restore the previous player state.
-  async function sniffDecodedUrl(trackId, reloadId) {
-    const ap = typeof getAudioPlayer === 'function' ? getAudioPlayer() : null;
-    if (!ap) throw new Error('no audio player');
-
-    const impl = ap._impl;
-    const audioEl = impl && impl._currentAudioEl;
-
-    // Remember current state to restore later
-    const prevAudio = ap._currentAudio;
-    const wasPlaying = ap._isPlaying;
-    const prevSrc = audioEl ? audioEl.src : null;
-
-    // Find the audio row in DOM by trackId and click play
-    const [ownerId, audioId] = trackId.split('_');
-    let row = document.querySelector('[class*="_audio_row_' + trackId + '"]');
-    if (!row) {
-      // vkit rows: find by fiber
-      for (const r of document.querySelectorAll('[class*="vkitAudioRow__root"]')) {
-        const fk = Object.keys(r).find(k => k.startsWith('__reactFiber$'));
-        if (!fk) continue;
-        const p = r[fk].memoizedProps || r[fk].pendingProps;
-        const id = p?.track?.entity?.data?.identity;
-        if (id && String(id.ownerId) === ownerId && String(id.id) === audioId) { row = r; break; }
-      }
-    }
-
-    let playBtn = row && (row.querySelector('._audio_row__play_btn') || row.querySelector('[class*="PlaybackControls"] button'));
-    if (!playBtn && row) playBtn = row.querySelector('button');
-    if (!playBtn) throw new Error('play button not found');
-
-    // Mute to avoid audible blip
-    const prevVol = audioEl ? audioEl.volume : 1;
-    if (audioEl) audioEl.volume = 0;
-
-    playBtn.click();
-
-    // Poll <audio>.src for up to 6s until it changes to a real URL
-    let url = null;
-    for (let i = 0; i < 60; i++) {
-      await pause(100);
-      if (!audioEl) continue;
-      const s = audioEl.src;
-      if (s && s !== prevSrc && !s.startsWith('blob:') && !s.includes('audio_api_unavailable')) {
-        url = s;
-        break;
-      }
-      // Also accept HLS URLs (vkuseraudio /a2/)
-      if (s && s !== prevSrc && s.startsWith('http') && (s.includes('/a2/') || s.includes('vkuseraudio'))) {
-        url = s;
-        break;
-      }
-    }
-
-    // Restore previous state
-    try {
-      if (audioEl) audioEl.volume = prevVol;
-      if (!wasPlaying) ap.pause();
-      // If a different track was playing before, resume it
-      if (wasPlaying && prevAudio && prevAudio !== ap._currentAudio) {
-        ap.play(prevAudio, ap._currentPlaylist);
-      }
-    } catch {}
-
-    if (!url) throw new Error('url not captured');
-    return url;
   }
 
   // ── Message dispatcher ────────────────────────────────────────────────────────
@@ -462,16 +361,6 @@
         }).catch(err => {
           window.postMessage({ type: 'VKD_RELOAD_AUDIO_DONE', ok: false, error: err.message, resolved: {} }, '*');
         });
-        break;
-      }
-
-      case 'VKD_SNIFF_URL': {
-        // Briefly ask VK's own player to resolve the track URL, then read
-        // the decoded URL from <audio>.src and restore previous state.
-        const { trackId, reloadId } = e.data;
-        sniffDecodedUrl(trackId, reloadId)
-          .then(url => window.postMessage({ type: 'VKD_SNIFF_URL_DONE', ok: true, url }, '*'))
-          .catch(err => window.postMessage({ type: 'VKD_SNIFF_URL_DONE', ok: false, error: err.message }, '*'));
         break;
       }
 
@@ -896,11 +785,7 @@
                   const curIsHls = cur && (cur.includes('/a2/') || cur.includes('.m3u8'));
                   if (!cur || (curIsHls && !isHls)) resolved[trackId] = u;
                 };
-                if (rawUrl.startsWith('http') && !rawUrl.includes('audio_api_unavailable')) {
-                  put(rawUrl);
-                } else {
-                  put(decodeVKAudioUrl(rawUrl));
-                }
+                put(rawUrl);
               }
             } else {
               for (const v of obj) walkReload(v, depth + 1);

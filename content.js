@@ -851,8 +851,7 @@
     fileQueue.forEach(f => counts[f.status]++);
 
     let txt = '';
-    if (fileQueue.length === 0)          txt = 'Перетащите файлы или нажмите «Выбрать»';
-    else if (counts.uploading)           txt = 'Загружается…';
+    if (counts.uploading)                txt = 'Загружается…';
     else if (counts.pending)             txt = `В очереди: ${counts.pending}`;
     else if (counts.error && counts.done) txt = `Загружено: ${counts.done}, ошибок: ${counts.error}`;
     else if (counts.done)                txt = `Все треки загружены: ${counts.done}`;
@@ -884,6 +883,35 @@
     });
     renderQueue();
     if (!isProcessing) processQueue();
+  }
+
+  // ─── global drag & drop interceptor ──────────────────────────────────────────
+  // VK's own upload dialog (.audio_add_box) has its own drop handling that, if
+  // allowed to see the event, grabs the dropped files into VK's native uploader
+  // (via the preserved vkInput listeners) — tracks then upload silently without
+  // ever reaching our queue/UI. Intercept on document in the CAPTURE phase, which
+  // runs before any listener on .audio_add_box, and stop propagation entirely
+  // whenever the drop happens over our embedded panel.
+  let dndCounter = 0;
+  for (const evt of ['dragenter', 'dragover', 'dragleave', 'drop']) {
+    document.addEventListener(evt, e => {
+      const embedded = document.getElementById('vmu-embedded');
+      if (!embedded || !embedded.contains(e.target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const dz = document.getElementById('vmu-dropzone');
+      if (evt === 'dragenter') {
+        dndCounter++;
+        dz?.classList.add('vmu-over');
+      } else if (evt === 'dragleave') {
+        dndCounter--;
+        if (dndCounter <= 0) { dndCounter = 0; dz?.classList.remove('vmu-over'); }
+      } else if (evt === 'drop') {
+        dndCounter = 0;
+        dz?.classList.remove('vmu-over');
+        addFiles([...e.dataTransfer.files].filter(isMP3));
+      }
+    }, true);
   }
 
   function showCompletionGif() {
@@ -994,7 +1022,6 @@
     wrap.id = 'vmu-embedded';
     wrap.innerHTML = `
       <div id="vmu-header">
-        <span id="vmu-title">Загрузить несколько треков</span>
         <button id="vmu-settings-btn" title="Настройки">${ICON_SETTINGS}</button>
       </div>
 
@@ -1013,12 +1040,29 @@
       <div id="vmu-list"></div>
 
       <div id="vmu-footer">
-        <span id="vmu-status">Перетащите файлы или нажмите «Выбрать»</span>
+        <span id="vmu-status"></span>
         <div id="vmu-footer-actions"></div>
-        <button id="vmu-clear">Очистить</button>
       </div>
     `;
     return wrap;
+  }
+
+  // Place "Очистить" in the same row as VK's native "Выбрать из своих аудиозаписей"
+  // link in the dialog footer (outside .audio_add_box, so it survives box.innerHTML reset)
+  function tryInjectClearButton() {
+    const pickLink = [...document.querySelectorAll('a, button')]
+      .find(el => (el.textContent || '').trim() === 'Выбрать из своих аудиозаписей');
+    if (!pickLink) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'vmu-clear';
+    btn.className = 'vmu-clear-native';
+    btn.textContent = 'Очистить';
+    btn.addEventListener('click', () => {
+      fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
+      renderQueue();
+    });
+    pickLink.insertAdjacentElement('afterend', btn);
   }
 
   function injectIntoVkDialog(box) {
@@ -1046,30 +1090,10 @@
   function attachEmbeddedHandlers() {
     document.getElementById('vmu-settings-btn')?.addEventListener('click', toggleSettings);
 
-    document.getElementById('vmu-clear')?.addEventListener('click', () => {
-      fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
-      renderQueue();
-    });
-
     document.getElementById('vmu-input')?.addEventListener('change', e => {
       addFiles([...e.target.files].filter(isMP3));
       e.target.value = '';
     });
-
-    const dz = document.getElementById('vmu-dropzone');
-    const embedded = document.getElementById('vmu-embedded');
-    if (dz && embedded) {
-      let dragCounter = 0;
-      embedded.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dz.classList.add('vmu-over'); });
-      embedded.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dz.classList.remove('vmu-over'); } });
-      embedded.addEventListener('dragover', e => e.preventDefault());
-      embedded.addEventListener('drop', e => {
-        e.preventDefault();
-        e.stopPropagation();
-        dragCounter = 0; dz.classList.remove('vmu-over');
-        addFiles([...e.dataTransfer.files].filter(isMP3));
-      });
-    }
 
     document.getElementById('vmu-list')?.addEventListener('click', e => {
       const btn = e.target.closest('.vmu-retry-btn');
@@ -1603,15 +1627,8 @@
     if (!track.url) {
       // Try reload_audio API first (no playback needed, same as playlist download)
       try {
-        const result = await pageCall('VKD_RELOAD_AUDIO', 'VKD_RELOAD_AUDIO_DONE', { ids: [track.id] }, 8000);
+        const result = await pageCall('VKD_RELOAD_AUDIO', 'VKD_RELOAD_AUDIO_DONE', { ids: [track.reloadId || track.id] }, 8000);
         if (result?.resolved?.[track.id]) track.url = result.resolved[track.id];
-      } catch {}
-    }
-    if (!track.url) {
-      // Fallback: briefly trigger VK's player to sniff the decoded URL
-      try {
-        const result = await pageCall('VKD_SNIFF_URL', 'VKD_SNIFF_URL_DONE', { trackId: track.id, reloadId: track.reloadId }, 12000);
-        if (result?.url) track.url = result.url;
       } catch {}
     }
     if (!track.url) { showToast('Не удалось получить ссылку на трек', true); return; }
@@ -1750,6 +1767,9 @@
     // Inject into VK's upload dialog whenever it appears
     const box = document.querySelector('.audio_add_box:not([data-vmu-injected])');
     if (box) injectIntoVkDialog(box);
+
+    // Place "Очистить" next to VK's native "Выбрать из своих аудиозаписей" link
+    if (document.querySelector('.audio_add_box') && !document.getElementById('vmu-clear')) tryInjectClearButton();
 
     // Inject download button on music/playlist pages
     if (!document.getElementById('vmu-dl-btn')) tryInjectDlButton();
