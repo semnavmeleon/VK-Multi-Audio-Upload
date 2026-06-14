@@ -338,12 +338,30 @@
   }
 
   // ─── status helpers ───────────────────────────────────────────────────────────
-  function setPlaylistStatus(text, isError) {
+  function setPlaylistStatus(text, isError, progress) {
     const el = document.getElementById('vmu-pl-status');
     if (!el) return;
-    el.textContent = text;
-    el.style.color = isError ? '#e64646' : '#4bb34b';
+    let textEl = el.querySelector('.vmu-pl-status-text');
+    let progWrap = el.querySelector('.vmu-pl-progress');
+    let bar = el.querySelector('.vmu-pl-progress-bar');
+    // Backfill DOM if a legacy element exists without children
+    if (!textEl) {
+      el.innerHTML = '<div class="vmu-pl-status-text"></div><div class="vmu-pl-progress"><div class="vmu-pl-progress-bar"></div></div>';
+      textEl = el.querySelector('.vmu-pl-status-text');
+      progWrap = el.querySelector('.vmu-pl-progress');
+      bar = el.querySelector('.vmu-pl-progress-bar');
+    }
+    textEl.textContent = text || '';
+    textEl.style.color = isError ? '#e64646' : '#4bb34b';
     el.style.display = text ? 'block' : 'none';
+    if (progress && progress.total > 0) {
+      const pct = Math.min(100, Math.max(0, (progress.loaded / progress.total) * 100));
+      progWrap.style.display = 'block';
+      bar.style.width = pct + '%';
+      bar.classList.toggle('vmu-pl-progress-bar-error', !!isError);
+    } else if (progWrap) {
+      progWrap.style.display = 'none';
+    }
   }
 
   // ─── auto-playlist flow ───────────────────────────────────────────────────────
@@ -554,10 +572,24 @@
   // its IntersectionObserver hits the bottom of the popup). Harvests every row
   // via fiber stamps + DOM fallback. Loops until no new tracks appear for a
   // few iterations. Works for any playlist size (verified on 71-track sample).
-  async function expandPlaylistModal() {
+  // Try to read the playlist's declared track count out of the popup header.
+  // VK renders something like "1000 треков" / "1 трек" / "23 записи" near the
+  // title; pull the first such number we find. Returns null if not visible.
+  function getPlaylistTotalFromModal(modal) {
+    if (!modal) return null;
+    const text = (modal.textContent || '').slice(0, 4000);
+    const m = text.match(/(\d[\d\s ]{0,6})\s*(?:трек(?:а|ов)?|записе?[йяи]|композици[йия])/i);
+    if (!m) return null;
+    const n = parseInt(m[1].replace(/[\s ]/g, ''), 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
+  async function expandPlaylistModal(onProgress) {
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0);
     if (!modal) return [];
+
+    const declaredTotal = getPlaylistTotalFromModal(modal);
 
     const showAll = modal.querySelector('[class*="showAll"], [class*="ShowAll"]')
       || [...modal.querySelectorAll('a, button, [role="button"], div, span')].find(el => {
@@ -607,6 +639,11 @@
     const initialScrollTop = initialScroller ? initialScroller.scrollTop : 0;
 
     await harvest();
+    const reportProgress = () => {
+      if (!onProgress) return;
+      try { onProgress(collected.size, declaredTotal); } catch {}
+    };
+    reportProgress();
     let stable = 0, lastSize = collected.size;
     const MAX_ITER = 60;
     for (let i = 0; i < MAX_ITER && stable < 4; i++) {
@@ -614,6 +651,7 @@
       sc.scrollTop = sc.scrollHeight;
       await sleep(500);
       await harvest();
+      reportProgress();
       if (collected.size === lastSize) stable++; else { stable = 0; lastSize = collected.size; }
     }
 
@@ -628,7 +666,7 @@
 
   async function scanForDuplicates(plInfoArg, statusCallback) {
     const pl = plInfoArg || getPlaylistInfoFromUrl();
-    const report = statusCallback || ((msg, isError) => setPlaylistStatus(msg, isError));
+    const report = statusCallback || ((msg, isError, progress) => setPlaylistStatus(msg, isError, progress));
 
     if (!pl) {
       report('Перейдите на страницу плейлиста для поиска дубликатов', true);
@@ -639,7 +677,10 @@
     report('Раскрываем плейлист…');
 
     try {
-      let tracks = await expandPlaylistModal();
+      let tracks = await expandPlaylistModal((loaded, total) => {
+        if (total) report(`Раскрываем плейлист… ${loaded} / ${total}`, false, { loaded, total });
+        else report(`Раскрываем плейлист… ${loaded}`);
+      });
       if (!tracks.length) tracks = getTracksFromDOM(pl);
 
       if (!tracks.length) {
@@ -669,6 +710,7 @@
       const seen = new Map();
       const dupes = [];
       const dupeIndexSet = new Set();
+      const groupsByKey = new Map();
       for (let i = 0; i < tracks.length; i++) {
         const track = tracks[i];
         const key = `${track.artist}|||${track.title}`.toLowerCase().trim();
@@ -678,10 +720,19 @@
           dupes.push({ track, original: orig.track });
           dupeIndexSet.add(i);
           dupeIndexSet.add(orig.index);
+          let g = groupsByKey.get(key);
+          if (!g) {
+            const label = `${orig.track.artist || ''}${orig.track.artist ? ' — ' : ''}${orig.track.title || ''}`.trim()
+              || `Трек ${orig.index + 1}`;
+            g = { label, indices: [orig.index] };
+            groupsByKey.set(key, g);
+          }
+          g.indices.push(i);
         } else {
           seen.set(key, { track, index: i });
         }
       }
+      const dupeGroups = [...groupsByKey.values()].sort((a, b) => a.indices[0] - b.indices[0]);
 
       const blockedIndices = [];
       for (let i = 0; i < tracks.length; i++) if (tracks[i].isBlocked) blockedIndices.push(i);
@@ -699,7 +750,7 @@
       const dupeIndices = [...dupeIndexSet].sort((a, b) => a - b);
       if (dupes.length) highlightDuplicateTracks(dupes);
       if (blockedIndices.length) highlightBlockedTracks(tracks, blockedIndices);
-      buildIssuePanel(tracks, dupeIndices, blockedIndices);
+      buildIssuePanel(tracks, dupeIndices, blockedIndices, dupeGroups);
     } catch (err) {
       report(`Ошибка: ${err.message}`, true);
     }
@@ -782,15 +833,17 @@
   // the left edge, optional scrollable list of blocked tracks on the right
   // with a single header (counts + copy-to-clipboard). Click any marker or
   // list row to jump to that track in the playlist popup.
-  function buildIssuePanel(tracks, dupeIndices, blockedIndices) {
+  function buildIssuePanel(tracks, dupeIndices, blockedIndices, dupeGroups) {
+    dupeGroups = dupeGroups || [];
     document.getElementById('vmu-issue-panel')?.remove();
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0);
     if (!modal || (!dupeIndices.length && !blockedIndices.length)) return;
 
+    const hasListContent = blockedIndices.length > 0 || dupeGroups.length > 0;
     const panel = document.createElement('div');
     panel.id = 'vmu-issue-panel';
-    panel.classList.toggle('vmu-ip-has-list', blockedIndices.length > 0);
+    panel.classList.toggle('vmu-ip-has-list', hasListContent);
 
     // ── marker column ────────────────────────────────────────────────────
     const mm = document.createElement('div');
@@ -818,7 +871,9 @@
       const mark = document.createElement('button');
       mark.type = 'button';
       mark.className = 'vmu-dupe-marker' + (blocked ? ' vmu-dupe-marker-blocked' : '');
-      mark.style.top = `${(idx / Math.max(1, total - 1)) * 100}%`;
+      // Place each marker at the centre of its track-slot so the first and last
+      // ones stay inside the column instead of being half-clipped at the edges.
+      mark.style.top = `${((idx + 0.5) / Math.max(1, total)) * 100}%`;
       const label = `${t.artist || ''}${t.artist ? ' — ' : ''}${t.title || ''}`.trim() || `Трек ${idx + 1}`;
       mark.title = (blocked ? '[недоступен] ' : '') + label;
       mark.addEventListener('click', e => {
@@ -830,17 +885,18 @@
     }
     panel.appendChild(mm);
 
-    // ── list column (only when blocked tracks exist) ─────────────────────
-    if (blockedIndices.length) {
+    // ── list column (blocked + duplicate groups) ─────────────────────────
+    if (hasListContent) {
       const right = document.createElement('div');
       right.className = 'vmu-ip-listcol';
 
-      const stats = [`Недоступно: ${blockedIndices.length}`];
+      const stats = [];
+      if (blockedIndices.length) stats.push(`Недоступно: ${blockedIndices.length}`);
       if (dupeIndices.length) stats.push(`Дубл: ${dupeIndices.length}`);
       const head = document.createElement('div');
       head.className = 'vmu-bl-head';
       head.innerHTML = `<span class="vmu-bl-title">${stats.join(' · ')}</span>
-        <button class="vmu-bl-copy" type="button" title="Скопировать список">
+        <button class="vmu-bl-copy" type="button" title="Скопировать недоступные">
           <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="12" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>
           <span class="vmu-bl-copy-label">Копировать</span>
         </button>`;
@@ -848,31 +904,88 @@
 
       const list = document.createElement('div');
       list.className = 'vmu-bl-list';
-      const lines = [];
-      for (const idx of blockedIndices) {
-        const t = tracks[idx] || {};
-        const label = `${t.artist || ''}${t.artist ? ' — ' : ''}${t.title || ''}`.trim() || `Трек ${idx + 1}`;
-        lines.push(label);
-        const row = document.createElement('button');
-        row.type = 'button';
-        row.className = 'vmu-bl-item';
-        row.title = label;
-        row.textContent = label;
-        row.addEventListener('click', e => {
-          e.preventDefault(); e.stopPropagation();
-          const trackId = t?.fullId || t?.id;
-          if (trackId) focusModalRowByTrackId(modal, trackId);
-        });
-        list.appendChild(row);
+
+      const blockedLines = [];
+      if (blockedIndices.length) {
+        const sectionHead = document.createElement('div');
+        sectionHead.className = 'vmu-bl-section-head vmu-bl-section-blocked';
+        sectionHead.textContent = `Недоступные · ${blockedIndices.length}`;
+        list.appendChild(sectionHead);
+        for (const idx of blockedIndices) {
+          const t = tracks[idx] || {};
+          const label = `${t.artist || ''}${t.artist ? ' — ' : ''}${t.title || ''}`.trim() || `Трек ${idx + 1}`;
+          blockedLines.push(label);
+          const row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'vmu-bl-item';
+          row.title = label;
+          const rowText = document.createElement('span');
+          rowText.className = 'vmu-bl-item-text';
+          rowText.textContent = label;
+          row.appendChild(rowText);
+          row.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation();
+            const trackId = t?.fullId || t?.id;
+            if (trackId) focusModalRowByTrackId(modal, trackId);
+          });
+          list.appendChild(row);
+        }
       }
+
+      if (dupeGroups.length) {
+        const sectionHead = document.createElement('div');
+        sectionHead.className = 'vmu-bl-section-head vmu-bl-section-dupes';
+        sectionHead.textContent = `Дубликаты · ${dupeGroups.length} ${dupeGroups.length === 1 ? 'группа' : 'групп'}`;
+        list.appendChild(sectionHead);
+        for (const g of dupeGroups) {
+          const group = document.createElement('div');
+          group.className = 'vmu-bl-group';
+
+          const title = document.createElement('div');
+          title.className = 'vmu-bl-group-title';
+          title.title = g.label;
+          const nameSpan = document.createElement('span');
+          nameSpan.className = 'vmu-bl-group-name';
+          nameSpan.textContent = g.label;
+          const countSpan = document.createElement('span');
+          countSpan.className = 'vmu-bl-group-count';
+          countSpan.textContent = '×' + g.indices.length;
+          title.append(nameSpan, countSpan);
+          group.appendChild(title);
+
+          const positions = document.createElement('div');
+          positions.className = 'vmu-bl-group-positions';
+          for (const idx of g.indices) {
+            const t = tracks[idx] || {};
+            const pos = document.createElement('button');
+            pos.type = 'button';
+            pos.className = 'vmu-bl-pos';
+            pos.textContent = `#${idx + 1}`;
+            pos.title = g.label;
+            pos.addEventListener('click', e => {
+              e.preventDefault(); e.stopPropagation();
+              const trackId = t?.fullId || t?.id;
+              if (trackId) focusModalRowByTrackId(modal, trackId);
+            });
+            positions.appendChild(pos);
+          }
+          group.appendChild(positions);
+          list.appendChild(group);
+        }
+      }
+
       right.appendChild(list);
 
       const copyBtn = head.querySelector('.vmu-bl-copy');
+      const copyText = blockedLines.length
+        ? blockedLines.join('\n')
+        : dupeGroups.map(g => `${g.label} (×${g.indices.length}: ${g.indices.map(i => '#' + (i + 1)).join(', ')})`).join('\n');
+      if (!blockedLines.length) copyBtn.title = 'Скопировать дубликаты';
       copyBtn.addEventListener('click', e => {
         e.preventDefault(); e.stopPropagation();
         const labelEl = copyBtn.querySelector('.vmu-bl-copy-label');
         const orig = labelEl?.textContent || 'Копировать';
-        navigator.clipboard.writeText(lines.join('\n')).then(() => {
+        navigator.clipboard.writeText(copyText).then(() => {
           if (labelEl) labelEl.textContent = 'Скопировано';
           copyBtn.classList.add('vmu-bl-copy-ok');
           setTimeout(() => {
@@ -1001,7 +1114,10 @@
           </div>
         </div>
 
-        <div id="vmu-pl-status" style="display:none;padding:6px 12px 8px;font-size:11.5px;color:#4bb34b;font-family:inherit"></div>
+        <div id="vmu-pl-status" style="display:none">
+          <div class="vmu-pl-status-text"></div>
+          <div class="vmu-pl-progress"><div class="vmu-pl-progress-bar"></div></div>
+        </div>
       </div>`;
   }
 
@@ -2090,7 +2206,14 @@
       // ALWAYS extract from popup DOM via React fiber (runs in page context via injected.js)
       dlSetPhase('Читаем треки из попапа…');
 
-      await expandPlaylistModal();
+      await expandPlaylistModal((loaded, total) => {
+        if (total) {
+          dlSetPhase(`Раскрываем плейлист… ${loaded} / ${total}`);
+          dlSetProgress(loaded, total);
+        } else {
+          dlSetPhase(`Раскрываем плейлист… ${loaded}`);
+        }
+      });
 
       // Extract via page context (injected.js can read React fiber, content.js cannot)
       // Fiber extraction is authoritative — it reads only tracks visible in the playlist popup
