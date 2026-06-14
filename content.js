@@ -1198,25 +1198,22 @@
 
     const hasWork = counts.pending > 0 || counts.uploading > 0;
     const allSettled = fileQueue.length > 0 && !hasWork;
-    const fa = document.getElementById('vmu-footer-actions');
-    if (fa) {
-      if (hasWork) {
-        const lbl = isPaused ? '▶ Продолжить' : '⏸ Пауза';
-        fa.innerHTML = `<button class="vmu-action-btn vmu-pause-btn ${isPaused ? 'vmu-resume' : ''}" id="vmu-pause-btn">${lbl}</button>`;
-      } else if (allSettled && counts.error > 0) {
-        fa.innerHTML = `
-          <button class="vmu-action-btn" id="vmu-copy-failed">
-            <svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="12" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>
-            Скопировать
-          </button>
-          <button class="vmu-action-btn" id="vmu-retry-all">
-            <svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5v5h-5"/><path d="M16.7 14a7 7 0 1 1-1.4-7.4L17 8"/></svg>
-            Повторить
-          </button>`;
-      } else {
-        fa.innerHTML = '';
-      }
+    const buttons = [];
+    if (hasWork) {
+      const pauseIcon = isPaused
+        ? `<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M4 2 L11 7 L4 12 Z"/></svg>`
+        : `<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><rect x="3" y="2" width="3" height="10" rx="0.8"/><rect x="8" y="2" width="3" height="10" rx="0.8"/></svg>`;
+      buttons.push(`<button class="vmu-action-btn vmu-pause-btn ${isPaused ? 'vmu-resume' : ''}" id="vmu-pause-btn" data-vmu-tip="${isPaused ? 'Продолжить' : 'Пауза'}">${pauseIcon}</button>`);
     }
+    if (allSettled && counts.error > 0) {
+      buttons.push(`<button class="vmu-action-btn" id="vmu-copy-failed" data-vmu-tip="Скопировать имена ошибок">
+          <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="12" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>
+        </button>`);
+      buttons.push(`<button class="vmu-action-btn" id="vmu-retry-all" data-vmu-tip="Повторить все">
+          <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5v5h-5"/><path d="M16.7 14a7 7 0 1 1-1.4-7.4L17 8"/></svg>
+        </button>`);
+    }
+    renderUploadSidePanel(buttons.join(''));
   }
 
   // ─── queue ────────────────────────────────────────────────────────────────────
@@ -1412,10 +1409,80 @@
 
       <div id="vmu-footer">
         <span id="vmu-status"></span>
-        <div id="vmu-footer-actions"></div>
       </div>
     `;
     return wrap;
+  }
+
+  // Floating side panel rendered OUTSIDE the .audio_add_box popup, pinned to
+  // its right edge. Same approach as the playlist dupe/blocked-tracks panel.
+  // Contains icon-only action buttons (pause, copy-failed, retry-all). Auto-
+  // disappears when there's nothing actionable.
+  function renderUploadSidePanel(buttonsHtml) {
+    if (!buttonsHtml) {
+      const old = document.getElementById('vmu-upload-side');
+      if (old) { old._vmuCleanup?.(); old.remove(); }
+      return;
+    }
+    const box = document.querySelector('.audio_add_box');
+    const popup = box?.closest('.popup_box_container');
+    if (!popup) {
+      const old = document.getElementById('vmu-upload-side');
+      if (old) { old._vmuCleanup?.(); old.remove(); }
+      return;
+    }
+    let panel = document.getElementById('vmu-upload-side');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'vmu-upload-side';
+      document.body.appendChild(panel);
+
+      const positionPanel = () => {
+        const r = popup.getBoundingClientRect();
+        if (r.width === 0) {
+          panel._vmuCleanup?.();
+          panel.remove();
+          return;
+        }
+        panel.style.left = (r.right + 8) + 'px';
+        // Vertically centered on the popup's right edge
+        const ph = panel.offsetHeight || 0;
+        panel.style.top = Math.max(8, r.top + (r.height - ph) / 2) + 'px';
+      };
+      positionPanel();
+      // Re-center once the panel has its real height after the first render
+      requestAnimationFrame(positionPanel);
+      const ro = new ResizeObserver(positionPanel);
+      ro.observe(popup);
+      window.addEventListener('resize', positionPanel);
+      window.addEventListener('scroll', positionPanel, true);
+      const mo = new MutationObserver(() => {
+        if (!document.body.contains(popup) || popup.getBoundingClientRect().width === 0) {
+          panel._vmuCleanup?.();
+          panel.remove();
+        }
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+      panel._vmuCleanup = () => {
+        ro.disconnect();
+        mo.disconnect();
+        window.removeEventListener('resize', positionPanel);
+        window.removeEventListener('scroll', positionPanel, true);
+      };
+      panel.addEventListener('click', e => {
+        if (e.target.closest('#vmu-copy-failed')) copyFailed();
+        else if (e.target.closest('#vmu-retry-all')) retryAll();
+        else if (e.target.closest('#vmu-pause-btn')) togglePause();
+      });
+    }
+    panel.innerHTML = buttonsHtml;
+    // Re-center vertically against the popup after the content height changes
+    const popup2 = document.querySelector('.audio_add_box')?.closest('.popup_box_container');
+    if (popup2) {
+      const r = popup2.getBoundingClientRect();
+      const ph = panel.offsetHeight || 0;
+      panel.style.top = Math.max(8, r.top + (r.height - ph) / 2) + 'px';
+    }
   }
 
   // Place "Очистить" in the same row as VK's native "Выбрать из своих аудиозаписей"
@@ -1492,11 +1559,8 @@
       if (cancelBtn) { cancelOne(parseInt(cancelBtn.dataset.idx, 10)); return; }
     });
 
-    document.getElementById('vmu-footer')?.addEventListener('click', e => {
-      if (e.target.closest('#vmu-copy-failed')) copyFailed();
-      else if (e.target.closest('#vmu-retry-all')) retryAll();
-      else if (e.target.closest('#vmu-pause-btn')) togglePause();
-    });
+    // The side action buttons live in a floating panel outside the popup; its
+    // click listener is wired up in renderUploadSidePanel().
 
     attachSettingsHandlers();
   }

@@ -228,51 +228,78 @@
 }
 .vmu-cancel-btn:hover { color: #e64646; background: rgba(230,70,70,0.12); }
 
-/* ── Pause / Resume button (footer) ───────────────────────────────────────── */
-.vmu-pause-btn {
-  font-size: 12px;
-  font-family: inherit;
-  background: rgba(38,136,235,0.12);
-  border: 1px solid rgba(38,136,235,0.35);
-  border-radius: 6px;
-  color: #2688eb;
-  cursor: pointer;
-  padding: 4px 10px;
-  white-space: nowrap;
-  transition: background .12s, color .12s;
-}
-.vmu-pause-btn:hover { background: rgba(38,136,235,0.22); color: #fff; }
-.vmu-pause-btn.vmu-resume {
-  background: rgba(75,179,75,0.14);
-  border-color: rgba(75,179,75,0.4);
-  color: #4bb34b;
-}
-.vmu-pause-btn.vmu-resume:hover { background: rgba(75,179,75,0.25); color: #fff; }
+/* Pause/Resume — same neutral colour as the rest of the strip (no green/blue) */
 
-/* ── Footer actions ───────────────────────────────────────────────────────── */
-/* Match VK's native vkuiButton appearanceOverlay (white bg, black text,
-   8px radius), same family as the dialog buttons used elsewhere. */
-#vmu-footer-actions { display: flex; gap: 6px; flex-shrink: 0; }
+/* ── Floating side panel: vertically centered on popup's right edge ─────── */
+#vmu-upload-side {
+  position: fixed;
+  z-index: 9700;
+  background: rgba(35,35,36,0.92);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 7px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+}
+#vmu-upload-side:empty { display: none; }
+
+/* Compact icon-only buttons in VK action-icon style (transparent on dark) */
 .vmu-action-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  font-family: inherit;
-  font-weight: 500;
-  background: #ffffff;
+  justify-content: center;
+  background: transparent;
   border: none;
-  border-radius: 8px;
-  color: #000000;
+  border-radius: 6px;
+  color: #99a2ad;
   cursor: pointer;
-  padding: 5px 11px;
-  transition: background .12s;
-  white-space: nowrap;
-  line-height: 1.2;
+  transition: background .12s, color .12s;
+  flex-shrink: 0;
+  position: relative;
+  font-family: inherit;
 }
-.vmu-action-btn:hover { background: #f0f1f3; }
-.vmu-action-btn:active { background: #e4e6ea; }
-.vmu-action-btn svg { display: block; flex-shrink: 0; }
+.vmu-action-btn:hover { background: rgba(255,255,255,0.08); color: #e1e3e6; }
+.vmu-action-btn:active { background: rgba(255,255,255,0.14); }
+.vmu-action-btn svg { display: block; width: 12px; height: 12px; }
+
+/* Tooltip on hover — same VK overlay-style as elsewhere in the plugin */
+.vmu-action-btn::after,
+.vmu-action-btn::before {
+  position: absolute;
+  right: calc(100% + 5px);
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .15s;
+  z-index: 100;
+}
+.vmu-action-btn::after {
+  content: attr(data-vmu-tip);
+  white-space: nowrap;
+  font-size: 12px;
+  background: rgb(50,50,50);
+  color: #e1e3e6;
+  padding: 6px 10px;
+  border-radius: 6px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
+}
+.vmu-action-btn::before {
+  content: '';
+  right: calc(100% - 1px);
+  border: 5px solid transparent;
+  border-left-color: rgb(50,50,50);
+  border-right: none;
+}
+.vmu-action-btn:hover::after,
+.vmu-action-btn:hover::before { opacity: 1; }
 
 /* ── Playlist status bar ──────────────────────────────────────────────────── */
 #vmu-pl-status {
