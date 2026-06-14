@@ -68,10 +68,6 @@
   const fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
   const escHtml = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 
-  function getVkBtn() {
-    return document.querySelector('[aria-label="Загрузить аудиозапись"]');
-  }
-
   function waitForElement(sel, ms) {
     return new Promise(resolve => {
       const el = document.querySelector(sel);
@@ -916,10 +912,15 @@
     setTimeout(dismiss, 4000);
   }
 
+  function setBlockAudioHide(block) {
+    window.postMessage({ type: 'VMU_BLOCK_AUDIO_HIDE', block }, '*');
+  }
+
   async function processQueue() {
     if (isProcessing) return;
     const next = fileQueue.find(f => f.status === 'pending');
     if (!next) {
+      setBlockAudioHide(false);
       renderQueue();
       if (fileQueue.length > 0 && !fileQueue.some(f => f.status === 'uploading')) {
         // Trigger auto-playlist if enabled (once per completed batch)
@@ -932,6 +933,7 @@
       return;
     }
 
+    setBlockAudioHide(true);
     isProcessing = true;
     next.status = 'uploading';
     renderQueue();
@@ -968,7 +970,6 @@
       }
     }
 
-    // Dialog is already open — just inject directly into VK's hidden input.
     // Set the callback before injection to avoid losing a fast upload response.
     const uploadPromise = new Promise((resolve, reject) => {
       const t = setTimeout(() => {
@@ -1063,6 +1064,8 @@
     btn.innerHTML = ICON_SETTINGS;
     btn.addEventListener('click', toggleSettings);
 
+    titleEl.style.display = 'flex';
+    titleEl.style.alignItems = 'center';
     titleEl.appendChild(btn);
   }
 

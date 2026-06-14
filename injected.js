@@ -5,6 +5,90 @@
 
   const pause = ms => new Promise(r => setTimeout(r, ms));
 
+  // ── Prevent VK from auto-closing the audio upload popup ──────────────────────
+  // VK's popup system is window.boxQueue; after a successful upload it calls
+  // boxQueue._hide(id) (and the instance's .hide()) on the audio_add_box popup.
+  // content.js toggles __vmuBlockAudioBoxHide via postMessage while the queue
+  // still has files to upload; while it's true, any hide call against a popup
+  // that contains .audio_add_box becomes a no-op.
+  let __vmuBlockAudioBoxHide = false;
+
+  function boxHasAudioAddBox(box) {
+    if (!box) return false;
+    const node = box.bodyNode || box.node || box._node || box.contentNode;
+    return !!(node && node.querySelector && node.querySelector('.audio_add_box'));
+  }
+
+  function patchBoxQueue() {
+    const bq = window.boxQueue;
+    if (!bq || bq.__vmuPatched) return;
+    const origHide = bq._hide.bind(bq);
+    bq._hide = function (id) {
+      if (__vmuBlockAudioBoxHide) {
+        const b = window._message_boxes && window._message_boxes[id];
+        if (boxHasAudioAddBox(b)) return;
+      }
+      return origHide(id);
+    };
+    bq.__vmuPatched = true;
+  }
+
+  // Patch the instance methods of any audio-upload box (each box is built from
+  // a factory and has its own .content / .hide copies — so we patch per instance
+  // when we see one appear).
+  function patchAudioBoxInstance(box) {
+    if (!box || box.__vmuPatched) return;
+    box.__vmuPatched = true;
+    const origContent = box.content && box.content.bind(box);
+    if (origContent) {
+      box.content = function (e) {
+        if (__vmuBlockAudioBoxHide) return;
+        return origContent(e);
+      };
+    }
+    // The box has multiple "hide" entry points (hide / _hide / _hideForce /
+    // _hideInternal) plus destroy — patch all of them.
+    for (const m of ['hide', '_hide', '_hideForce', '_hideInternal', 'destroy']) {
+      const orig = box[m] && box[m].bind(box);
+      if (!orig) continue;
+      box[m] = function (...args) {
+        if (__vmuBlockAudioBoxHide) return m === 'hide' ? false : undefined;
+        return orig(...args);
+      };
+    }
+    // Block VK's post-upload re-skinning of the popup: it changes the title
+    // via setOptions({title}) and adds a "Закрыть" button via setButtons /
+    // addButton / setControlsText. Suppress all of those while locked.
+    for (const m of ['setOptions', 'setButtons', 'addButton', 'removeButtons', 'setControlsText', 'setBackTitle']) {
+      const orig = box[m] && box[m].bind(box);
+      if (!orig) continue;
+      box[m] = function (...args) {
+        if (__vmuBlockAudioBoxHide) return;
+        return orig(...args);
+      };
+    }
+  }
+
+  function scanAndPatchAudioBoxes() {
+    const mb = window._message_boxes;
+    if (!mb) return;
+    for (const id in mb) {
+      if (boxHasAudioAddBox(mb[id])) patchAudioBoxInstance(mb[id]);
+    }
+  }
+
+  const __vmuBoxQueuePoll = setInterval(() => {
+    patchBoxQueue();
+    scanAndPatchAudioBoxes();
+  }, 300);
+
+  window.addEventListener('message', e => {
+    if (e.source !== window || !e.data) return;
+    if (e.data.type === 'VMU_BLOCK_AUDIO_HIDE') {
+      __vmuBlockAudioBoxHide = !!e.data.block;
+    }
+  });
+
   // ── Capture VK's own al_audio.php hashes for reuse ───────────────────────────
   window.__vmuHashes = {};
   // Callback for one-shot response capture
@@ -254,7 +338,7 @@
             input.files = dt.files;
             input.dispatchEvent(new Event('change', { bubbles: true }));
             window.postMessage({ type: 'VK_FILE_INJECTED', ok: true }, '*');
-          } else if (tries++ < 20) {
+          } else if (tries++ < 100) {
             setTimeout(tryInject, 200);
           } else {
             window.postMessage({ type: 'VK_FILE_INJECTED', ok: false, error: 'input not found' }, '*');
