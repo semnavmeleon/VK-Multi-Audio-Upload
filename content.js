@@ -37,6 +37,9 @@
   let isProcessing = false;
   let uploadDoneCallback = null;
   let autoPlaylistRunning = false;
+  let isPaused = false;
+  let currentUploadingItem = null;
+  let itemIdCounter = 0;
 
   // ─── playlist download state ──────────────────────────────────────────────────
   const dlTracks = new Map();   // trackId -> {id, title, artist, url}
@@ -59,6 +62,13 @@
     if (e.data?.type === 'VKD_TRACK') {
       const t = e.data.track;
       if (t?.id && !dlTracks.has(t.id)) dlTracks.set(t.id, t);
+    }
+    if (e.data?.type === 'VK_UPLOAD_PROGRESS' && currentUploadingItem) {
+      const total = e.data.total || 0;
+      if (total > 0) {
+        currentUploadingItem.progress = e.data.loaded / total;
+        updateRowProgress(currentUploadingItem.id);
+      }
     }
   });
 
@@ -83,7 +93,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false };
 
   function loadSettings() {
     try {
@@ -98,6 +108,7 @@
         autoPlaylist: settings.autoPlaylist,
         coverDataUrl: settings.coverDataUrl,
         autoMeta: settings.autoMeta,
+        autoCoverFromId3: settings.autoCoverFromId3,
       }));
     } catch {}
   }
@@ -172,7 +183,8 @@
   // ─── ID3 tag reader ───────────────────────────────────────────────────────────
   async function readID3(file) {
     try {
-      const buf = await file.slice(0, 131072).arrayBuffer();
+      // Larger slice so embedded APIC cover art (often 200KB–1MB JPEG) fits
+      const buf = await file.slice(0, 2_097_152).arrayBuffer();
       const v = new Uint8Array(buf);
       if (v[0] !== 73 || v[1] !== 68 || v[2] !== 51) return {};
       const ver = v[3];
@@ -198,6 +210,30 @@
           } catch {
             tags[id] = new TextDecoder('utf-8',{fatal:false}).decode(bytes).replace(/\0/g,'').trim();
           }
+        } else if (id === 'APIC' && sz > 0 && p + sz <= v.length && !tags.APIC) {
+          try {
+            const frameEnd = p + sz;
+            const enc = v[p];
+            let q = p + 1;
+            // MIME type (ASCII, null-terminated)
+            const mimeStart = q;
+            while (q < frameEnd && v[q] !== 0) q++;
+            const mime = String.fromCharCode(...v.slice(mimeStart, q));
+            q++;                 // skip null
+            if (q < frameEnd) q++; // picture type byte
+            // Description (encoding-dependent null terminator)
+            if (enc === 1 || enc === 2) {
+              while (q + 1 < frameEnd && !(v[q] === 0 && v[q+1] === 0)) q++;
+              q += 2;
+            } else {
+              while (q < frameEnd && v[q] !== 0) q++;
+              q++;
+            }
+            const data = v.slice(q, frameEnd);
+            if (data.length > 100 && /^image\//.test(mime)) {
+              tags.APIC = { mime, data };
+            }
+          } catch {}
         }
         p += Math.max(0, sz);
       }
@@ -352,11 +388,31 @@
         return { artist: '', title: name };
       });
 
-      // Prepare cover blob BEFORE opening the dialog (inject it during creation)
+      // Prepare cover blob BEFORE opening the dialog (inject it during creation).
+      // Priority: user-set base cover from settings → if the "Обложка из ID3"
+      // toggle is on, first file's embedded ID3 APIC frame. Either source is
+      // passed through makePerezalitoCover so the watermark applies uniformly.
       let coverBlob = null;
+      let coverSource = null;
       if (settings.coverDataUrl) {
+        coverSource = settings.coverDataUrl;
+      } else if (settings.autoCoverFromId3) {
+        const apicItem = done.find(i => i.tags?.APIC?.data);
+        if (apicItem) {
+          setPlaylistStatus('Извлекаем обложку из ID3…');
+          const apic = apicItem.tags.APIC;
+          const apicBlob = new Blob([apic.data], { type: apic.mime || 'image/jpeg' });
+          coverSource = await new Promise(res => {
+            const r = new FileReader();
+            r.onload = () => res(r.result);
+            r.onerror = () => res(null);
+            r.readAsDataURL(apicBlob);
+          });
+        }
+      }
+      if (coverSource) {
         setPlaylistStatus('Готовим обложку…');
-        coverBlob = await makePerezalitoCover(settings.coverDataUrl);
+        coverBlob = await makePerezalitoCover(coverSource);
       }
 
       // Create playlist: opens VK dialog, fills fields, injects cover, selects tracks, saves
@@ -528,11 +584,12 @@
       await sleep(80);
       const rows = modal.querySelectorAll('[class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
       for (const r of rows) {
-        let id = null, title = '', artist = '', fullId = null;
+        let id = null, title = '', artist = '', fullId = null, isBlocked = false;
         if (r.dataset && r.dataset.vmuTrack) {
           try {
             const t = JSON.parse(r.dataset.vmuTrack);
             id = t.id; fullId = t.id; title = t.title || ''; artist = t.artist || '';
+            isBlocked = !!t.isBlocked;
           } catch {}
         }
         if (!id && r.dataset && r.dataset.fullId) {
@@ -540,7 +597,7 @@
           title = (r.querySelector('.audio_title, .ai_title, [class*="title"]')?.textContent || '').trim();
           artist = (r.querySelector('.audio_artist, .ai_artist, [class*="performers"]')?.textContent || '').trim();
         }
-        if (id && !collected.has(id)) collected.set(id, { id, fullId, title, artist });
+        if (id && !collected.has(id)) collected.set(id, { id, fullId, title, artist, isBlocked });
       }
     }
 
@@ -626,15 +683,23 @@
         }
       }
 
-      if (!dupes.length) {
-        report(`Дубликаты не найдены в ${tracks.length} треках`);
+      const blockedIndices = [];
+      for (let i = 0; i < tracks.length; i++) if (tracks[i].isBlocked) blockedIndices.push(i);
+
+      if (!dupes.length && !blockedIndices.length) {
+        report(`В ${tracks.length} треках всё чисто`);
         return;
       }
 
-      report(`Найдено ${dupes.length} дубликатов из ${tracks.length} треков`);
+      const msgParts = [];
+      if (dupes.length) msgParts.push(`Дубликатов: ${dupes.length}`);
+      if (blockedIndices.length) msgParts.push(`Недоступных: ${blockedIndices.length}`);
+      report(`${msgParts.join(' · ')} из ${tracks.length}`);
+
       const dupeIndices = [...dupeIndexSet].sort((a, b) => a - b);
-      highlightDuplicateTracks(dupes);
-      buildDupeMinimap(tracks, dupeIndices);
+      if (dupes.length) highlightDuplicateTracks(dupes);
+      if (blockedIndices.length) highlightBlockedTracks(tracks, blockedIndices);
+      buildIssuePanel(tracks, dupeIndices, blockedIndices);
     } catch (err) {
       report(`Ошибка: ${err.message}`, true);
     }
@@ -662,102 +727,193 @@
     }
   }
 
-  // Clear highlight rows and tear down the minimap (used at scan start, and
-  // automatically when the playlist modal closes).
-  function clearDupeMarkers() {
-    document.querySelectorAll('.vmu-dupe-highlight').forEach(el => el.classList.remove('vmu-dupe-highlight'));
-    const m = document.getElementById('vmu-dupe-minimap');
-    if (m) {
-      m._vmuCleanup?.();
-      m.remove();
+  // Mark blocked / VK-unavailable tracks with a red accent. Detected from
+  // entity.data.isBlocked (or null url) — set by markRowTrackData in injected.js.
+  function highlightBlockedTracks(tracks, blockedIndices) {
+    const ids = new Set();
+    for (const i of blockedIndices) {
+      const t = tracks[i];
+      if (t?.fullId) ids.add(t.fullId);
+      if (t?.id) ids.add(String(t.id));
+    }
+    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [class*="vkitAudioRow__root"], .audio_row');
+    for (const row of rows) {
+      let rowId = row.dataset?.fullId || null;
+      if (!rowId && row.dataset?.vmuTrack) {
+        try { rowId = JSON.parse(row.dataset.vmuTrack).id; } catch {}
+      }
+      if (rowId && ids.has(rowId)) row.classList.add('vmu-blocked-highlight');
     }
   }
 
-  // VS-Code-style minimap on the right edge of the playlist popup with one
-  // marker per duplicate track. Click a marker to scroll the popup to that row.
-  // Position is recomputed on modal resize/scroll, and the strip self-destructs
-  // when the modal disappears.
-  function buildDupeMinimap(tracks, dupeIndices) {
-    document.getElementById('vmu-dupe-minimap')?.remove();
+  // Clear highlight rows and tear down the minimap (used at scan start, and
+  // automatically when the playlist modal closes).
+  function clearDupeMarkers() {
+    document.querySelectorAll('.vmu-dupe-highlight, .vmu-blocked-highlight').forEach(el => {
+      el.classList.remove('vmu-dupe-highlight');
+      el.classList.remove('vmu-blocked-highlight');
+    });
+    const panel = document.getElementById('vmu-issue-panel');
+    if (panel) {
+      panel._vmuCleanup?.();
+      panel.remove();
+    }
+  }
+
+  // Helper: scroll a popup row into view and flash it. Used by both the
+  // minimap markers and the blocked-list entries.
+  function focusModalRowByTrackId(modal, trackId) {
+    let row = null;
+    try { row = modal.querySelector(`[data-full-id="${CSS.escape(String(trackId))}"]`); } catch {}
+    if (!row) {
+      row = [...modal.querySelectorAll('[data-vmu-track]')].find(r => {
+        try { return JSON.parse(r.dataset.vmuTrack).id === trackId; } catch { return false; }
+      }) || null;
+    }
+    if (!row) return;
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.classList.remove('vmu-dupe-flash');
+    void row.offsetWidth;
+    row.classList.add('vmu-dupe-flash');
+    setTimeout(() => row.classList.remove('vmu-dupe-flash'), 1400);
+  }
+
+  // Unified issue panel: small marker strip (dupes amber + blocked red) on
+  // the left edge, optional scrollable list of blocked tracks on the right
+  // with a single header (counts + copy-to-clipboard). Click any marker or
+  // list row to jump to that track in the playlist popup.
+  function buildIssuePanel(tracks, dupeIndices, blockedIndices) {
+    document.getElementById('vmu-issue-panel')?.remove();
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0);
-    if (!modal || !dupeIndices.length) return;
+    if (!modal || (!dupeIndices.length && !blockedIndices.length)) return;
 
-    const strip = document.createElement('div');
-    strip.id = 'vmu-dupe-minimap';
-    const total = tracks.length;
-    const head = document.createElement('div');
-    head.className = 'vmu-dupe-minimap-head';
-    head.textContent = String(dupeIndices.length);
-    head.title = `Дубликатов: ${dupeIndices.length}`;
-    strip.appendChild(head);
+    const panel = document.createElement('div');
+    panel.id = 'vmu-issue-panel';
+    panel.classList.toggle('vmu-ip-has-list', blockedIndices.length > 0);
+
+    // ── marker column ────────────────────────────────────────────────────
+    const mm = document.createElement('div');
+    mm.className = 'vmu-ip-mm';
+    // Show numeric badge only when there is no separate list to label things
+    if (!blockedIndices.length && dupeIndices.length) {
+      const badge = document.createElement('div');
+      badge.className = 'vmu-ip-mm-badge';
+      badge.textContent = String(dupeIndices.length);
+      badge.title = `Дубликатов: ${dupeIndices.length}`;
+      mm.appendChild(badge);
+    }
     const inner = document.createElement('div');
-    inner.className = 'vmu-dupe-minimap-inner';
-    strip.appendChild(inner);
+    inner.className = 'vmu-ip-mm-inner';
+    mm.appendChild(inner);
 
-    for (const idx of dupeIndices) {
-      const mark = document.createElement('button');
-      mark.className = 'vmu-dupe-marker';
-      mark.style.top = `${(idx / Math.max(1, total - 1)) * 100}%`;
+    const total = tracks.length;
+    const blockedSet = new Set(blockedIndices);
+    const all = [
+      ...blockedIndices.map(idx => ({ idx, blocked: true })),
+      ...dupeIndices.filter(idx => !blockedSet.has(idx)).map(idx => ({ idx, blocked: false })),
+    ];
+    for (const { idx, blocked } of all) {
       const t = tracks[idx] || {};
-      mark.title = `${t.artist || ''}${t.artist ? ' — ' : ''}${t.title || ''}`.trim() || `Трек ${idx + 1}`;
+      const mark = document.createElement('button');
+      mark.type = 'button';
+      mark.className = 'vmu-dupe-marker' + (blocked ? ' vmu-dupe-marker-blocked' : '');
+      mark.style.top = `${(idx / Math.max(1, total - 1)) * 100}%`;
+      const label = `${t.artist || ''}${t.artist ? ' — ' : ''}${t.title || ''}`.trim() || `Трек ${idx + 1}`;
+      mark.title = (blocked ? '[недоступен] ' : '') + label;
       mark.addEventListener('click', e => {
         e.preventDefault(); e.stopPropagation();
         const trackId = t?.fullId || t?.id;
-        if (!trackId) return;
-        // Tracks are all in DOM after expandPlaylistModal (no virtualization
-        // inside the popup once VK has loaded them). Look up directly and
-        // scroll the row into the viewport, then flash it.
-        let row = null;
-        try { row = modal.querySelector(`[data-full-id="${CSS.escape(String(trackId))}"]`); } catch {}
-        if (!row) {
-          row = [...modal.querySelectorAll('[data-vmu-track]')].find(r => {
-            try { return JSON.parse(r.dataset.vmuTrack).id === trackId; } catch { return false; }
-          }) || null;
-        }
-        if (!row) return;
-        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        row.classList.remove('vmu-dupe-flash');
-        void row.offsetWidth;
-        row.classList.add('vmu-dupe-flash');
-        setTimeout(() => row.classList.remove('vmu-dupe-flash'), 1400);
+        if (trackId) focusModalRowByTrackId(modal, trackId);
       });
       inner.appendChild(mark);
     }
-    document.body.appendChild(strip);
+    panel.appendChild(mm);
 
-    // Fixed compact strip — does NOT span the modal height. Pinned to the
-    // viewport at roughly the modal's vertical mid-line so it follows the
-    // popup but stays a small clickable widget regardless of playlist size.
-    const positionStrip = () => {
+    // ── list column (only when blocked tracks exist) ─────────────────────
+    if (blockedIndices.length) {
+      const right = document.createElement('div');
+      right.className = 'vmu-ip-listcol';
+
+      const stats = [`Недоступно: ${blockedIndices.length}`];
+      if (dupeIndices.length) stats.push(`Дубл: ${dupeIndices.length}`);
+      const head = document.createElement('div');
+      head.className = 'vmu-bl-head';
+      head.innerHTML = `<span class="vmu-bl-title">${stats.join(' · ')}</span>
+        <button class="vmu-bl-copy" type="button" title="Скопировать список">
+          <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="12" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>
+          <span class="vmu-bl-copy-label">Копировать</span>
+        </button>`;
+      right.appendChild(head);
+
+      const list = document.createElement('div');
+      list.className = 'vmu-bl-list';
+      const lines = [];
+      for (const idx of blockedIndices) {
+        const t = tracks[idx] || {};
+        const label = `${t.artist || ''}${t.artist ? ' — ' : ''}${t.title || ''}`.trim() || `Трек ${idx + 1}`;
+        lines.push(label);
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'vmu-bl-item';
+        row.title = label;
+        row.textContent = label;
+        row.addEventListener('click', e => {
+          e.preventDefault(); e.stopPropagation();
+          const trackId = t?.fullId || t?.id;
+          if (trackId) focusModalRowByTrackId(modal, trackId);
+        });
+        list.appendChild(row);
+      }
+      right.appendChild(list);
+
+      const copyBtn = head.querySelector('.vmu-bl-copy');
+      copyBtn.addEventListener('click', e => {
+        e.preventDefault(); e.stopPropagation();
+        const labelEl = copyBtn.querySelector('.vmu-bl-copy-label');
+        const orig = labelEl?.textContent || 'Копировать';
+        navigator.clipboard.writeText(lines.join('\n')).then(() => {
+          if (labelEl) labelEl.textContent = 'Скопировано';
+          copyBtn.classList.add('vmu-bl-copy-ok');
+          setTimeout(() => {
+            if (!copyBtn.isConnected) return;
+            if (labelEl) labelEl.textContent = orig;
+            copyBtn.classList.remove('vmu-bl-copy-ok');
+          }, 1500);
+        }).catch(() => {
+          if (labelEl) labelEl.textContent = 'Ошибка';
+          setTimeout(() => { if (copyBtn.isConnected && labelEl) labelEl.textContent = orig; }, 1500);
+        });
+      });
+      panel.appendChild(right);
+    }
+
+    document.body.appendChild(panel);
+
+    const positionPanel = () => {
       const r = modal.getBoundingClientRect();
       if (r.width === 0) return;
-      strip.style.left = (r.right + 6) + 'px';
-      // Anchor below the modal header so the strip clears the popup's title
-      // and action buttons; clamp to viewport so it stays fully visible.
-      const top = Math.max(60, Math.min(r.top + 220, window.innerHeight - 280));
-      strip.style.top = top + 'px';
+      panel.style.left = (r.right + 6) + 'px';
+      const top = Math.max(60, Math.min(r.top + 220, window.innerHeight - 320));
+      panel.style.top = top + 'px';
     };
-    positionStrip();
-
-    const ro = new ResizeObserver(positionStrip);
+    positionPanel();
+    const ro = new ResizeObserver(positionPanel);
     ro.observe(modal);
-    window.addEventListener('resize', positionStrip);
-    window.addEventListener('scroll', positionStrip, true);
-
+    window.addEventListener('resize', positionPanel);
+    window.addEventListener('scroll', positionPanel, true);
     const mo = new MutationObserver(() => {
       if (!document.body.contains(modal) || modal.getBoundingClientRect().width === 0) {
-        strip._vmuCleanup?.();
-        strip.remove();
+        panel._vmuCleanup?.();
+        panel.remove();
       }
     });
     mo.observe(document.body, { childList: true, subtree: true });
-
-    strip._vmuCleanup = () => {
+    panel._vmuCleanup = () => {
       ro.disconnect();
       mo.disconnect();
-      window.removeEventListener('resize', positionStrip);
-      window.removeEventListener('scroll', positionStrip, true);
+      window.removeEventListener('resize', positionPanel);
+      window.removeEventListener('scroll', positionPanel, true);
     };
   }
 
@@ -832,6 +988,17 @@
               <span class="vmu-toggle-track"></span>
             </label>
           </div>
+
+          <div class="vmu-setting-row ${settings.autoPlaylist && !settings.coverDataUrl ? '' : 'vmu-row-disabled'}" id="vmu-id3cover-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Обложка из ID3</span>
+              <span class="vmu-setting-hint">Использовать встроенную обложку первого трека (если нет выбранной выше)</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-id3cover-toggle" ${settings.autoCoverFromId3 ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
         </div>
 
         <div id="vmu-pl-status" style="display:none;padding:6px 12px 8px;font-size:11.5px;color:#4bb34b;font-family:inherit"></div>
@@ -846,6 +1013,16 @@
         saveSettings();
         const coverRow = document.getElementById('vmu-cover-row');
         if (coverRow) coverRow.classList.toggle('vmu-row-disabled', !settings.autoPlaylist);
+        const id3Row = document.getElementById('vmu-id3cover-row');
+        if (id3Row) id3Row.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && !settings.coverDataUrl));
+      });
+    }
+
+    const id3CoverToggle = document.getElementById('vmu-id3cover-toggle');
+    if (id3CoverToggle) {
+      id3CoverToggle.addEventListener('change', () => {
+        settings.autoCoverFromId3 = id3CoverToggle.checked;
+        saveSettings();
       });
     }
 
@@ -923,6 +1100,48 @@
     if (any) { renderQueue(); if (!isProcessing) processQueue(); }
   }
 
+  // Cancel an item: if it's uploading, abort the XHR (status flips to
+  // pending again via the catch in processQueue once the abort comes back);
+  // if it's queued/done/error, just drop it from the queue.
+  function cancelOne(idx) {
+    const item = fileQueue[idx];
+    if (!item) return;
+    if (item.status === 'uploading') {
+      item.abortReason = 'cancel';
+      window.postMessage({ type: 'VMU_CANCEL_UPLOAD' }, '*');
+    } else {
+      fileQueue.splice(idx, 1);
+      renderQueue();
+    }
+  }
+
+  // Pause / resume the queue. If a track is uploading, abort it so the user
+  // sees the pause take effect immediately — it'll get re-uploaded from
+  // scratch on resume (VK upload protocol doesn't support resume).
+  function togglePause() {
+    isPaused = !isPaused;
+    if (isPaused) {
+      const upl = fileQueue.find(i => i.status === 'uploading');
+      if (upl) {
+        upl.abortReason = 'pause';
+        window.postMessage({ type: 'VMU_CANCEL_UPLOAD' }, '*');
+      }
+    } else if (!isProcessing) {
+      processQueue();
+    }
+    renderQueue();
+  }
+
+  // Update only the progress bar of one item, without touching the rest of
+  // the DOM (called many times per second during upload).
+  function updateRowProgress(itemId) {
+    const item = fileQueue.find(i => i.id === itemId);
+    if (!item) return;
+    const list = document.getElementById('vmu-list');
+    const bar = list?.querySelector(`.vmu-progress[data-id="${itemId}"]`);
+    if (bar) bar.style.width = `${Math.round((item.progress || 0) * 100)}%`;
+  }
+
   function copyFailed() {
     const names = fileQueue.filter(f => f.status === 'error').map(f => f.file.name);
     if (!names.length) return;
@@ -946,6 +1165,11 @@
       const name = raw.length > 48 ? raw.slice(0, 46) + '…' : raw;
       const errHtml = item.errorMsg ? `<span class="vmu-errmsg">${item.errorMsg}</span>` : '';
       const retryBtn = item.status === 'error' ? `<button class="vmu-retry-btn" data-idx="${idx}" title="Повторить">↺</button>` : '';
+      const cancelTitle = item.status === 'uploading' ? 'Отменить загрузку' : 'Убрать из очереди';
+      const cancelBtn = `<button class="vmu-cancel-btn" data-idx="${idx}" title="${cancelTitle}">✕</button>`;
+      const progressBar = item.status === 'uploading'
+        ? `<div class="vmu-progress" data-id="${item.id}" style="width:${Math.round((item.progress || 0) * 100)}%"></div>`
+        : '';
       return `<div class="vmu-item vmu-${item.status}">
         <span class="vmu-icon">${STATUS_ICON[item.status]}</span>
         <span class="vmu-info">
@@ -953,6 +1177,8 @@
         </span>
         <span class="vmu-sz">${fmtSize(item.file.size)}</span>
         ${retryBtn}
+        ${cancelBtn}
+        ${progressBar}
       </div>`;
     }).join('');
 
@@ -960,7 +1186,8 @@
     fileQueue.forEach(f => counts[f.status]++);
 
     let txt = '';
-    if (counts.uploading)                txt = 'Загружается…';
+    if (isPaused && (counts.pending || counts.uploading)) txt = `На паузе · в очереди: ${counts.pending + counts.uploading}`;
+    else if (counts.uploading)                txt = 'Загружается…';
     else if (counts.pending)             txt = `В очереди: ${counts.pending}`;
     else if (counts.error && counts.done) txt = `Загружено: ${counts.done}, ошибок: ${counts.error}`;
     else if (counts.done)                txt = `Все треки загружены: ${counts.done}`;
@@ -969,11 +1196,23 @@
     const st = document.getElementById('vmu-status');
     if (st) st.textContent = txt;
 
-    const allSettled = fileQueue.length > 0 && !fileQueue.some(f => f.status === 'pending' || f.status === 'uploading');
+    const hasWork = counts.pending > 0 || counts.uploading > 0;
+    const allSettled = fileQueue.length > 0 && !hasWork;
     const fa = document.getElementById('vmu-footer-actions');
     if (fa) {
-      if (allSettled && counts.error > 0) {
-        fa.innerHTML = `<button class="vmu-action-btn" id="vmu-copy-failed">📋 Скопировать</button><button class="vmu-action-btn" id="vmu-retry-all">↺ Повторить все</button>`;
+      if (hasWork) {
+        const lbl = isPaused ? '▶ Продолжить' : '⏸ Пауза';
+        fa.innerHTML = `<button class="vmu-action-btn vmu-pause-btn ${isPaused ? 'vmu-resume' : ''}" id="vmu-pause-btn">${lbl}</button>`;
+      } else if (allSettled && counts.error > 0) {
+        fa.innerHTML = `
+          <button class="vmu-action-btn" id="vmu-copy-failed">
+            <svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="12" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>
+            Скопировать
+          </button>
+          <button class="vmu-action-btn" id="vmu-retry-all">
+            <svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5v5h-5"/><path d="M16.7 14a7 7 0 1 1-1.4-7.4L17 8"/></svg>
+            Повторить
+          </button>`;
       } else {
         fa.innerHTML = '';
       }
@@ -985,7 +1224,7 @@
     if (!files.length) return;
     autoPlaylistRunning = false;
     files.forEach(f => {
-      const item = { file: f, status: 'pending', errorMsg: null, tags: {} };
+      const item = { id: ++itemIdCounter, file: f, status: 'pending', errorMsg: null, tags: {}, progress: 0 };
       fileQueue.push(item);
       // Read ID3 tags asynchronously (non-blocking)
       readID3(f).then(tags => { item.tags = tags; }).catch(() => {});
@@ -1015,7 +1254,13 @@
 
   async function processQueue() {
     if (isProcessing) return;
+    if (isPaused) return;
     const next = fileQueue.find(f => f.status === 'pending');
+    console.log('[VMU QUEUE] processQueue: pending=', fileQueue.filter(f => f.status === 'pending').length,
+      'uploading=', fileQueue.filter(f => f.status === 'uploading').length,
+      'done=', fileQueue.filter(f => f.status === 'done').length,
+      'error=', fileQueue.filter(f => f.status === 'error').length,
+      'next=', next?.file?.name);
     if (!next) {
       setBlockAudioHide(false);
       renderQueue();
@@ -1033,25 +1278,61 @@
     setBlockAudioHide(true);
     isProcessing = true;
     next.status = 'uploading';
+    next.progress = 0;
     renderQueue();
 
     try {
       await uploadOne(next);
       next.status = 'done';
+      next.progress = 1;
     } catch (err) {
-      next.status = 'error';
-      next.errorMsg = err.message;
-      console.warn('[VK Multi Upload]', err.message);
+      if (err.message === '__ABORTED__') {
+        const reason = next.abortReason || 'cancel';
+        next.progress = 0;
+        delete next.abortReason;
+        if (reason === 'cancel') {
+          const i = fileQueue.indexOf(next);
+          if (i >= 0) fileQueue.splice(i, 1);
+        } else {
+          next.status = 'pending'; // paused — keep for resume
+        }
+      } else {
+        next.status = 'error';
+        next.errorMsg = err.message;
+        console.warn('[VK Multi Upload]', err.message);
+      }
     }
 
+    currentUploadingItem = null;
     renderQueue();
     isProcessing = false;
+    // Drop the hold-open flag the moment there's nothing more pending, so
+    // the user can immediately close the panel without waiting out the 2s
+    // settle delay below.
+    if (!fileQueue.some(f => f.status === 'pending' || f.status === 'uploading')) {
+      setBlockAudioHide(false);
+    }
     await sleep(2000);
     processQueue();
   }
 
   async function uploadOne(item) {
     let file = item.file;
+    console.log('[VMU UPLOAD] uploadOne start:', file.name, 'size=', file.size);
+    // Snapshot dialog state for diagnostics
+    try {
+      const box = document.querySelector('.audio_add_box');
+      const layer = box?.closest('#box_layer, .popup_box_container');
+      console.log('[VMU UPLOAD] dialog state', {
+        boxOpen: !!box,
+        boxStyle: box ? box.style.cssText.slice(0, 100) : null,
+        boxClassExtras: box ? box.className : null,
+        layerPointerEvents: layer ? getComputedStyle(layer).pointerEvents : null,
+        layerOpacity: layer ? getComputedStyle(layer).opacity : null,
+        layerDisplay: layer ? getComputedStyle(layer).display : null,
+        layerCount: document.querySelectorAll('#box_layer').length,
+      });
+    } catch (err) { console.log('[VMU UPLOAD] dialog state read failed', err.message); }
 
     if (settings.autoMeta) {
       const tags = item.tags || {};
@@ -1067,29 +1348,39 @@
       }
     }
 
+    currentUploadingItem = item;
+
     // Set the callback before injection to avoid losing a fast upload response.
     const uploadPromise = new Promise((resolve, reject) => {
       const t = setTimeout(() => {
+        console.log('[VMU UPLOAD] 90s timeout —', file.name);
         uploadDoneCallback = null;
         reject(new Error('Timeout загрузки (90s)'));
       }, 90_000);
       uploadDoneCallback = data => {
         clearTimeout(t);
+        console.log('[VMU UPLOAD] VK_UPLOAD_DONE received:', file.name, 'aborted=', !!data.aborted, 'error=', !!data.error, 'resp=', (data.response || '').slice(0, 100));
+        if (data.aborted) { reject(new Error('__ABORTED__')); return; }
         if (data.error) { reject(new Error('Ошибка сети')); return; }
         try {
           const r = JSON.parse(data.response);
-          r.error_code ? reject(new Error(`VK ${r.error_code}: ${r.error_msg}`)) : resolve(r);
+          if (r.error_code) {
+            console.log('[VMU UPLOAD] VK error_code=', r.error_code, r.error_msg);
+            reject(new Error(`VK ${r.error_code}: ${r.error_msg}`));
+          } else { resolve(r); }
         } catch { resolve(); }
       };
     });
 
     const buffer = await file.arrayBuffer();
+    console.log('[VMU UPLOAD] sending VK_INJECT_FILE for', file.name);
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('Timeout инжекта')), 5000);
       const handler = e => {
         if (e.source !== window || e.data?.type !== 'VK_FILE_INJECTED') return;
         window.removeEventListener('message', handler);
         clearTimeout(t);
+        console.log('[VMU UPLOAD] VK_FILE_INJECTED ok=', e.data.ok, 'err=', e.data.error);
         e.data.ok ? resolve() : reject(new Error(e.data.error));
       };
       window.addEventListener('message', handler);
@@ -1195,13 +1486,16 @@
     });
 
     document.getElementById('vmu-list')?.addEventListener('click', e => {
-      const btn = e.target.closest('.vmu-retry-btn');
-      if (btn) retryOne(parseInt(btn.dataset.idx, 10));
+      const retryBtn = e.target.closest('.vmu-retry-btn');
+      if (retryBtn) { retryOne(parseInt(retryBtn.dataset.idx, 10)); return; }
+      const cancelBtn = e.target.closest('.vmu-cancel-btn');
+      if (cancelBtn) { cancelOne(parseInt(cancelBtn.dataset.idx, 10)); return; }
     });
 
     document.getElementById('vmu-footer')?.addEventListener('click', e => {
       if (e.target.closest('#vmu-copy-failed')) copyFailed();
       else if (e.target.closest('#vmu-retry-all')) retryAll();
+      else if (e.target.closest('#vmu-pause-btn')) togglePause();
     });
 
     attachSettingsHandlers();

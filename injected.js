@@ -88,6 +88,131 @@
     return (typeof t === 'string' && t.startsWith('http')) ? t : url;
   }
 
+  // ── Always-on close escape hatch ────────────────────────────────────────────
+  // Even when our hold-open patches block VK's close path, the user must be
+  // able to dismiss the panel manually. Intercept clicks on the popup's X
+  // icon (popup_box_close) and on any "Закрыть" button inside .audio_add_box,
+  // and remove the popup directly — bypasses both the patched .hide() and
+  // boxQueue._hide(). Triggered via a capture-phase document listener so we
+  // run before VK's own delegated handlers.
+  // Close-button intercept. Once our patches kept the popup open through a
+  // VK close attempt, VK's internal state for that box is dead and a second
+  // native close can't happen (b.hide() returns true but the DOM never
+  // unmounts). The user-facing close must therefore drop the hold-open flag
+  // AND tear down the popup ourselves.
+  document.addEventListener('click', (e) => {
+    const t = e.target;
+    if (!t || !t.closest) return;
+    const box = document.querySelector('.audio_add_box');
+    if (!box) return;
+    const popup = box.closest('.popup_box_container');
+    if (!popup) return;
+    const layer = popup.closest('#box_layer') || popup.parentElement;
+    const isXIcon = !!t.closest('.box_x_button, ._box_x_button, .popup_box_close, [class*="popup_box_close"], [class*="DismissButton"]');
+    const closeBtn = t.closest('button');
+    const isCloseBtn = closeBtn && /^\s*Закрыть\s*$/.test(closeBtn.textContent || '') && layer && layer.contains(closeBtn);
+    if (isXIcon || isCloseBtn) {
+      console.log('[VMU CLOSE] user-close intercepted — flag off + DOM removal');
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      __vmuBlockAudioBoxHide = false;
+      clearArmedStyles();
+      try { popup.remove(); } catch {}
+      // Strip the dark backdrop too — VK normally fades these out when its
+      // own close path runs; ours doesn't, so the page stays dimmed.
+      for (const sel of ['#box_layer_bg', '#box_layer_wrap', '.box_layer_wrap', '#box_layer', '.box_layer']) {
+        for (const el of document.querySelectorAll(sel)) {
+          if (!el.querySelector('.popup_box_container')) el.style.display = 'none';
+        }
+      }
+      for (const el of document.querySelectorAll('.scroll_fix_wrap.fixed')) {
+        if (!el.querySelector('.popup_box_container')) {
+          el.style.display = 'none';
+          el.classList.remove('fixed');
+        }
+      }
+      document.body.classList.remove('popup_open', 'has_popup', 'noscroll');
+      document.body.style.removeProperty('overflow');
+    }
+  }, true);
+
+  // ── Preserve VK's Upload manager state across uploads ───────────────────────
+  // VK clears Upload.options/obj/vars/uploadUrls[0] right after the first
+  // upload finishes (Upload.deinit / onUploadCompleteAll path). All later
+  // uploads then have nothing to drive — Upload.onFileApiSend(0, ...) bails
+  // because options[0] is undefined. We snapshot the slot the first time we
+  // see it populated, restore it before/around each subsequent upload, and
+  // suppress deinit while our queue is still working.
+  let __vmuUploadSnapshot = null;
+  function snapshotUploadSlot() {
+    try {
+      const U = window.Upload;
+      if (!U || !U.options || !U.options[0]) return;
+      __vmuUploadSnapshot = {
+        options: U.options[0],
+        obj: U.obj?.[0],
+        vars: U.vars?.[0],
+        types: U.types?.[0],
+        url: U.uploadUrls?.[0],
+        dropbox: U.dropbox?.[0],
+        files: U.files?.[0],
+      };
+      console.log('[VMU UPLOAD] snapshot saved, url=', String(__vmuUploadSnapshot.url || '').slice(0, 60));
+    } catch (e) { console.log('[VMU UPLOAD] snapshot failed', e.message); }
+  }
+  function restoreUploadSlot() {
+    const snap = __vmuUploadSnapshot;
+    const U = window.Upload;
+    if (!snap || !U) return false;
+    try {
+      U.options = U.options || {};
+      U.obj     = U.obj     || {};
+      U.vars    = U.vars    || {};
+      U.types   = U.types   || {};
+      U.uploadUrls = U.uploadUrls || {};
+      U.dropbox = U.dropbox || {};
+      U.files   = U.files   || {};
+      if (!U.options[0]) {
+        U.options[0]    = snap.options;
+        U.obj[0]        = snap.obj;
+        U.vars[0]       = snap.vars;
+        U.types[0]      = snap.types;
+        U.uploadUrls[0] = snap.url;
+        U.dropbox[0]    = snap.dropbox;
+        U.files[0]      = snap.files;
+        // Reset per-upload counters so VK treats this as a fresh queue
+        const o = U.options[0];
+        o.uploading = false;
+        o.filesQueue = [];
+        o.filesTotalSize = 0;
+        o.filesTotalCount = 0;
+        o.filesLoadedSize = 0;
+        o.filesLoadedCount = 0;
+        delete window.cur?.multiProgressIndex;
+        delete window.cur?.nextQueues;
+        console.log('[VMU UPLOAD] slot restored from snapshot');
+        return true;
+      }
+      return false;
+    } catch (e) { console.log('[VMU UPLOAD] restore failed', e.message); return false; }
+  }
+  function patchUploadManager() {
+    const U = window.Upload;
+    if (!U || U.__vmuPatched) return;
+    U.__vmuPatched = true;
+    // Suppress deinit while our queue is still working
+    const origDeinit = U.deinit && U.deinit.bind(U);
+    if (origDeinit) {
+      U.deinit = function (...args) {
+        if (__vmuBlockAudioBoxHide) {
+          console.log('[VMU UPLOAD] blocked Upload.deinit', args[0]);
+          return;
+        }
+        return origDeinit(...args);
+      };
+    }
+    console.log('[VMU UPLOAD] Upload manager patched');
+  }
+
   // ── Prevent VK from auto-closing the audio upload popup ──────────────────────
   // VK's popup system is window.boxQueue; after a successful upload it calls
   // boxQueue._hide(id) (and the instance's .hide()) on the audio_add_box popup.
@@ -95,6 +220,10 @@
   // still has files to upload; while it's true, any hide call against a popup
   // that contains .audio_add_box becomes a no-op.
   let __vmuBlockAudioBoxHide = false;
+  Object.defineProperty(window, '__vmuFlag', {
+    get() { return __vmuBlockAudioBoxHide; },
+    configurable: true,
+  });
 
   function boxHasAudioAddBox(box) {
     if (!box) return false;
@@ -129,8 +258,6 @@
         return origContent(e);
       };
     }
-    // The box has multiple "hide" entry points (hide / _hide / _hideForce /
-    // _hideInternal) plus destroy — patch all of them.
     for (const m of ['hide', '_hide', '_hideForce', '_hideInternal', 'destroy']) {
       const orig = box[m] && box[m].bind(box);
       if (!orig) continue;
@@ -139,9 +266,6 @@
         return orig(...args);
       };
     }
-    // Block VK's post-upload re-skinning of the popup: it changes the title
-    // via setOptions({title}) and adds a "Закрыть" button via setButtons /
-    // addButton / setControlsText. Suppress all of those while locked.
     for (const m of ['setOptions', 'setButtons', 'addButton', 'removeButtons', 'setControlsText', 'setBackTitle']) {
       const orig = box[m] && box[m].bind(box);
       if (!orig) continue;
@@ -149,6 +273,38 @@
         if (__vmuBlockAudioBoxHide) return;
         return orig(...args);
       };
+    }
+  }
+
+  // Re-enable the audio popup so the user can keep dropping files after an
+  // upload completes. VK's close anim may have set opacity 0 / pointer-events
+  // none on the layer that wraps the box — clear them.
+  function armBoxVisibility() {
+    const box = document.querySelector('.audio_add_box');
+    if (!box) return;
+    const layers = [box, box.closest('.popup_box_container'), box.closest('#box_layer'), box.closest('.box_body'), box.closest('.box_layout')].filter(Boolean);
+    for (const el of layers) {
+      const cs = getComputedStyle(el);
+      if (cs.pointerEvents === 'none') el.style.pointerEvents = 'auto';
+      if (parseFloat(cs.opacity || '1') < 0.99) el.style.opacity = '1';
+      if (cs.display === 'none') el.style.display = '';
+      if (cs.visibility === 'hidden') el.style.visibility = 'visible';
+    }
+  }
+
+  // When the "hold open" flag flips off (queue finished or user cancelled),
+  // remove all inline overrides we may have set. Otherwise opacity:1 and
+  // pointer-events:auto stick on the popup container and VK's natural
+  // fade-out close animation can't run — the user can't close the panel.
+  function clearArmedStyles() {
+    const box = document.querySelector('.audio_add_box');
+    if (!box) return;
+    const layers = [box, box.closest('.popup_box_container'), box.closest('#box_layer'), box.closest('.box_body'), box.closest('.box_layout')].filter(Boolean);
+    for (const el of layers) {
+      el.style.removeProperty('pointer-events');
+      el.style.removeProperty('opacity');
+      el.style.removeProperty('display');
+      el.style.removeProperty('visibility');
     }
   }
 
@@ -163,14 +319,35 @@
   const __vmuBoxQueuePoll = setInterval(() => {
     patchBoxQueue();
     scanAndPatchAudioBoxes();
+    patchUploadManager();
+    // Take a snapshot whenever VK has a populated slot — overwrites any stale
+    // snapshot if VK silently re-initialized between operations.
+    if (window.Upload?.options?.[0]) snapshotUploadSlot();
   }, 300);
 
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data) return;
     if (e.data.type === 'VMU_BLOCK_AUDIO_HIDE') {
+      const wasBlocking = __vmuBlockAudioBoxHide;
       __vmuBlockAudioBoxHide = !!e.data.block;
+      if (__vmuBlockAudioBoxHide) {
+        // entering "hold open" — re-arm in case VK started fading already
+        armBoxVisibility();
+      } else if (wasBlocking) {
+        // leaving "hold open" — strip our inline overrides so VK's natural
+        // close animation can run when the user clicks the X.
+        clearArmedStyles();
+      }
     }
   });
+
+  // Periodic visibility re-arm: between consecutive uploads VK can rev up its
+  // close animation between two postMessage frames, leaving the popup faded
+  // when we finally block .hide(). The cheap interval below keeps the box
+  // clickable for as long as the queue is still working.
+  setInterval(() => {
+    if (__vmuBlockAudioBoxHide) armBoxVisibility();
+  }, 300);
 
   // ── Capture VK's own al_audio.php hashes for reuse ───────────────────────────
   window.__vmuHashes = {};
@@ -213,8 +390,30 @@
     const isUploadUrl = url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php');
     if (isUploadUrl) {
       const xhr = this;
-      this.addEventListener('load', () => window.postMessage({ type: 'VK_UPLOAD_DONE', response: xhr.responseText }, '*'));
-      this.addEventListener('error', () => window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*'));
+      window.__vmuCurrentUpload = xhr;
+      console.log('[VMU XHR] upload start', url.slice(0, 80));
+      if (xhr.upload) {
+        xhr.upload.addEventListener('progress', (e) => {
+          if (e.lengthComputable) {
+            window.postMessage({ type: 'VK_UPLOAD_PROGRESS', loaded: e.loaded, total: e.total }, '*');
+          }
+        });
+      }
+      this.addEventListener('load', () => {
+        console.log('[VMU XHR] load', xhr.status, (xhr.responseText || '').slice(0, 200));
+        window.__vmuCurrentUpload = null;
+        window.postMessage({ type: 'VK_UPLOAD_DONE', response: xhr.responseText }, '*');
+      });
+      this.addEventListener('error', () => {
+        console.log('[VMU XHR] error');
+        window.__vmuCurrentUpload = null;
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*');
+      });
+      this.addEventListener('abort', () => {
+        console.log('[VMU XHR] abort');
+        window.__vmuCurrentUpload = null;
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, aborted: true }, '*');
+      });
     }
 
     // Capture hashes from VK's own al_audio.php calls
@@ -409,14 +608,66 @@
 
     switch (e.data.type) {
 
+      case 'VMU_CANCEL_UPLOAD': {
+        if (window.__vmuCurrentUpload) {
+          try { window.__vmuCurrentUpload.abort(); } catch {}
+          window.__vmuCurrentUpload = null;
+        }
+        break;
+      }
+
       case 'VK_INJECT_FILE': {
         const { name, mimeType, buffer } = e.data;
         const file = new File([buffer], name, { type: mimeType || 'audio/mpeg' });
+        console.log('[VMU INJECT] received file', name, file.size, 'bytes');
+
+        // VK clears Upload.options[0] etc. after the first completed upload
+        // (deinit / cleanup path). Restore the saved snapshot so subsequent
+        // calls have the slot they need to drive the upload.
+        if (!window.Upload?.options?.[0]) {
+          const restored = restoreUploadSlot();
+          console.log('[VMU INJECT] slot was empty, restored=', restored);
+        } else {
+          // Slot present — reset per-upload counters so VK starts fresh
+          const o = window.Upload.options[0];
+          o.uploading = false;
+          o.filesQueue = [];
+          o.filesTotalSize = 0;
+          o.filesTotalCount = 0;
+          o.filesLoadedSize = 0;
+          o.filesLoadedCount = 0;
+          delete window.cur?.multiProgressIndex;
+          delete window.cur?.fileApiUploadStarted;
+        }
+
+        try {
+          const o = window.Upload?.options?.[0];
+          console.log('[VMU INJECT] Upload.options[0]', o ? {
+            uploading: o.uploading,
+            filesQueueLen: o.filesQueue?.length,
+            filesTotalCount: o.filesTotalCount,
+            filesLoadedCount: o.filesLoadedCount,
+            uploadUrl: window.Upload.uploadUrls?.[0]?.slice(0, 50),
+          } : 'missing');
+        } catch (err) {}
+
+        try {
+          if (window.Upload && typeof window.Upload.onFileApiSend === 'function' && window.Upload.options?.[0]) {
+            console.log('[VMU INJECT] using Upload.onFileApiSend(0, [file])');
+            Promise.resolve(window.Upload.onFileApiSend(0, [file])).catch(err => {
+              console.log('[VMU INJECT] onFileApiSend rejected:', err?.message || err);
+            });
+            window.postMessage({ type: 'VK_FILE_INJECTED', ok: true }, '*');
+            break;
+          }
+          console.log('[VMU INJECT] Upload manager unavailable, falling back to DOM input');
+        } catch (err) { console.log('[VMU INJECT] direct call failed:', err.message); }
+
         let tries = 0;
         (function tryInject() {
-          // Prefer the VK-native input (marked during embedding), fall back to any file input
           const input = document.querySelector('[data-vmu-vk="1"]') || document.querySelector('input[type="file"]');
           if (input) {
+            console.log('[VMU INJECT] DOM input found, mark=', !!input.dataset.vmuVk);
             const dt = new DataTransfer();
             dt.items.add(file);
             input.files = dt.files;
@@ -425,6 +676,7 @@
           } else if (tries++ < 100) {
             setTimeout(tryInject, 200);
           } else {
+            console.log('[VMU INJECT] no input found');
             window.postMessage({ type: 'VK_FILE_INJECTED', ok: false, error: 'input not found' }, '*');
           }
         })();
@@ -883,6 +1135,7 @@
           title: entity.title || '',
           artist: entity.authors?.main?.[0]?.name || entity.subtitle || '',
           url: entity.url || null,
+          isBlocked: !!(entity.data?.isBlocked) || entity.data?.url === null,
         });
         marked++;
       } catch {}
