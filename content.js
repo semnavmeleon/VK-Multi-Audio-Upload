@@ -1297,6 +1297,14 @@
         next.status = 'error';
         next.errorMsg = err.message;
         console.warn('[VK Multi Upload]', err.message);
+        // VK rate limit (code 8) — fail the rest of the batch immediately, every
+        // subsequent file would just hit the same wall and produce noise.
+        const code = err.vkCode;
+        if (code === 8 || code === '8') {
+          for (const f of fileQueue) {
+            if (f.status === 'pending') { f.status = 'error'; f.errorMsg = err.message; }
+          }
+        }
       }
     }
 
@@ -1356,9 +1364,14 @@
       }, 90_000);
       uploadDoneCallback = data => {
         clearTimeout(t);
-        console.log('[VMU UPLOAD] VK_UPLOAD_DONE received:', file.name, 'aborted=', !!data.aborted, 'error=', !!data.error, 'resp=', (data.response || '').slice(0, 100));
+        console.log('[VMU UPLOAD] VK_UPLOAD_DONE received:', file.name, 'aborted=', !!data.aborted, 'error=', !!data.error, 'errorMsg=', data.errorMsg, 'code=', data.errorCode, 'resp=', (data.response || '').slice(0, 100));
         if (data.aborted) { reject(new Error('__ABORTED__')); return; }
-        if (data.error) { reject(new Error('Ошибка сети')); return; }
+        if (data.error) {
+          const e = new Error(data.errorMsg || 'Ошибка сети');
+          e.vkCode = data.errorCode;
+          reject(e);
+          return;
+        }
         try {
           const r = JSON.parse(data.response);
           if (r.error_code) {

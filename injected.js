@@ -266,14 +266,11 @@
         return orig(...args);
       };
     }
-    for (const m of ['setOptions', 'setButtons', 'addButton', 'removeButtons', 'setControlsText', 'setBackTitle']) {
-      const orig = box[m] && box[m].bind(box);
-      if (!orig) continue;
-      box[m] = function (...args) {
-        if (__vmuBlockAudioBoxHide) return;
-        return orig(...args);
-      };
-    }
+    // NB: setOptions/setButtons/setControlsText/setBackTitle are NOT blocked —
+    // VK uses them to update dialog state after each successful upload, and that
+    // update is part of the chain that actually attaches the track to the user's
+    // library (save_audio). Blocking them caused uploads to "succeed" on the
+    // upload server but never get committed to the audio list.
   }
 
   // Re-enable the audio popup so the user can keep dropping files after an
@@ -356,6 +353,57 @@
   // Capture audio.editPlaylist params for reorder
   let __editPlaylistCapture = null;
 
+  // ── Pending upload → done_add bridge ────────────────────────────────────────
+  // VK's upload chain is: pu.vk.com/...upload (file transfer) → al_audio.php?act=done_add
+  // (commit). Only done_add tells us whether the track was actually attached to
+  // the user's audio (it returns payload[0]=0 on success, error code otherwise —
+  // e.g. "9|Вы не можете загружать так много аудиозаписей" on rate limit).
+  // We defer VK_UPLOAD_DONE until done_add resolves; if done_add doesn't come
+  // within a few seconds (older VK flows without it), we fall back to the raw
+  // upload response so the queue doesn't hang.
+  let __vmuPendingUpload = null;
+  let __vmuPendingTimer = null;
+  function emitDoneFromDoneAdd(text) {
+    if (!__vmuPendingUpload) return false;
+    clearTimeout(__vmuPendingTimer);
+    __vmuPendingTimer = null;
+    __vmuPendingUpload = null;
+    let code, errArr;
+    try {
+      const d = JSON.parse(text);
+      code = d?.payload?.[0];
+      errArr = d?.payload?.[1];
+    } catch {
+      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: 'Ошибка ответа done_add' }, '*');
+      return true;
+    }
+    if (code === 0 || code === '0') {
+      window.postMessage({ type: 'VK_UPLOAD_DONE', response: text }, '*');
+    } else {
+      let msg = 'Ошибка загрузки';
+      if (Array.isArray(errArr) && errArr[0]) {
+        let raw = String(errArr[0]).replace(/^"+|"+$/g, '');
+        const pipe = raw.indexOf('|');
+        if (pipe >= 0) raw = raw.slice(pipe + 1);
+        msg = raw.replace(/<br\s*\/?>/gi, ' ').replace(/\\"/g, '"').trim() || msg;
+      }
+      console.log('[VMU UPLOAD] done_add error code=', code, 'msg=', msg);
+      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: code }, '*');
+    }
+    return true;
+  }
+  function deferUploadDone(uploadResponseText) {
+    __vmuPendingUpload = { response: uploadResponseText };
+    clearTimeout(__vmuPendingTimer);
+    __vmuPendingTimer = setTimeout(() => {
+      if (!__vmuPendingUpload) return;
+      console.log('[VMU UPLOAD] done_add timeout — flushing raw upload response');
+      const pending = __vmuPendingUpload;
+      __vmuPendingUpload = null;
+      window.postMessage({ type: 'VK_UPLOAD_DONE', response: pending.response }, '*');
+    }, 8000);
+  }
+
   function parseBodyStr(body) {
     if (body instanceof URLSearchParams) return body.toString();
     if (typeof body === 'string') return body;
@@ -402,7 +450,7 @@
       this.addEventListener('load', () => {
         console.log('[VMU XHR] load', xhr.status, (xhr.responseText || '').slice(0, 200));
         window.__vmuCurrentUpload = null;
-        window.postMessage({ type: 'VK_UPLOAD_DONE', response: xhr.responseText }, '*');
+        deferUploadDone(xhr.responseText);
       });
       this.addEventListener('error', () => {
         console.log('[VMU XHR] error');
@@ -431,6 +479,7 @@
           __savePlaylistCapture = null;
           cb(xhr.responseText);
         }
+        if (act === 'done_add') emitDoneFromDoneAdd(xhr.responseText);
         try {
           const d = JSON.parse(xhr.responseText);
           if (d?.payload) walkForHashes(d.payload);
@@ -467,7 +516,7 @@
     if (isUploadUrl) {
       return origFetch.apply(this, args).then(result => {
         result.clone().text().then(text => {
-          window.postMessage({ type: 'VK_UPLOAD_DONE', response: text }, '*');
+          deferUploadDone(text);
         }).catch(() => window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*'));
         return result;
       }, err => {
@@ -490,6 +539,7 @@
           __savePlaylistCapture = null;
           cb(text);
         }
+        if (act === 'done_add') emitDoneFromDoneAdd(text);
         try {
           const d = JSON.parse(text);
           if (d?.payload) walkForHashes(d.payload);
