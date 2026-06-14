@@ -493,6 +493,82 @@
     return tracks;
   }
 
+  // Expand the playlist popup: click "Показать все" to load the first batch,
+  // then scroll the page-level scroll container (VK lazy-loads more tracks as
+  // its IntersectionObserver hits the bottom of the popup). Harvests every row
+  // via fiber stamps + DOM fallback. Loops until no new tracks appear for a
+  // few iterations. Works for any playlist size (verified on 71-track sample).
+  async function expandPlaylistModal() {
+    const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+      .find(m => m.getBoundingClientRect().width > 0);
+    if (!modal) return [];
+
+    const showAll = modal.querySelector('[class*="showAll"], [class*="ShowAll"]')
+      || [...modal.querySelectorAll('a, button, [role="button"], div, span')].find(el => {
+        const t = (el.textContent || '').trim().toLowerCase();
+        return t === 'показать все' || t === 'показать всё' || t === 'show all';
+      });
+    if (showAll) {
+      showAll.click();
+      await sleep(900);
+    }
+
+    // VK virtualizes the playlist popup against the page-level scroller, not
+    // a container inside the modal. Find the first ancestor (or any element)
+    // that's actually scrollable — that's where scrolling triggers lazy load.
+    const findScroller = () => [...document.querySelectorAll('*')].find(el => {
+      const cs = getComputedStyle(el);
+      return (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
+    }) || document.scrollingElement;
+
+    const collected = new Map();
+
+    async function harvest() {
+      window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
+      await sleep(80);
+      const rows = modal.querySelectorAll('[class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
+      for (const r of rows) {
+        let id = null, title = '', artist = '', fullId = null;
+        if (r.dataset && r.dataset.vmuTrack) {
+          try {
+            const t = JSON.parse(r.dataset.vmuTrack);
+            id = t.id; fullId = t.id; title = t.title || ''; artist = t.artist || '';
+          } catch {}
+        }
+        if (!id && r.dataset && r.dataset.fullId) {
+          id = r.dataset.fullId; fullId = id;
+          title = (r.querySelector('.audio_title, .ai_title, [class*="title"]')?.textContent || '').trim();
+          artist = (r.querySelector('.audio_artist, .ai_artist, [class*="performers"]')?.textContent || '').trim();
+        }
+        if (id && !collected.has(id)) collected.set(id, { id, fullId, title, artist });
+      }
+    }
+
+    // Snapshot the scroll position before we start jumping to the bottom to
+    // trigger lazy-loading, so we can put the user back where they were.
+    const initialScroller = findScroller();
+    const initialScrollTop = initialScroller ? initialScroller.scrollTop : 0;
+
+    await harvest();
+    let stable = 0, lastSize = collected.size;
+    const MAX_ITER = 60;
+    for (let i = 0; i < MAX_ITER && stable < 4; i++) {
+      const sc = findScroller();
+      sc.scrollTop = sc.scrollHeight;
+      await sleep(500);
+      await harvest();
+      if (collected.size === lastSize) stable++; else { stable = 0; lastSize = collected.size; }
+    }
+
+    // Restore the original scroll position. Rows stay mounted (no
+    // virtualization here once VK has loaded them), so the user lands back
+    // where they started with the full playlist already in the DOM.
+    const sc = findScroller();
+    if (sc) sc.scrollTop = initialScrollTop;
+
+    return [...collected.values()];
+  }
+
   async function scanForDuplicates(plInfoArg, statusCallback) {
     const pl = plInfoArg || getPlaylistInfoFromUrl();
     const report = statusCallback || ((msg, isError) => setPlaylistStatus(msg, isError));
@@ -502,10 +578,12 @@
       return;
     }
 
-    report('Читаем треки со страницы…');
+    clearDupeMarkers();
+    report('Раскрываем плейлист…');
 
     try {
-      let tracks = getTracksFromDOM(pl);
+      let tracks = await expandPlaylistModal();
+      if (!tracks.length) tracks = getTracksFromDOM(pl);
 
       if (!tracks.length) {
         report('Загружаем через API…');
@@ -533,26 +611,154 @@
 
       const seen = new Map();
       const dupes = [];
-      for (const track of tracks) {
+      const dupeIndexSet = new Set();
+      for (let i = 0; i < tracks.length; i++) {
+        const track = tracks[i];
         const key = `${track.artist}|||${track.title}`.toLowerCase().trim();
         if (!key.includes('|||') || (!track.artist && !track.title)) continue;
         if (seen.has(key)) {
-          dupes.push({ track, original: seen.get(key) });
+          const orig = seen.get(key);
+          dupes.push({ track, original: orig.track });
+          dupeIndexSet.add(i);
+          dupeIndexSet.add(orig.index);
         } else {
-          seen.set(key, track);
+          seen.set(key, { track, index: i });
         }
       }
 
       if (!dupes.length) {
-        report(`Дубликаты не найдены в ${tracks.length} треках ✓`);
+        report(`Дубликаты не найдены в ${tracks.length} треках`);
         return;
       }
 
       report(`Найдено ${dupes.length} дубликатов из ${tracks.length} треков`);
-      showDupesDialog(dupes, pl.ownerId, pl.playlistId);
+      const dupeIndices = [...dupeIndexSet].sort((a, b) => a - b);
+      highlightDuplicateTracks(dupes);
+      buildDupeMinimap(tracks, dupeIndices);
     } catch (err) {
       report(`Ошибка: ${err.message}`, true);
     }
+  }
+
+  // Highlight every row whose track participates in a duplicate set (both the
+  // original first occurrence and the dupes), so users can spot the pairs
+  // directly in the playlist popup. Replaces the old delete-dialog flow.
+  function highlightDuplicateTracks(dupes) {
+    document.querySelectorAll('.vmu-dupe-highlight').forEach(el => el.classList.remove('vmu-dupe-highlight'));
+    const ids = new Set();
+    for (const d of dupes) {
+      if (d.track?.fullId) ids.add(d.track.fullId);
+      if (d.original?.fullId) ids.add(d.original.fullId);
+      if (d.track?.id) ids.add(String(d.track.id));
+      if (d.original?.id) ids.add(String(d.original.id));
+    }
+    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [class*="vkitAudioRow__root"], .audio_row');
+    for (const row of rows) {
+      let rowId = row.dataset?.fullId || null;
+      if (!rowId && row.dataset?.vmuTrack) {
+        try { rowId = JSON.parse(row.dataset.vmuTrack).id; } catch {}
+      }
+      if (rowId && ids.has(rowId)) row.classList.add('vmu-dupe-highlight');
+    }
+  }
+
+  // Clear highlight rows and tear down the minimap (used at scan start, and
+  // automatically when the playlist modal closes).
+  function clearDupeMarkers() {
+    document.querySelectorAll('.vmu-dupe-highlight').forEach(el => el.classList.remove('vmu-dupe-highlight'));
+    const m = document.getElementById('vmu-dupe-minimap');
+    if (m) {
+      m._vmuCleanup?.();
+      m.remove();
+    }
+  }
+
+  // VS-Code-style minimap on the right edge of the playlist popup with one
+  // marker per duplicate track. Click a marker to scroll the popup to that row.
+  // Position is recomputed on modal resize/scroll, and the strip self-destructs
+  // when the modal disappears.
+  function buildDupeMinimap(tracks, dupeIndices) {
+    document.getElementById('vmu-dupe-minimap')?.remove();
+    const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+      .find(m => m.getBoundingClientRect().width > 0);
+    if (!modal || !dupeIndices.length) return;
+
+    const strip = document.createElement('div');
+    strip.id = 'vmu-dupe-minimap';
+    const total = tracks.length;
+    const head = document.createElement('div');
+    head.className = 'vmu-dupe-minimap-head';
+    head.textContent = String(dupeIndices.length);
+    head.title = `Дубликатов: ${dupeIndices.length}`;
+    strip.appendChild(head);
+    const inner = document.createElement('div');
+    inner.className = 'vmu-dupe-minimap-inner';
+    strip.appendChild(inner);
+
+    for (const idx of dupeIndices) {
+      const mark = document.createElement('button');
+      mark.className = 'vmu-dupe-marker';
+      mark.style.top = `${(idx / Math.max(1, total - 1)) * 100}%`;
+      const t = tracks[idx] || {};
+      mark.title = `${t.artist || ''}${t.artist ? ' — ' : ''}${t.title || ''}`.trim() || `Трек ${idx + 1}`;
+      mark.addEventListener('click', e => {
+        e.preventDefault(); e.stopPropagation();
+        const trackId = t?.fullId || t?.id;
+        if (!trackId) return;
+        // Tracks are all in DOM after expandPlaylistModal (no virtualization
+        // inside the popup once VK has loaded them). Look up directly and
+        // scroll the row into the viewport, then flash it.
+        let row = null;
+        try { row = modal.querySelector(`[data-full-id="${CSS.escape(String(trackId))}"]`); } catch {}
+        if (!row) {
+          row = [...modal.querySelectorAll('[data-vmu-track]')].find(r => {
+            try { return JSON.parse(r.dataset.vmuTrack).id === trackId; } catch { return false; }
+          }) || null;
+        }
+        if (!row) return;
+        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        row.classList.remove('vmu-dupe-flash');
+        void row.offsetWidth;
+        row.classList.add('vmu-dupe-flash');
+        setTimeout(() => row.classList.remove('vmu-dupe-flash'), 1400);
+      });
+      inner.appendChild(mark);
+    }
+    document.body.appendChild(strip);
+
+    // Fixed compact strip — does NOT span the modal height. Pinned to the
+    // viewport at roughly the modal's vertical mid-line so it follows the
+    // popup but stays a small clickable widget regardless of playlist size.
+    const positionStrip = () => {
+      const r = modal.getBoundingClientRect();
+      if (r.width === 0) return;
+      strip.style.left = (r.right + 6) + 'px';
+      // Anchor below the modal header so the strip clears the popup's title
+      // and action buttons; clamp to viewport so it stays fully visible.
+      const top = Math.max(60, Math.min(r.top + 220, window.innerHeight - 280));
+      strip.style.top = top + 'px';
+    };
+    positionStrip();
+
+    const ro = new ResizeObserver(positionStrip);
+    ro.observe(modal);
+    window.addEventListener('resize', positionStrip);
+    window.addEventListener('scroll', positionStrip, true);
+
+    const mo = new MutationObserver(() => {
+      if (!document.body.contains(modal) || modal.getBoundingClientRect().width === 0) {
+        strip._vmuCleanup?.();
+        strip.remove();
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+
+    strip._vmuCleanup = () => {
+      ro.disconnect();
+      mo.disconnect();
+      window.removeEventListener('resize', positionStrip);
+      window.removeEventListener('scroll', positionStrip, true);
+    };
   }
 
   function parseTracksFromPayload(list) {
@@ -570,71 +776,6 @@
       }
     }
     return tracks;
-  }
-
-  function showDupesDialog(dupes, ownerId, playlistId) {
-    document.getElementById('vmu-dupes-backdrop')?.remove();
-    const wrap = document.createElement('div');
-    wrap.id = 'vmu-dupes-backdrop';
-    wrap.innerHTML = `
-      <div id="vmu-dupes-modal">
-        <div id="vmu-dupes-header">
-          <span>Найдено дубликатов: ${dupes.length}</span>
-          <button id="vmu-dupes-close">${ICON_CLOSE}</button>
-        </div>
-        <div id="vmu-dupes-list">
-          ${dupes.map((d, i) => `
-            <label class="vmu-dupe-item">
-              <input type="checkbox" class="vmu-dupe-cb" data-idx="${i}" checked>
-              <span class="vmu-dupe-name">${escHtml(d.track.artist)} — ${escHtml(d.track.title)}</span>
-              <span class="vmu-dupe-id">id:${d.track.id}</span>
-            </label>`).join('')}
-        </div>
-        <div id="vmu-dupes-footer">
-          <span id="vmu-dupes-status"></span>
-          <div style="display:flex;gap:8px">
-            <button id="vmu-dupes-selall">Все</button>
-            <button id="vmu-dupes-delete">Удалить выбранные</button>
-          </div>
-        </div>
-      </div>`;
-    document.body.appendChild(wrap);
-
-    wrap.addEventListener('click', e => { if (e.target === wrap) wrap.remove(); });
-    document.getElementById('vmu-dupes-close').onclick = () => wrap.remove();
-    document.getElementById('vmu-dupes-selall').onclick = () => {
-      const cbs = wrap.querySelectorAll('.vmu-dupe-cb');
-      const anyUnchecked = [...cbs].some(c => !c.checked);
-      cbs.forEach(c => c.checked = anyUnchecked);
-    };
-
-    document.getElementById('vmu-dupes-delete').onclick = async () => {
-      const checked = [...wrap.querySelectorAll('.vmu-dupe-cb:checked')];
-      if (!checked.length) return;
-      const btn = document.getElementById('vmu-dupes-delete');
-      const st = document.getElementById('vmu-dupes-status');
-      btn.disabled = true;
-      let removed = 0;
-      for (const cb of checked) {
-        const track = dupes[parseInt(cb.dataset.idx)].track;
-        const audioId = track.fullId || `${track.owner_id}_${track.id}`;
-        try {
-          const res = await pageCall('VK_REMOVE_FROM_PLAYLIST', 'VK_REMOVE_PLAYLIST_DONE', {
-            ownerId,
-            playlistId,
-            audioId,
-          }, 10000);
-          if (!res.ok) throw new Error('Сервер вернул ошибку');
-          cb.closest('.vmu-dupe-item').style.opacity = '0.35';
-          st.textContent = `Удалено: ${++removed}`;
-        } catch (e) {
-          st.textContent = `Ошибка: ${e.message}`;
-        }
-        await sleep(400);
-      }
-      st.textContent = `✓ Удалено ${removed} дубликатов`;
-      btn.disabled = false;
-    };
   }
 
   // ─── settings panel ───────────────────────────────────────────────────────────
@@ -1134,6 +1275,7 @@
     const btn = document.createElement('button');
     btn.className = 'vmu-dupes-dialog-btn';
     btn.setAttribute('data-vmu-dupes-dialog', '1');
+    btn.setAttribute('data-vmu-tip', 'Проверить на дубликаты');
     btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="10" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>`;
     btn.addEventListener('click', e => {
       e.preventDefault();
@@ -1577,29 +1719,7 @@
       // ALWAYS extract from popup DOM via React fiber (runs in page context via injected.js)
       dlSetPhase('Читаем треки из попапа…');
 
-      // Expand and scroll popup to load all tracks
-      const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-        .find(m => m.getBoundingClientRect().width > 0);
-      if (modal) {
-        // Click "Показать все" if present (VK hides tracks beyond first 5)
-        const showAll = modal.querySelector('[class*="showAll"], [class*="ShowAll"]')
-          || [...modal.querySelectorAll('a, button, [role="button"]')].find(el => {
-            const t = (el.textContent || '').trim().toLowerCase();
-            return t === 'показать все' || t === 'показать всё' || t === 'show all';
-          });
-        if (showAll) {
-          showAll.click();
-          await sleep(1000);
-        }
-        // Scroll to load virtualized tracks
-        const scrollable = modal.querySelector('[class*="vkitInternalModalBoxContent"], [class*="ModalBox__content"]') || modal;
-        for (let s = 0; s < 10; s++) {
-          scrollable.scrollTop = scrollable.scrollHeight;
-          await sleep(300);
-        }
-        scrollable.scrollTop = 0;
-        await sleep(300);
-      }
+      await expandPlaylistModal();
 
       // Extract via page context (injected.js can read React fiber, content.js cannot)
       // Fiber extraction is authoritative — it reads only tracks visible in the playlist popup
@@ -1848,16 +1968,25 @@
   }
 
   function injectSingleDlBtn(row) {
-    if (row.querySelector('.vmu-single-dl')) return;
     if (!getTrackDataFromRow(row)) return;
 
-    // New VK page-level rows: inject into buttonGroup
+    // Prefer buttonGroup: VK's own action panel. Works for both page-level rows
+    // and playlist-modal rows (modal rows have buttonGroup too, but VK mounts it
+    // after first sweep — so if a previous sweep placed the button into the
+    // after-slot fallback, migrate it here now that the proper slot exists).
     const btnGroup = row.querySelector('[class*="buttonGroup"]');
-    if (btnGroup) { btnGroup.prepend(makeSingleDlBtn(row, 'vmu-single-dl-vkit')); return; }
+    if (btnGroup) {
+      const existing = row.querySelector('.vmu-single-dl');
+      if (existing && existing.parentElement === btnGroup) return;
+      if (existing) existing.remove();
+      btnGroup.prepend(makeSingleDlBtn(row, 'vmu-single-dl-vkit'));
+      return;
+    }
 
-    // New VK playlist modal rows: no buttonGroup. Prepend into the right-side
-    // "after" slot which also holds the duration. Mark the slot so CSS can lay
-    // the button out inline with the duration.
+    if (row.querySelector('.vmu-single-dl')) return;
+
+    // Fallback: vkitAudioRow__after slot. Used when buttonGroup is not in DOM
+    // yet (rare). A subsequent sweep with buttonGroup present will migrate it.
     const after = row.querySelector('[class*="vkitAudioRow__after"]');
     if (after) {
       after.classList.add('vmu-after-host');

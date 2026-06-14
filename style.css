@@ -231,84 +231,82 @@
   display: block;
 }
 
-/* ── Duplicates modal ─────────────────────────────────────────────────────── */
-#vmu-dupes-backdrop {
+/* ── Duplicate-track highlight ────────────────────────────────────────────── */
+/* Pulsing amber accent on the left edge + soft tint so duplicate rows are
+   visually obvious in the playlist popup. Works for both old VK (.audio_row)
+   and new VK (vkitAudioRow__root) layouts. */
+@keyframes vmu-dupe-pulse {
+  0%, 100% { box-shadow: inset 3px 0 0 rgba(245,166,35,0.85), 0 0 0 1px rgba(245,166,35,0.18); }
+  50%      { box-shadow: inset 3px 0 0 rgba(245,166,35,1),     0 0 0 1px rgba(245,166,35,0.42); }
+}
+.vmu-dupe-highlight {
+  position: relative;
+  background: linear-gradient(90deg, rgba(245,166,35,0.14), rgba(245,166,35,0.04) 60%, transparent) !important;
+  border-radius: 6px;
+  animation: vmu-dupe-pulse 1.8s ease-in-out infinite;
+  transition: background .25s;
+}
+
+/* ── Duplicate-marker minimap (compact fixed-size widget next to popup) ──── */
+#vmu-dupe-minimap {
   position: fixed;
-  inset: 0;
-  z-index: 9600;
+  width: 16px;
+  height: 240px;
+  z-index: 9700;
+  background: rgba(35,35,36,0.92);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 6px;
+  padding: 4px 0 6px;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: center;
-  background: rgba(0,0,0,0.55);
-  backdrop-filter: blur(5px);
-}
-#vmu-dupes-modal {
-  background: #232324;
-  border: 1px solid rgba(255,255,255,0.09);
-  border-radius: 14px;
-  box-shadow: 0 12px 48px rgba(0,0,0,0.7);
-  width: 480px;
-  max-height: 75vh;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
   font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
-  font-size: 13px;
-  color: #e1e3e6;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+  user-select: none;
 }
-#vmu-dupes-header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 16px;
-  border-bottom: 1px solid rgba(255,255,255,0.07);
-  font-size: 14px; font-weight: 600;
-  flex-shrink: 0;
+.vmu-dupe-minimap-head {
+  font-size: 9px;
+  font-weight: 700;
+  color: #f5a623;
+  margin-bottom: 4px;
+  width: 100%;
+  text-align: center;
+  line-height: 1;
 }
-#vmu-dupes-close {
-  width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
-  border: none; background: rgba(255,255,255,0.06); border-radius: 50%;
-  color: #76787a; cursor: pointer; transition: background .12s; padding: 0;
+.vmu-dupe-minimap-inner {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
 }
-#vmu-dupes-close:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
-#vmu-dupes-list {
-  overflow-y: auto;
-  flex: 1;
-  padding: 8px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
+.vmu-dupe-marker {
+  position: absolute;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 8px;
+  height: 3px;
+  border-radius: 1.5px;
+  background: rgba(245,166,35,0.7);
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  transition: width .12s ease, background .12s ease, height .12s ease;
 }
-#vmu-dupes-list::-webkit-scrollbar { width: 3px; }
-#vmu-dupes-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
-.vmu-dupe-item {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 8px; border-radius: 7px;
-  background: rgba(255,255,255,0.03); cursor: pointer;
-  transition: background .1s;
+.vmu-dupe-marker:hover {
+  width: 14px;
+  height: 4px;
+  background: #f5a623;
+  box-shadow: 0 0 5px rgba(245,166,35,0.7);
 }
-.vmu-dupe-item:hover { background: rgba(255,255,255,0.06); }
-.vmu-dupe-cb { accent-color: #2688eb; flex-shrink: 0; cursor: pointer; }
-.vmu-dupe-name { flex: 1; font-size: 12px; color: #c0c2c4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.vmu-dupe-id   { font-size: 10px; color: #555; flex-shrink: 0; }
-#vmu-dupes-footer {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 16px; border-top: 1px solid rgba(255,255,255,0.07);
-  gap: 8px; flex-shrink: 0;
+
+/* Brief flash on the scrolled-to row after clicking a minimap marker */
+@keyframes vmu-dupe-flash {
+  0%   { background: rgba(245,166,35,0.55); box-shadow: 0 0 0 2px rgba(245,166,35,0.45); }
+  100% { background: transparent;            box-shadow: 0 0 0 0 transparent; }
 }
-#vmu-dupes-status { font-size: 12px; color: #6d6d6d; flex: 1; }
-#vmu-dupes-selall {
-  font-size: 12px; font-family: inherit;
-  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
-  border-radius: 6px; color: #888; cursor: pointer; padding: 4px 10px;
+.vmu-dupe-flash {
+  animation: vmu-dupe-flash 1.4s ease-out;
+  border-radius: 6px;
 }
-#vmu-dupes-selall:hover { background: rgba(255,255,255,0.12); color: #e1e3e6; }
-#vmu-dupes-delete {
-  font-size: 12px; font-family: inherit;
-  background: rgba(230,70,70,0.15); border: 1px solid rgba(230,70,70,0.35);
-  border-radius: 6px; color: #e64646; cursor: pointer; padding: 4px 12px;
-  transition: background .12s;
-}
-#vmu-dupes-delete:hover { background: rgba(230,70,70,0.3); }
-#vmu-dupes-delete:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ── Buttons injected into VK playlist popup — styled to match VK native ──── */
 /* Computed from VK's own vkuiButton__appearanceOverlay: bg #fff, color #000, radius 8px */
@@ -341,6 +339,50 @@
 /* Feedback state for dupes btn — subtle tint instead of color override */
 .vmu-dupes-dialog-btn[data-error="1"] { background: rgba(230,70,70,0.12); color: #c0392b; }
 .vmu-dupes-dialog-btn[data-ok="1"]   { background: rgba(75,179,75,0.1);  color: #2e7d32; }
+
+/* Native-VK-style tooltip on hover for dialog buttons */
+.vmu-dupes-dialog-btn,
+.vmu-dl-dialog-btn { position: relative; }
+.vmu-dupes-dialog-btn::after,
+.vmu-dl-dialog-btn::after,
+.vmu-dupes-dialog-btn::before,
+.vmu-dl-dialog-btn::before {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .15s;
+  z-index: 100;
+}
+.vmu-dupes-dialog-btn::after,
+.vmu-dl-dialog-btn::after {
+  content: attr(data-vmu-tip);
+  white-space: nowrap;
+  font-weight: 400;
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+  bottom: calc(100% + 5px);
+  background: rgb(50,50,50);
+  color: #e1e3e6;
+  font-size: 13px;
+  padding: 9px 12px 10px;
+  border-radius: 8px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
+}
+.vmu-dupes-dialog-btn::before,
+.vmu-dl-dialog-btn::before {
+  content: '';
+  border: 6px solid transparent;
+  bottom: calc(100% - 1px);
+  border-top-color: rgb(50,50,50);
+  border-bottom: none;
+}
+.vmu-dupes-dialog-btn:hover:not(:disabled)::after,
+.vmu-dl-dialog-btn:hover:not(:disabled)::after,
+.vmu-dupes-dialog-btn:hover:not(:disabled)::before,
+.vmu-dl-dialog-btn:hover:not(:disabled)::before {
+  opacity: 1;
+}
 
 /* ── Playlist download page button ────────────────────────────────────────── */
 .vmu-dl-page-btn {
@@ -375,7 +417,6 @@
   color: #d4a553;
 }
 .vmu-dl-page-btn-zip:hover:not(:disabled) { background: rgba(180,140,40,0.22); }
-.vmu-dl-dialog-btn-zip { color: #b07a1d; }
 
 /* ── Embedded playlist-download progress strip ────────────────────────────── */
 /* Tuned to VK's flat dark-modal aesthetic: subdued surface, thin progress bar,
