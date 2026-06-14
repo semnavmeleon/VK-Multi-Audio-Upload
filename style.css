@@ -154,18 +154,18 @@
 /* ── File list ────────────────────────────────────────────────────────────── */
 #vmu-list {
   margin: 0;
-  max-height: 200px;
+  max-height: 220px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 5px;
 }
 #vmu-list::-webkit-scrollbar { width: 3px; }
 #vmu-list::-webkit-scrollbar-track { background: transparent; }
 #vmu-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
 .vmu-item {
   display: flex; align-items: center; gap: 8px;
-  padding: 7px 8px; border-radius: 7px;
+  padding: 9px 10px; border-radius: 7px;
   background: rgba(255,255,255,0.03);
   position: relative;
   overflow: hidden;
