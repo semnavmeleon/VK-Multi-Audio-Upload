@@ -5,6 +5,89 @@
 
   const pause = ms => new Promise(r => setTimeout(r, ms));
 
+  // ── VK audio_api_unavailable URL deobfuscator ────────────────────────────────
+  // VK serves obfuscated URLs of the form:
+  //   https://vk.com/mp3/audio_api_unavailable.mp3?extra=<base64-ish>#<key>
+  // The real CDN URL is encoded in `extra` and the op-chain key is in the fragment.
+  // Decoding requires the current user's VK id. Ported from yuru-yuri/vk-audio-url-decoder.
+  const VK_AUDIO_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN0PQRSTUVWXYZO123456789+/=';
+
+  function vkAudioDecode(url) {
+    if (!url || typeof url !== 'string' || !url.includes('audio_api_unavailable')) return url;
+    const uid = window.vk && window.vk.id;
+    if (!uid) return url;
+    const after = url.split('?extra=')[1];
+    if (!after) return url;
+    const [extraPart, hashPart] = after.split('#');
+    const N = VK_AUDIO_ALPHABET;
+
+    const decR = (e) => {
+      if (!e || e.length % 4 === 1) return false;
+      let o = 0, t = 0, r = '';
+      for (let a = 0; a < e.length; a++) {
+        const i = N.indexOf(e[a]);
+        if (i !== -1) {
+          t = (o % 4) ? 64 * t + i : i;
+          o++;
+          if ((o - 1) % 4) {
+            const c = String.fromCharCode(255 & (t >> (-2 * o & 6)));
+            if (c !== '\x00') r += c;
+          }
+        }
+      }
+      return r;
+    };
+    const v = (e) => e.split('').reverse().join('');
+    const r = (e, t) => {
+      const arr = e.split('');
+      const o = N + N;
+      let a = arr.length;
+      while (a) { a--; const i = o.indexOf(arr[a]); if (i !== -1) arr[a] = o[i - t]; }
+      return arr.join('');
+    };
+    const decS = (e, t) => {
+      const eLen = e.length;
+      const out = new Array(eLen);
+      let o = eLen;
+      t = Math.abs(t);
+      while (o) { o--; t = (eLen * (o + 1) ^ (t + o)) % eLen; out[o] = t; }
+      return out;
+    };
+    const s = (e, t) => {
+      const eLen = e.length;
+      if (!eLen) return e;
+      const idx = decS(e, t);
+      const arr = e.split('');
+      for (let o = 1; o < eLen; o++) {
+        const sw = idx[eLen - 1 - o];
+        const tmp = arr[sw]; arr[sw] = arr[o]; arr[o] = tmp;
+      }
+      return arr.join('');
+    };
+    const i = (e, t) => { const n = parseInt(t, 10); return isNaN(n) ? e : s(e, n ^ uid); };
+    const x = (e, t) => {
+      let out = ''; const tc = t.charCodeAt(0);
+      for (let k = 0; k < e.length; k++) out += String.fromCharCode(e.charCodeAt(k) ^ tc);
+      return out;
+    };
+    const OPS = { v, r, s, i, x };
+
+    const nStr = hashPart ? decR(hashPart) : '';
+    let t = decR(extraPart);
+    if (typeof nStr !== 'string' || !t) return url;
+    const ops = nStr ? nStr.split('\t') : [];
+    let k = ops.length;
+    while (k--) {
+      const parts = ops[k].split('\v');
+      const opName = parts.shift();
+      parts.unshift(t);
+      const fn = OPS[opName];
+      if (!fn || parts.length < 2) return url;
+      try { t = fn(...parts); } catch { return url; }
+    }
+    return (typeof t === 'string' && t.startsWith('http')) ? t : url;
+  }
+
   // ── Prevent VK from auto-closing the audio upload popup ──────────────────────
   // VK's popup system is window.boxQueue; after a successful upload it calls
   // boxQueue._hide(id) (and the instance's .hide()) on the audio_add_box popup.
@@ -312,9 +395,10 @@
     if (_dlSeen.has(trackId)) return true;
     _dlSeen.add(trackId);
     const cs = s => typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : String(s || '').trim();
+    const realUrl = typeof url === 'string' ? vkAudioDecode(url) : url;
     window.postMessage({
       type: 'VKD_TRACK',
-      track: { id: trackId, title: cs(title), artist: cs(artist), duration: duration || 0, url: url || null }
+      track: { id: trackId, title: cs(title), artist: cs(artist), duration: duration || 0, url: realUrl || null }
     }, '*');
     return true;
   }
@@ -412,9 +496,21 @@
       }
 
       case 'VKD_HLS_DOWNLOAD': {
-        const { url, trackId } = e.data;
-        downloadHlsAsBlob(url).then(result => {
-          window.postMessage({ type: 'VKD_HLS_DOWNLOAD_DONE', ok: true, trackId, blobUrl: result.blobUrl, ext: result.ext }, '*');
+        const { url, trackId, returnBuffer } = e.data;
+        const onProgress = (done, total) => {
+          window.postMessage({ type: 'VKD_HLS_PROGRESS', trackId, done, total }, '*');
+        };
+        downloadHlsAsBlob(url, onProgress).then(async result => {
+          const msg = { type: 'VKD_HLS_DOWNLOAD_DONE', ok: true, trackId, ext: result.ext };
+          const transfers = [];
+          if (returnBuffer && result.blob) {
+            const buf = await result.blob.arrayBuffer();
+            msg.buffer = buf;
+            transfers.push(buf);
+          } else {
+            msg.blobUrl = result.blobUrl;
+          }
+          window.postMessage(msg, '*', transfers);
         }).catch(err => {
           window.postMessage({ type: 'VKD_HLS_DOWNLOAD_DONE', ok: false, trackId, error: err.message }, '*');
         });
@@ -422,15 +518,23 @@
       }
 
       case 'VKD_FETCH_BLOB': {
-        const { url, trackId } = e.data;
+        const { url, trackId, returnBuffer } = e.data;
         origFetch(url, { headers: { Referer: 'https://vk.com/' } })
           .then(resp => {
             if (!resp.ok) throw new Error('fetch failed: ' + resp.status);
             return resp.blob();
           })
-          .then(blob => {
-            const blobUrl = URL.createObjectURL(blob);
-            window.postMessage({ type: 'VKD_FETCH_BLOB_DONE', ok: true, trackId, blobUrl, size: blob.size }, '*');
+          .then(async blob => {
+            const msg = { type: 'VKD_FETCH_BLOB_DONE', ok: true, trackId, size: blob.size };
+            const transfers = [];
+            if (returnBuffer) {
+              const buf = await blob.arrayBuffer();
+              msg.buffer = buf;
+              transfers.push(buf);
+            } else {
+              msg.blobUrl = URL.createObjectURL(blob);
+            }
+            window.postMessage(msg, '*', transfers);
           })
           .catch(err => {
             window.postMessage({ type: 'VKD_FETCH_BLOB_DONE', ok: false, trackId, error: err.message }, '*');
@@ -495,7 +599,7 @@
     return segments;
   }
 
-  async function downloadHlsAsBlob(m3u8Url) {
+  async function downloadHlsAsBlob(m3u8Url, onProgress) {
     // Fix doubled /index.m3u8 (content.js may append it when URL already has .m3u8?query)
     m3u8Url = m3u8Url.replace(/(\.m3u8[^/]*?)\/index\.m3u8$/, '$1');
     const hlsFetch = (url) => origFetch(url, { headers: { Referer: 'https://vk.com/' } });
@@ -600,6 +704,9 @@
       }
 
       chunks.push(data);
+      if (typeof onProgress === 'function') {
+        try { onProgress(i + 1, segments.length); } catch {}
+      }
       if (i % 5 === 4) await pause(50);
     }
 
@@ -617,11 +724,11 @@
     if (combined[0] !== 0x47) {
       if (combined[0] === 0xFF && (combined[1] & 0xE0) === 0xE0) {
         const blob = new Blob([combined], { type: 'audio/mpeg' });
-        return { blobUrl: URL.createObjectURL(blob), ext: 'mp3' };
+        return { blobUrl: URL.createObjectURL(blob), ext: 'mp3', blob };
       }
       if (combined[0] === 0xFF && (combined[1] & 0xF0) === 0xF0) {
         const blob = new Blob([combined], { type: 'audio/aac' });
-        return { blobUrl: URL.createObjectURL(blob), ext: 'aac' };
+        return { blobUrl: URL.createObjectURL(blob), ext: 'aac', blob };
       }
     }
 
@@ -633,12 +740,12 @@
       const mime = codec === 'mp3' ? 'audio/mpeg' : 'audio/aac';
       console.log('[vmu] extracted', ext + ':', (audio.byteLength / 1024 / 1024).toFixed(1), 'MB');
       const blob = new Blob([audio], { type: mime });
-      return { blobUrl: URL.createObjectURL(blob), ext };
+      return { blobUrl: URL.createObjectURL(blob), ext, blob };
     }
     // Fallback: return raw TS
     console.warn('[vmu] audio extraction failed, returning raw TS');
     const blob = new Blob([combined], { type: 'video/mp2t' });
-    return { blobUrl: URL.createObjectURL(blob), ext: 'ts' };
+    return { blobUrl: URL.createObjectURL(blob), ext: 'ts', blob };
   }
 
   // Extract audio frames from MPEG-TS data. Returns { data: Uint8Array, codec: 'mp3'|'aac' } or null
@@ -741,17 +848,30 @@
     return { data: audioData, codec };
   }
 
+  // Walk up the React fiber tree from a DOM element looking for a node whose
+  // props expose `track.entity`. New VK wraps each row in 7+ levels of HOCs,
+  // so the entity does not live on the row element itself.
+  function findTrackEntityFromFiber(el, maxDepth) {
+    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    if (!fiberKey) return null;
+    let cur = el[fiberKey];
+    const limit = maxDepth || 20;
+    for (let i = 0; i < limit && cur; i++) {
+      const props = cur.memoizedProps || cur.pendingProps;
+      const entity = props?.track?.entity || props?.audio?.entity || props?.entity;
+      if (entity && entity.data?.identity) return entity;
+      cur = cur.return;
+    }
+    return null;
+  }
+
   // ── Stamp data-vmu-track on audio rows so the content script (isolated world,
   // no access to React fiber expandos) can read track data from the DOM ──
   function markRowTrackData() {
     let marked = 0;
     for (const row of document.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow')) {
       try {
-        const fiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
-        if (!fiberKey) continue;
-        const fiber = row[fiberKey];
-        const props = fiber.memoizedProps || fiber.pendingProps;
-        const entity = props?.track?.entity;
+        const entity = findTrackEntityFromFiber(row);
         if (!entity) continue;
         const identity = entity.data?.identity;
         const ownerId = identity?.ownerId;
@@ -782,29 +902,24 @@
 
     for (const row of rows) {
       try {
-        const fiberKey = Object.keys(row).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
-        if (fiberKey) {
-          const fiber = row[fiberKey];
-          const props = fiber.memoizedProps || fiber.pendingProps;
-          const entity = props?.track?.entity;
-          if (entity) {
-            const identity = entity.data?.identity;
-            const ownerId = identity?.ownerId;
-            const audioId = identity?.id;
-            const trackId = (ownerId && audioId) ? `${ownerId}_${audioId}` : `dom_${tracks.length}`;
-            if (seen.has(trackId)) continue;
-            seen.add(trackId);
+        const entity = findTrackEntityFromFiber(row);
+        if (entity) {
+          const identity = entity.data?.identity;
+          const ownerId = identity?.ownerId;
+          const audioId = identity?.id;
+          const trackId = (ownerId && audioId) ? `${ownerId}_${audioId}` : `dom_${tracks.length}`;
+          if (seen.has(trackId)) continue;
+          seen.add(trackId);
 
-            const artistName = entity.authors?.main?.[0]?.name || entity.subtitle || '';
-            tracks.push({
-              id: trackId,
-              title: entity.title || '',
-              artist: artistName,
-              url: entity.url || null,
-              duration: entity.duration || 0,
-            });
-            continue;
-          }
+          const artistName = entity.authors?.main?.[0]?.name || entity.subtitle || '';
+          tracks.push({
+            id: trackId,
+            title: entity.title || '',
+            artist: artistName,
+            url: entity.url || null,
+            duration: entity.duration || 0,
+          });
+          continue;
         }
 
         // Fallback: data-full-id (old VK)
@@ -860,16 +975,19 @@
               const trackId = `${obj[1]}_${obj[0]}`;
               const rawUrl = obj[2];
               if (typeof rawUrl === 'string' && rawUrl) {
-                // Keep HLS URLs too — single-track download handles them via
-                // VKD_HLS_DOWNLOAD; a direct URL still wins over an HLS one
+                // Deobfuscate VK's audio_api_unavailable stub URLs into real CDN URLs.
+                // Reload_audio returns a placeholder mp3 that decodes (via window.vk.id +
+                // op chain in the URL fragment) into the actual /a2/...m3u8 stream.
+                const realUrl = vkAudioDecode(rawUrl);
                 const put = (u) => {
                   if (!u || !u.startsWith('http')) return;
+                  if (u.includes('audio_api_unavailable')) return; // never store stubs
                   const isHls = u.includes('/a2/') || u.includes('.m3u8');
                   const cur = resolved[trackId];
                   const curIsHls = cur && (cur.includes('/a2/') || cur.includes('.m3u8'));
                   if (!cur || (curIsHls && !isHls)) resolved[trackId] = u;
                 };
-                put(rawUrl);
+                put(realUrl);
               }
             } else {
               for (const v of obj) walkReload(v, depth + 1);

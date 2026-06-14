@@ -29,21 +29,6 @@
   flex-shrink: 0;
 }
 .vmu-settings-btn-header:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
-#vmu-close {
-  width: 28px;
-  height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border: none;
-  background: rgba(255,255,255,0.06);
-  border-radius: 50%;
-  color: #76787a;
-  cursor: pointer;
-  transition: background .12s, color .12s;
-  padding: 0;
-}
-#vmu-close:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
 
 /* ── Settings panel ───────────────────────────────────────────────────────── */
 #vmu-settings-panel {
@@ -119,22 +104,6 @@
   transition: color .12s, background .12s;
 }
 #vmu-cover-clear:hover { color: #e1e3e6; background: rgba(255,255,255,0.13); }
-
-/* Scan dupes button */
-.vmu-scan-btn {
-  font-size: 12px;
-  font-family: inherit;
-  background: rgba(255,255,255,0.07);
-  border: 1px solid rgba(255,255,255,0.12);
-  border-radius: 6px;
-  color: #c0c2c4;
-  cursor: pointer;
-  padding: 4px 12px;
-  transition: background .12s;
-  flex-shrink: 0;
-}
-.vmu-scan-btn:hover { background: rgba(255,255,255,0.14); }
-.vmu-scan-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 
 /* ── Drop zone ────────────────────────────────────────────────────────────── */
 #vmu-dropzone {
@@ -393,121 +362,115 @@
 }
 .vmu-dl-page-btn:hover:not(:disabled) { background: rgba(38,136,235,0.2); }
 .vmu-dl-page-btn:disabled { opacity: 0.5; cursor: default; }
-
-/* ── Download modal backdrop ──────────────────────────────────────────────── */
-#vmu-dl-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 9700;
-  display: flex;
+.vmu-dl-page-wrap {
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  background: rgba(0,0,0,0.55);
-  backdrop-filter: blur(5px);
+  gap: 6px;
+  margin-left: 10px;
 }
-#vmu-dl-modal {
-  background: #232324;
-  border: 1px solid rgba(255,255,255,0.09);
-  border-radius: 14px;
-  box-shadow: 0 12px 48px rgba(0,0,0,0.7);
-  width: 500px;
-  max-height: 82vh;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+.vmu-dl-page-wrap .vmu-dl-page-btn { margin-left: 0; }
+.vmu-dl-page-btn-zip {
+  border-color: rgba(180,140,40,0.4);
+  background: rgba(180,140,40,0.12);
+  color: #d4a553;
+}
+.vmu-dl-page-btn-zip:hover:not(:disabled) { background: rgba(180,140,40,0.22); }
+.vmu-dl-dialog-btn-zip { color: #b07a1d; }
+
+/* ── Embedded playlist-download progress strip ────────────────────────────── */
+/* Tuned to VK's flat dark-modal aesthetic: subdued surface, thin progress bar,
+   no chromatic background tint until the run resolves to done/error. */
+.vmu-dlp-strip {
   font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
   font-size: 13px;
-  color: #e1e3e6;
-}
-#vmu-dl-header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 14px 16px;
-  border-bottom: 1px solid rgba(255,255,255,0.07);
-  font-size: 14px; font-weight: 600;
-  flex-shrink: 0;
-}
-#vmu-dl-close {
-  width: 26px; height: 26px; display: flex; align-items: center; justify-content: center;
-  border: none; background: rgba(255,255,255,0.06); border-radius: 50%;
-  color: #76787a; cursor: pointer; transition: background .12s; padding: 0;
-}
-#vmu-dl-close:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
-
-/* Progress bar */
-#vmu-dl-prog-wrap {
-  height: 3px;
-  background: rgba(255,255,255,0.07);
-  flex-shrink: 0;
-}
-#vmu-dl-bar {
-  height: 100%;
-  background: #2688eb;
-  border-radius: 2px;
-  transition: width .25s ease;
-}
-
-/* Status line */
-#vmu-dl-status-line {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 16px 5px;
-  font-size: 12px;
-  flex-shrink: 0;
-}
-#vmu-dl-phase {
-  color: #c0c2c4; flex: 1;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-#vmu-dl-collected {
-  color: #2688eb; font-weight: 500;
-  flex-shrink: 0; margin-left: 10px;
-}
-
-/* Track list */
-#vmu-dl-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 4px 12px 6px;
+  color: #c7c9cb;
+  background: rgba(255,255,255,0.03);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  padding: 8px 16px 9px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  min-height: 80px;
+  gap: 6px;
+  z-index: 10;
+  position: relative;
 }
-#vmu-dl-list::-webkit-scrollbar { width: 3px; }
-#vmu-dl-list::-webkit-scrollbar-track { background: transparent; }
-#vmu-dl-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 2px; }
-
-.vmu-dl-row {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 6px; border-radius: 6px;
-  background: rgba(255,255,255,0.02);
-  transition: background .1s;
+.vmu-dlp-floating {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 340px;
+  max-width: 90vw;
+  border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  border: 1px solid rgba(255,255,255,0.08);
+  background: #2c2d2e;
 }
-.vmu-dl-row-name {
-  flex: 1; font-size: 12px; color: #c0c2c4;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.vmu-dlp-strip.vmu-dlp-done { color: #c7c9cb; }
+.vmu-dlp-strip.vmu-dlp-error-state { color: #c7c9cb; }
+.vmu-dlp-row1 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
-.vmu-dl-row.vmu-uploading { background: rgba(38,136,235,0.08); }
-.vmu-dl-row.vmu-done     { background: rgba(75,179,75,0.05); }
-.vmu-dl-row.vmu-error    { background: rgba(230,70,70,0.06); }
-
-/* Footer */
-#vmu-dl-footer {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 16px;
-  border-top: 1px solid rgba(255,255,255,0.07);
+.vmu-dlp-mode {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: rgba(255,255,255,0.08);
+  color: #99a2ad;
   flex-shrink: 0;
 }
-#vmu-dl-foot-txt { font-size: 12px; color: #6d6d6d; flex: 1; }
-#vmu-dl-stop {
-  font-size: 12px; font-family: inherit;
-  background: rgba(230,70,70,0.12);
-  border: 1px solid rgba(230,70,70,0.3);
-  border-radius: 6px; color: #e64646;
-  cursor: pointer; padding: 5px 14px;
-  transition: background .12s;
+.vmu-dlp-phase {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+  color: #c7c9cb;
+  font-size: 12.5px;
 }
-#vmu-dl-stop:hover { background: rgba(230,70,70,0.25); }
+.vmu-dlp-counter {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: #76787a;
+  flex-shrink: 0;
+}
+.vmu-dlp-stop {
+  font-size: 11.5px;
+  font-family: inherit;
+  background: transparent;
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 4px;
+  color: #99a2ad;
+  cursor: pointer;
+  padding: 3px 10px;
+  transition: background .1s, color .1s, border-color .1s;
+  flex-shrink: 0;
+}
+.vmu-dlp-stop:hover:not(:disabled) {
+  background: rgba(255,255,255,0.06);
+  color: #e1e3e6;
+}
+.vmu-dlp-stop:disabled { opacity: 0.55; cursor: default; }
+.vmu-dlp-barwrap {
+  height: 2px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.vmu-dlp-bar {
+  height: 100%;
+  background: #2688eb;
+  transition: width .25s ease;
+}
+.vmu-dlp-strip.vmu-dlp-done .vmu-dlp-bar { background: #4bb34b; }
+.vmu-dlp-strip.vmu-dlp-error-state .vmu-dlp-bar { background: #e64646; }
+.vmu-dlp-error {
+  font-size: 11.5px;
+  color: #e64646;
+}
 
 /* ── Single-track download button ────────────────────────────────────────── */
 .vmu-single-dl {
@@ -621,4 +584,43 @@
 }
 .vmu-single-dl-loading {
   opacity: 1 !important;
+}
+/* New VK playlist modal — row has no buttonGroup; my button shares the
+   right "after" slot with the duration label. Make the slot inline-flex so
+   they sit on one line, with the button hover-revealed like native VK rows. */
+.vkitAudioRow__after--s6OAG.vmu-after-host,
+[class*="vkitAudioRow__after"].vmu-after-host {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.vmu-single-dl-after {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  margin: 0;
+  color: #99a2ad;
+  box-sizing: border-box;
+}
+/* Hover reveal — same pattern as native VK action buttons */
+[class*="vkitAudioRow__root"]:hover .vmu-single-dl-after {
+  opacity: 1;
+}
+.vmu-single-dl-after:hover {
+  color: #e1e3e6;
+  background: rgba(255,255,255,.08);
+}
+.vmu-single-dl-after::after {
+  top: calc(100% + 5px);
+  background: rgb(50,50,50);
+  color: #e1e3e6;
+  font-size: 13px;
+  padding: 9px 12px 10px;
+  border-radius: 8px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
+}
+.vmu-single-dl-after::before {
+  top: calc(100% - 1px);
+  border-bottom-color: rgb(50,50,50);
+  border-top: none;
 }

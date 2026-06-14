@@ -52,13 +52,13 @@
       window.__vmuCoverCallback(e.data);
       window.__vmuCoverCallback = null;
     }
+    if (e.data?.type === 'VKD_HLS_PROGRESS') {
+      const cb = hlsProgressHandlers.get(e.data.trackId);
+      if (cb) cb(e.data.done, e.data.total);
+    }
     if (e.data?.type === 'VKD_TRACK') {
       const t = e.data.track;
-      if (t?.id && !dlTracks.has(t.id)) {
-        dlTracks.set(t.id, t);
-        const el = document.getElementById('vmu-dl-collected');
-        if (el) el.textContent = `Найдено: ${dlTracks.size}`;
-      }
+      if (t?.id && !dlTracks.has(t.id)) dlTracks.set(t.id, t);
     }
   });
 
@@ -232,16 +232,6 @@
     });
   }
 
-  // ─── VK internal API via al_audio.php (browser-native, no external tokens) ────
-
-  function getPageHash() {
-    for (const s of document.querySelectorAll('script:not([src])')) {
-      const m = s.textContent.match(/"hash"\s*:\s*"([a-zA-Z0-9_\-]{30,70})"/);
-      if (m) return m[1];
-    }
-    return '';
-  }
-
   function getVkUserId() {
     // URL-first: works for any user (/audiosXXX) or group (/audios-XXX) page
     const m = location.href.match(/audios(-?\d+)/);
@@ -267,24 +257,6 @@
       playlist_id_not_found: 'Не удалось получить ID созданного плейлиста.',
     };
     return map[msg] || msg;
-  }
-
-  // Generic al_audio.php call (works for read operations; write ops may need UI)
-  async function alAudio(act, params) {
-    const hash = getPageHash();
-    const body = new URLSearchParams({ act, al: '1', hash, ...params });
-    const res = await fetch('/al_audio.php', {
-      method: 'POST',
-      body,
-      headers: { 'X-Requested-With': 'XMLHttpRequest' },
-    });
-    const text = await res.text();
-    let data;
-    try { data = JSON.parse(text); } catch { throw new Error(`al_audio.php ответил не JSON`); }
-    if (data.payload?.[0] !== 0) {
-      throw new Error(`al_audio.php ${act}: код ${data.payload?.[0]}`);
-    }
-    return data.payload?.[1] ?? [];
   }
 
   // Send message to injected.js and wait for response
@@ -896,22 +868,6 @@
     addFiles([...e.detail.files].filter(isMP3));
   });
 
-  function showCompletionGif() {
-    const existing = document.getElementById('vmu-gif-overlay');
-    if (existing) existing.remove();
-    const overlay = document.createElement('div');
-    overlay.id = 'vmu-gif-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:999999;display:flex;align-items:center;justify-content:center;cursor:pointer;';
-    const img = document.createElement('img');
-    img.src = chrome.runtime.getURL('done.gif');
-    img.style.cssText = 'max-width:80vw;max-height:80vh;border-radius:8px;pointer-events:none;';
-    overlay.appendChild(img);
-    document.body.appendChild(overlay);
-    const dismiss = () => overlay.remove();
-    overlay.addEventListener('click', dismiss);
-    setTimeout(dismiss, 4000);
-  }
-
   function setBlockAudioHide(block) {
     window.postMessage({ type: 'VMU_BLOCK_AUDIO_HIDE', block }, '*');
   }
@@ -1134,6 +1090,46 @@
     setTimeout(() => el.remove(), 5000);
   }
 
+  // Persistent progress toast — same slot as showToast but updates in place
+  // and shows an optional progress bar. Pass kind: 'done' or 'error' to
+  // auto-dismiss after 4s; 'progress' keeps it on screen until next update.
+  function showProgressToast(title, opts) {
+    const kind = opts?.kind || 'progress';
+    const pct = typeof opts?.pct === 'number' ? Math.max(0, Math.min(100, opts.pct)) : null;
+    const id = opts?.id || 'vmu-progress';
+    let el = document.getElementById(id);
+    if (!el) {
+      // Clear any plain toast so they don't stack on top
+      document.getElementById('vmu-toast')?.remove();
+      el = document.createElement('div');
+      el.id = id;
+      el.style.cssText = `position:fixed;bottom:20px;left:20px;z-index:999999;color:#fff;padding:10px 14px 12px;border-radius:8px;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.5);min-width:240px;max-width:340px;word-break:break-word;pointer-events:none;transition:background .25s ease;`;
+      el.innerHTML = `<div class="vmu-pt-row" style="display:flex;align-items:center;gap:8px;"><span class="vmu-pt-spin" style="width:12px;height:12px;border-radius:50%;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;animation:vmu-spin 1s linear infinite;flex:0 0 auto;"></span><span class="vmu-pt-text" style="flex:1 1 auto;"></span></div><div class="vmu-pt-bar" style="margin-top:8px;height:4px;background:rgba(255,255,255,.18);border-radius:2px;overflow:hidden;display:none;"><div class="vmu-pt-fill" style="height:100%;width:0%;background:#fff;transition:width .18s ease;"></div></div>`;
+      if (!document.getElementById('vmu-pt-style')) {
+        const s = document.createElement('style');
+        s.id = 'vmu-pt-style';
+        s.textContent = '@keyframes vmu-spin{to{transform:rotate(360deg)}}';
+        document.head.appendChild(s);
+      }
+      document.body.appendChild(el);
+    }
+    el.style.background = kind === 'error' ? '#b71c1c' : kind === 'done' ? '#1b5e20' : '#0d47a1';
+    el.querySelector('.vmu-pt-text').textContent = title || '';
+    const spin = el.querySelector('.vmu-pt-spin');
+    spin.style.display = kind === 'progress' ? '' : 'none';
+    const bar = el.querySelector('.vmu-pt-bar');
+    const fill = el.querySelector('.vmu-pt-fill');
+    if (pct !== null) { bar.style.display = ''; fill.style.width = pct + '%'; }
+    else if (kind !== 'progress') bar.style.display = 'none';
+    clearTimeout(el._vmuTimer);
+    if (kind === 'done' || kind === 'error') {
+      el._vmuTimer = setTimeout(() => el.remove(), 4000);
+    }
+  }
+
+  // Per-trackId HLS progress callbacks registered by downloadSingleTrack
+  const hlsProgressHandlers = new Map();
+
   function makeDupesBtn(plInfo) {
     const btn = document.createElement('button');
     btn.className = 'vmu-dupes-dialog-btn';
@@ -1150,15 +1146,22 @@
     return btn;
   }
 
-  function makeDlDialogBtn(plInfo) {
+  // Two download buttons for the playlist edit dialog: one downloads each track
+  // as a separate file, the other bundles them into a single ZIP.
+  function makeDlDialogBtn(plInfo, mode) {
+    const isZip = mode === 'zip';
     const btn = document.createElement('button');
-    btn.className = 'vmu-dl-dialog-btn';
-    btn.setAttribute('data-vmu-dl-dialog', '1');
-    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v10M7 10l3 3 3-3"/><path d="M3 15h14"/></svg>`;
+    btn.className = 'vmu-dl-dialog-btn vmu-dl-dialog-btn-' + mode;
+    btn.setAttribute('data-vmu-dl-dialog', mode);
+    btn.setAttribute('data-vmu-tip', isZip ? 'Скачать ZIP' : 'Скачать треками');
+    btn.innerHTML = isZip
+      ? `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6.5L5 4h10l1.5 2.5v9a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1v-9z"/><path d="M3.5 7h13"/><path d="M10 10v4M8 12.2l2 2 2-2"/></svg>`
+      : `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v10M7 10l3 3 3-3"/><path d="M3 15h14"/></svg>`;
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
-      if (!document.getElementById('vmu-dl-backdrop')) showDlModal(plInfo);
+      if (document.getElementById('vmu-dlp-strip')) return;
+      startDlSession(plInfo, mode);
     });
     return btn;
   }
@@ -1190,7 +1193,8 @@
     const newRow = document.createElement('div');
     newRow.style.cssText = 'display:flex;gap:8px;flex-basis:100%;';
     newRow.appendChild(makeDupesBtn(plInfo));
-    newRow.appendChild(makeDlDialogBtn(plInfo));
+    newRow.appendChild(makeDlDialogBtn(plInfo, 'individual'));
+    newRow.appendChild(makeDlDialogBtn(plInfo, 'zip'));
     flexParent.appendChild(newRow);
   }
 
@@ -1211,97 +1215,133 @@
   function tryInjectDlButton() {
     const h = location.href;
     if (!h.includes('/music') && !h.includes('/audio')) return;
-    if (document.getElementById('vmu-dl-btn')) return;
+    if (document.getElementById('vmu-dl-btn-wrap')) return;
     let target = null;
     for (const sel of DL_HDR_SELS) {
       target = document.querySelector(sel);
       if (target) break;
     }
     if (!target) return;
-    const btn = document.createElement('button');
-    btn.id = 'vmu-dl-btn';
-    btn.className = 'vmu-dl-page-btn';
-    btn.innerHTML = `${ICON_DL_SM} Скачать плейлист`;
-    btn.onclick = () => { if (!document.getElementById('vmu-dl-backdrop')) showDlModal(); };
-    target.appendChild(btn);
-  }
+    const wrap = document.createElement('span');
+    wrap.id = 'vmu-dl-btn-wrap';
+    wrap.className = 'vmu-dl-page-wrap';
 
-  function showDlModal(plInfo) {
-    document.getElementById('vmu-dl-backdrop')?.remove();
-    const backdrop = document.createElement('div');
-    backdrop.id = 'vmu-dl-backdrop';
-    backdrop.innerHTML = `
-      <div id="vmu-dl-modal">
-        <div id="vmu-dl-header">
-          <span>Скачивание плейлиста</span>
-          <button id="vmu-dl-close">${ICON_CLOSE}</button>
-        </div>
-        <div id="vmu-dl-prog-wrap"><div id="vmu-dl-bar" style="width:0%"></div></div>
-        <div id="vmu-dl-status-line">
-          <span id="vmu-dl-phase">Загружаем треки…</span>
-          <span id="vmu-dl-collected"></span>
-        </div>
-        <div id="vmu-dl-list"></div>
-        <div id="vmu-dl-footer">
-          <span id="vmu-dl-foot-txt"></span>
-          <button id="vmu-dl-stop">Остановить</button>
-        </div>
-      </div>`;
-    document.body.appendChild(backdrop);
-    backdrop.addEventListener('click', e => { if (e.target === backdrop) closeDlModal(); });
-    document.getElementById('vmu-dl-close').onclick = closeDlModal;
-    document.getElementById('vmu-dl-stop').onclick = () => {
-      dlCancelFlag = true;
-      const s = document.getElementById('vmu-dl-stop');
-      if (s) s.textContent = 'Останавливаем…';
+    const make = (mode, label) => {
+      const b = document.createElement('button');
+      b.className = 'vmu-dl-page-btn vmu-dl-page-btn-' + mode;
+      b.innerHTML = `${ICON_DL_SM} ${label}`;
+      b.onclick = () => {
+        if (document.getElementById('vmu-dlp-strip')) return;
+        // If a playlist popup isn't currently open, open it first so progress
+        // can render inside the modal.
+        if (!getActiveModal()) {
+          const link = document.querySelector('a[href*="/music/playlist"], a[href*="audio_playlist"]');
+          if (link) {
+            link.click();
+            setTimeout(() => startDlSession(getPlaylistInfoFromUrl(), mode), 900);
+            return;
+          }
+        }
+        startDlSession(getPlaylistInfoFromUrl(), mode);
+      };
+      return b;
     };
-    runPlaylistDownload(plInfo);
+    wrap.appendChild(make('individual', 'Треками'));
+    wrap.appendChild(make('zip', 'ZIP'));
+    target.appendChild(wrap);
   }
 
-  function closeDlModal() {
-    dlCancelFlag = true;
-    document.getElementById('vmu-dl-backdrop')?.remove();
+  // ─── Embedded download progress (no backdrop) ────────────────────────────────
+  // The progress strip is injected into the visible playlist modal between its
+  // header and body. If no modal is open, falls back to a fixed floating bar.
+  // Per-track status is shown as a badge inside the row's right-side slot.
+  let _dlpStrip = null;
+
+  function startDlSession(plInfo, mode) {
+    dlpInit(mode);
+    runPlaylistDownload(plInfo, mode);
+  }
+
+  function getActiveModal() {
+    return [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+      .find(m => m.getBoundingClientRect().width > 0) || null;
+  }
+
+  function dlpInit(mode) {
+    dlpClose();
+    const strip = document.createElement('div');
+    strip.id = 'vmu-dlp-strip';
+    strip.className = 'vmu-dlp-strip';
+    strip.innerHTML = `
+      <div class="vmu-dlp-row1">
+        <span class="vmu-dlp-mode">${mode === 'zip' ? 'ZIP' : 'Треки'}</span>
+        <span class="vmu-dlp-phase">Готовим скачивание…</span>
+        <span class="vmu-dlp-counter"></span>
+        <button class="vmu-dlp-stop" type="button">Остановить</button>
+      </div>
+      <div class="vmu-dlp-barwrap"><div class="vmu-dlp-bar" style="width:0%"></div></div>
+      <div class="vmu-dlp-error" style="display:none"></div>`;
+    const modal = getActiveModal();
+    if (modal) {
+      // Insert between header and body
+      const header = modal.querySelector('[class*="vkitAudioListBoxHeader__root"]');
+      const body = modal.querySelector('[class*="vkitModalBody__container"]');
+      if (header && body && header.parentNode === body.parentNode) {
+        body.parentNode.insertBefore(strip, body);
+      } else {
+        modal.appendChild(strip);
+      }
+      strip.classList.add('vmu-dlp-in-modal');
+    } else {
+      strip.classList.add('vmu-dlp-floating');
+      document.body.appendChild(strip);
+    }
+    strip.querySelector('.vmu-dlp-stop').onclick = () => {
+      dlCancelFlag = true;
+      const b = strip.querySelector('.vmu-dlp-stop');
+      if (b) { b.textContent = 'Останавливаем…'; b.disabled = true; }
+    };
+    _dlpStrip = strip;
+  }
+
+  function dlpClose() {
+    document.getElementById('vmu-dlp-strip')?.remove();
+    // Also clear any per-row badges
+    document.querySelectorAll('.vmu-row-status').forEach(n => n.remove());
+    _dlpStrip = null;
   }
 
   function dlSetPhase(text) {
-    const el = document.getElementById('vmu-dl-phase');
+    const el = _dlpStrip?.querySelector('.vmu-dlp-phase');
     if (el) el.textContent = text;
   }
 
   function dlSetProgress(done, total) {
-    const bar = document.getElementById('vmu-dl-bar');
-    const foot = document.getElementById('vmu-dl-foot-txt');
+    const bar = _dlpStrip?.querySelector('.vmu-dlp-bar');
+    const cnt = _dlpStrip?.querySelector('.vmu-dlp-counter');
     if (bar) bar.style.width = total > 0 ? Math.round((done / total) * 100) + '%' : '0%';
-    if (foot) foot.textContent = '';
+    if (cnt) cnt.textContent = total > 0 ? `${done}/${total}` : '';
   }
 
-  function dlAddRow(track, status) {
-    const list = document.getElementById('vmu-dl-list');
-    if (!list) return;
-    const old = document.getElementById('vmu-dlr-' + track.id);
-    if (old) { old.className = 'vmu-dl-row vmu-' + status; return; }
-    const div = document.createElement('div');
-    div.id = 'vmu-dlr-' + track.id;
-    div.className = 'vmu-dl-row vmu-' + status;
-    div.innerHTML = `<span class="vmu-icon">${STATUS_ICON[status] || STATUS_ICON.pending}</span><span class="vmu-dl-row-name">${escHtml(track.artist)} — ${escHtml(track.title)}</span>`;
-    list.appendChild(div);
-    list.scrollTop = list.scrollHeight;
-    // Keep DOM small — drop oldest settled rows beyond 80
-    const settled = list.querySelectorAll('.vmu-done, .vmu-error');
-    if (settled.length > 80) settled[0].remove();
+  function dlSetError(msg) {
+    const el = _dlpStrip?.querySelector('.vmu-dlp-error');
+    if (!el) return;
+    if (msg) { el.style.display = ''; el.textContent = msg; }
+    else el.style.display = 'none';
   }
 
-  function dlUpdateRow(trackId, status, errMsg) {
-    const row = document.getElementById('vmu-dlr-' + trackId);
-    if (!row) return;
-    row.className = 'vmu-dl-row vmu-' + status;
-    const icon = row.querySelector('.vmu-icon');
-    if (icon) icon.innerHTML = STATUS_ICON[status] || STATUS_ICON.done;
-    if (errMsg) {
-      const nameEl = row.querySelector('.vmu-dl-row-name');
-      if (nameEl) nameEl.title = errMsg;
-    }
+  function dlSetFinished(ok) {
+    if (!_dlpStrip) return;
+    _dlpStrip.classList.add(ok ? 'vmu-dlp-done' : 'vmu-dlp-error-state');
+    const stop = _dlpStrip.querySelector('.vmu-dlp-stop');
+    if (stop) { stop.textContent = 'Закрыть'; stop.disabled = false; stop.onclick = dlpClose; }
   }
+
+  // Per-track row badges removed — progress is now communicated only through
+  // the strip. Kept as no-ops so existing call sites in runPlaylistDownload
+  // don't need to change.
+  function dlAddRow() {}
+  function dlUpdateRow() {}
 
   async function scrollToCollect() {
     let last = dlTracks.size, unchanged = 0;
@@ -1309,8 +1349,7 @@
       window.postMessage({ type: 'VKD_SCROLL_LOAD' }, '*');
       await sleep(750);
       const now = dlTracks.size;
-      const el = document.getElementById('vmu-dl-collected');
-      if (el) el.textContent = `Найдено: ${now}`;
+      dlSetPhase(`Прокручиваем список… найдено ${now}`);
       unchanged = now === last ? unchanged + 1 : 0;
       last = now;
     }
@@ -1418,15 +1457,102 @@
     }
   }
 
-  async function runPlaylistDownload(plInfo) {
+  // ─── Inline ZIP writer (store method, no compression) ────────────────────────
+  // MP3/AAC don't compress meaningfully; store-only keeps the code small and the
+  // builder fast. Each file entry is: local header + name + data; central dir
+  // appended at the end, then End-Of-Central-Directory record.
+  function vmuZipBuild(files) {
+    const enc = new TextEncoder();
+    if (!vmuZipBuild._crcTbl) {
+      const t = new Uint32Array(256);
+      for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[i] = c >>> 0;
+      }
+      vmuZipBuild._crcTbl = t;
+    }
+    const T = vmuZipBuild._crcTbl;
+    const crc32 = (buf) => {
+      let c = 0xFFFFFFFF;
+      for (let i = 0; i < buf.length; i++) c = T[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+      return (c ^ 0xFFFFFFFF) >>> 0;
+    };
+
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    const dosTime = 0, dosDate = 0x21; // 1980-01-01
+
+    for (const f of files) {
+      const nameBytes = enc.encode(f.name);
+      const data = f.data instanceof Uint8Array ? f.data : new Uint8Array(f.data);
+      const crc = crc32(data);
+      const size = data.length;
+
+      const lh = new Uint8Array(30 + nameBytes.length);
+      const lv = new DataView(lh.buffer);
+      lv.setUint32(0, 0x04034b50, true);
+      lv.setUint16(4, 20, true);
+      lv.setUint16(6, 0x0800, true); // UTF-8 filename
+      lv.setUint16(8, 0, true);      // store
+      lv.setUint16(10, dosTime, true);
+      lv.setUint16(12, dosDate, true);
+      lv.setUint32(14, crc, true);
+      lv.setUint32(18, size, true);
+      lv.setUint32(22, size, true);
+      lv.setUint16(26, nameBytes.length, true);
+      lv.setUint16(28, 0, true);
+      lh.set(nameBytes, 30);
+      parts.push(lh, data);
+
+      const ch = new Uint8Array(46 + nameBytes.length);
+      const cv = new DataView(ch.buffer);
+      cv.setUint32(0, 0x02014b50, true);
+      cv.setUint16(4, 20, true);
+      cv.setUint16(6, 20, true);
+      cv.setUint16(8, 0x0800, true);
+      cv.setUint16(10, 0, true);
+      cv.setUint16(12, dosTime, true);
+      cv.setUint16(14, dosDate, true);
+      cv.setUint32(16, crc, true);
+      cv.setUint32(20, size, true);
+      cv.setUint32(24, size, true);
+      cv.setUint16(28, nameBytes.length, true);
+      cv.setUint16(30, 0, true);
+      cv.setUint16(32, 0, true);
+      cv.setUint16(34, 0, true);
+      cv.setUint16(36, 0, true);
+      cv.setUint32(38, 0, true);
+      cv.setUint32(42, offset, true);
+      ch.set(nameBytes, 46);
+      central.push(ch);
+
+      offset += lh.length + data.length;
+    }
+
+    let centralSize = 0;
+    for (const c of central) centralSize += c.length;
+    const centralOffset = offset;
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    ev.setUint32(0, 0x06054b50, true);
+    ev.setUint16(8, files.length, true);
+    ev.setUint16(10, files.length, true);
+    ev.setUint32(12, centralSize, true);
+    ev.setUint32(16, centralOffset, true);
+    return new Blob([...parts, ...central, eocd], { type: 'application/zip' });
+  }
+
+  async function runPlaylistDownload(plInfo, mode) {
     dlCancelFlag = false;
     // Snapshot tracks already captured during popup load (early injection path)
     const preloaded = new Map(dlTracks);
     dlTracks.clear();
     window.postMessage({ type: 'VKD_RESET_DL' }, '*');
 
-    const pageBtn = document.getElementById('vmu-dl-btn');
-    if (pageBtn) pageBtn.disabled = true;
+    const pageBtns = document.querySelectorAll('.vmu-dl-page-btn');
+    pageBtns.forEach(b => b.disabled = true);
 
     try {
       if (plInfo?.ownerId && plInfo?.playlistId) {
@@ -1520,8 +1646,7 @@
           : `Нет прямых ссылок (HLS: ${hlsCount}, без URL: ${noUrl}). VK отдаёт стрим-формат`;
         console.warn('[vmu]', msg);
         dlSetPhase(msg);
-        const stopBtn = document.getElementById('vmu-dl-stop');
-        if (stopBtn) stopBtn.style.display = 'none';
+        dlSetFinished(false);
         return;
       }
 
@@ -1529,64 +1654,82 @@
       dlSetProgress(0, total);
       console.log('[vmu] download queue:', total, 'tracks, first url:', queue[0]?.url?.substring(0, 100));
 
-      // Phase 2 — download queue
+      // Phase 2 — fetch loop. In ZIP mode we accumulate Uint8Arrays + filenames
+      // and build a single archive at the end. In individual mode we download
+      // each blob via chrome.downloads as it lands.
+      const zipFiles = [];
       let done = 0, errors = 0;
+      const wantBuffer = (mode === 'zip');
+
       for (let i = 0; i < queue.length; i++) {
         if (dlCancelFlag) break;
         const track = queue[i];
         dlAddRow(track, 'uploading');
-        dlSetPhase(`${i + 1} / ${total} — ${track.artist ? track.artist + ' — ' : ''}${track.title}`);
+        dlSetPhase(`${i + 1}/${total} — ${track.artist ? track.artist + ' — ' : ''}${track.title}`);
 
         const fn = dlSanitize(`${dlPad(i + 1, total)} - ${track.artist} - ${track.title}`);
         const isHls = track.url.includes('/a2/') || track.url.includes('.m3u8');
-        let res;
+        let res, ext = 'mp3', bytes = null;
 
-        if (isHls) {
-          // HLS: fetch m3u8 → download segments → concat → blob → download
-          const hlsUrl = track.url.includes('.m3u8') ? track.url : track.url + '/index.m3u8';
-          try {
-            const hlsResult = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id }, 120000);
-            if (hlsResult?.ok && hlsResult.blobUrl) {
-              const ext = hlsResult.ext || 'ts';
-              res = await sendDlMsg(hlsResult.blobUrl, fn + '.' + ext);
-            } else {
-              res = { ok: false, error: hlsResult?.error || 'HLS failed' };
-            }
-          } catch (e) {
-            res = { ok: false, error: e.message };
+        try {
+          if (isHls) {
+            const hlsUrl = track.url.includes('.m3u8') ? track.url : track.url + '/index.m3u8';
+            const r = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id, returnBuffer: wantBuffer }, 300000);
+            if (r?.ok) {
+              ext = r.ext || 'ts';
+              if (wantBuffer) { bytes = r.buffer; res = { ok: true }; }
+              else { res = await sendDlMsg(r.blobUrl, fn + '.' + ext); }
+            } else res = { ok: false, error: r?.error || 'HLS failed' };
+          } else {
+            const r = await pageCall('VKD_FETCH_BLOB', 'VKD_FETCH_BLOB_DONE', { url: track.url, trackId: track.id, returnBuffer: wantBuffer }, 180000);
+            if (r?.ok) {
+              if (wantBuffer) { bytes = r.buffer; res = { ok: true }; }
+              else { res = await sendDlMsg(r.blobUrl, fn + '.mp3'); }
+            } else res = { ok: false, error: r?.error || 'fetch failed' };
           }
-        } else {
-          // Fetch in page context (sends correct Referer + cookies), then download blob
-          try {
-            const fetchResult = await pageCall('VKD_FETCH_BLOB', 'VKD_FETCH_BLOB_DONE', { url: track.url, trackId: track.id }, 120000);
-            if (fetchResult?.ok && fetchResult.blobUrl) {
-              res = await sendDlMsg(fetchResult.blobUrl, fn + '.mp3');
-            } else {
-              res = { ok: false, error: fetchResult?.error || 'fetch failed' };
-            }
-          } catch (e) {
-            res = { ok: false, error: e.message };
-          }
-        }
+        } catch (e) { res = { ok: false, error: e.message }; }
 
         console.log('[vmu] dl', i + 1, res?.ok ? 'OK' : ('ERR: ' + res?.error), isHls ? 'HLS' : 'direct');
-        if (res?.ok) { done++; dlUpdateRow(track.id, 'done'); }
-        else          { errors++; dlUpdateRow(track.id, 'error', res?.error); }
+        if (res?.ok) {
+          done++;
+          dlUpdateRow(track.id, 'done');
+          if (wantBuffer && bytes) zipFiles.push({ name: fn + '.' + ext, data: new Uint8Array(bytes) });
+        } else {
+          errors++;
+          dlUpdateRow(track.id, 'error', res?.error);
+        }
         dlSetProgress(done, total);
-        await sleep(180);
+        await sleep(120);
       }
 
-      const stopBtn = document.getElementById('vmu-dl-stop');
+      // ZIP mode: build the archive and trigger one download
+      if (wantBuffer && zipFiles.length > 0 && !dlCancelFlag) {
+        dlSetPhase(`Собираем ZIP… (${zipFiles.length} треков)`);
+        const playlistName = dlSanitize(getPlaylistTitle() || 'playlist');
+        const zipBlob = vmuZipBuild(zipFiles);
+        const blobUrl = URL.createObjectURL(zipBlob);
+        const zipRes = await sendDlMsg(blobUrl, playlistName + '.zip');
+        if (!zipRes?.ok) errors++;
+      }
+
       dlSetPhase(dlCancelFlag
-        ? `Остановлено — скачано ${done} из ${total}`
-        : `Готово! Скачано ${done}${errors ? `, ошибок ${errors}` : ''} из ${total}`);
-      if (stopBtn) stopBtn.style.display = 'none';
+        ? `Остановлено — ${done} из ${total}`
+        : `Готово · ${done}${errors ? `, ошибок ${errors}` : ''} из ${total}`);
+      dlSetFinished(!dlCancelFlag && errors === 0);
     } catch (err) {
       dlSetPhase('Ошибка: ' + err.message);
+      dlSetFinished(false);
       console.error('[VK Multi Upload DL]', err);
     } finally {
-      if (pageBtn) pageBtn.disabled = false;
+      pageBtns.forEach(b => b.disabled = false);
     }
+  }
+
+  function getPlaylistTitle() {
+    const modal = getActiveModal();
+    if (!modal) return null;
+    const title = modal.querySelector('[class*="vkitAudioListBoxHeader__info"] a, [class*="vkitAudioListBoxHeader__info"] [class*="TextClamp"]');
+    return title?.textContent?.trim() || null;
   }
 
   // ─── Single-track download on hover ──────────────────────────────────────────
@@ -1626,14 +1769,18 @@
   }
 
   async function downloadSingleTrack(track, btnEl) {
+    const label = `${track.artist ? track.artist + ' — ' : ''}${track.title}`;
+    showProgressToast(`Получение ссылки… ${label}`, { kind: 'progress' });
     if (!track.url) {
-      // Try reload_audio API first (no playback needed, same as playlist download)
       try {
         const result = await pageCall('VKD_RELOAD_AUDIO', 'VKD_RELOAD_AUDIO_DONE', { ids: [track.reloadId || track.id] }, 8000);
         if (result?.resolved?.[track.id]) track.url = result.resolved[track.id];
       } catch {}
     }
-    if (!track.url) { showToast('Не удалось получить ссылку на трек', true); return; }
+    if (!track.url) {
+      showProgressToast('Не удалось получить ссылку на трек', { kind: 'error' });
+      return;
+    }
 
     btnEl.classList.add('vmu-single-dl-loading');
     const fn = dlSanitize(`${track.artist} - ${track.title}`);
@@ -1642,14 +1789,22 @@
 
     try {
       if (isHls) {
+        showProgressToast(`Подготовка HLS… ${label}`, { kind: 'progress', pct: 0 });
+        hlsProgressHandlers.set(track.id, (done, total) => {
+          const pct = total ? Math.round((done / total) * 100) : 0;
+          showProgressToast(`Скачивание ${pct}% · ${label}`, { kind: 'progress', pct });
+        });
         const hlsUrl = track.url.includes('.m3u8') ? track.url : track.url + '/index.m3u8';
-        const hlsResult = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id }, 120000);
+        const hlsResult = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id }, 300000);
+        hlsProgressHandlers.delete(track.id);
         if (hlsResult?.ok && hlsResult.blobUrl) {
+          showProgressToast(`Сохранение файла… ${label}`, { kind: 'progress', pct: 100 });
           res = await sendDlMsg(hlsResult.blobUrl, fn + '.' + (hlsResult.ext || 'ts'));
         } else {
           res = { ok: false, error: hlsResult?.error || 'HLS failed' };
         }
       } else {
+        showProgressToast(`Скачивание… ${label}`, { kind: 'progress' });
         const fetchResult = await pageCall('VKD_FETCH_BLOB', 'VKD_FETCH_BLOB_DONE', { url: track.url, trackId: track.id }, 120000);
         if (fetchResult?.ok && fetchResult.blobUrl) {
           res = await sendDlMsg(fetchResult.blobUrl, fn + '.mp3');
@@ -1659,13 +1814,15 @@
       }
     } catch (e) {
       res = { ok: false, error: e.message };
+    } finally {
+      hlsProgressHandlers.delete(track.id);
     }
 
     btnEl.classList.remove('vmu-single-dl-loading');
     if (res?.ok) {
-      showToast(`${track.artist ? track.artist + ' — ' : ''}${track.title}`);
+      showProgressToast(`Готово · ${label}`, { kind: 'done' });
     } else {
-      showToast('Ошибка: ' + (res?.error || 'unknown'), true);
+      showProgressToast('Ошибка: ' + (res?.error || 'unknown'), { kind: 'error' });
     }
   }
 
@@ -1694,9 +1851,19 @@
     if (row.querySelector('.vmu-single-dl')) return;
     if (!getTrackDataFromRow(row)) return;
 
-    // New VK: inject into buttonGroup inside actions area
+    // New VK page-level rows: inject into buttonGroup
     const btnGroup = row.querySelector('[class*="buttonGroup"]');
-    if (btnGroup) btnGroup.prepend(makeSingleDlBtn(row, 'vmu-single-dl-vkit'));
+    if (btnGroup) { btnGroup.prepend(makeSingleDlBtn(row, 'vmu-single-dl-vkit')); return; }
+
+    // New VK playlist modal rows: no buttonGroup. Prepend into the right-side
+    // "after" slot which also holds the duration. Mark the slot so CSS can lay
+    // the button out inline with the duration.
+    const after = row.querySelector('[class*="vkitAudioRow__after"]');
+    if (after) {
+      after.classList.add('vmu-after-host');
+      after.prepend(makeSingleDlBtn(row, 'vmu-single-dl-after'));
+      return;
+    }
     // Old VK: actions container appears only on hover — handled by the observer below
   }
 
@@ -1718,14 +1885,21 @@
     }
   }).observe(document.body, { childList: true, subtree: true });
 
-  // Ask injected.js to stamp data-vmu-track on vkit rows (fiber data lives in the
-  // page world), then inject buttons once attributes are in place
+  // Ask injected.js to stamp data-vmu-track on vkit rows (fiber data lives in
+  // the page world), then inject buttons once attributes are in place. We do
+  // three passes — virtualized lists sometimes finish mounting after the first
+  // mark; the cheap re-scans catch any rows that landed late.
   function markAndInjectAll() {
-    window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
-    setTimeout(() => {
-      const rows = document.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow, .audio_row, [data-full-id]');
-      for (const row of rows) injectSingleDlBtn(row);
-    }, 50);
+    const sweep = () => {
+      window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
+      setTimeout(() => {
+        const rows = document.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow, .audio_row, [data-full-id]');
+        for (const row of rows) injectSingleDlBtn(row);
+      }, 50);
+    };
+    sweep();
+    setTimeout(sweep, 200);
+    setTimeout(sweep, 600);
   }
 
   let _dlBtnTimer = null;
@@ -1734,17 +1908,41 @@
     _dlBtnTimer = setTimeout(markAndInjectAll, 150);
   }
 
-  // Dedicated watcher for popup modal — scans at 400ms and 900ms after it appears
+  // Dedicated watcher for popup modal — scans at 400ms and 900ms after it appears,
+  // then attaches an inner observer that re-runs markAndInjectAll whenever the
+  // virtualized list swaps rows (scroll inside the modal).
   let _modalDlTimer1 = null, _modalDlTimer2 = null;
+  let _modalInnerObs = null;
+  function attachModalInnerObserver(modal) {
+    if (!modal || modal.__vmuObsAttached) return;
+    modal.__vmuObsAttached = true;
+    let t = null;
+    const obs = new MutationObserver(muts => {
+      for (const mut of muts) {
+        for (const node of mut.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          if (node.matches?.('[class*="vkitAudioRow__root"]') || node.querySelector?.('[class*="vkitAudioRow__root"]')) {
+            clearTimeout(t);
+            t = setTimeout(markAndInjectAll, 60);
+            return;
+          }
+        }
+      }
+    });
+    obs.observe(modal, { childList: true, subtree: true });
+    _modalInnerObs = obs;
+  }
   new MutationObserver(muts => {
     for (const mut of muts) {
       for (const node of mut.addedNodes) {
         if (node.nodeType !== 1) continue;
-        const isModal = node.matches?.('[class*="vkitInternalModalBox"]') || node.querySelector?.('[class*="vkitInternalModalBox"]');
-        if (!isModal) continue;
+        const modalNode = node.matches?.('[class*="vkitInternalModalBox"]')
+          ? node
+          : node.querySelector?.('[class*="vkitInternalModalBox"]');
+        if (!modalNode) continue;
         clearTimeout(_modalDlTimer1); clearTimeout(_modalDlTimer2);
         _modalDlTimer1 = setTimeout(markAndInjectAll, 400);
-        _modalDlTimer2 = setTimeout(markAndInjectAll, 900);
+        _modalDlTimer2 = setTimeout(() => { markAndInjectAll(); attachModalInnerObserver(modalNode); }, 900);
       }
     }
   }).observe(document.body, { childList: true, subtree: true });
@@ -1763,7 +1961,7 @@
       uploadDoneCallback = null;
       dlTracks.clear();
       dlCancelFlag = true;
-      document.getElementById('vmu-dl-backdrop')?.remove();
+      dlpClose();
     }
 
     // Inject into VK's upload dialog whenever it appears
@@ -1776,8 +1974,8 @@
     // Move settings gear into the dialog's native header row
     if (document.querySelector('.audio_add_box') && !document.getElementById('vmu-settings-btn')) tryInjectSettingsIntoHeader();
 
-    // Inject download button on music/playlist pages
-    if (!document.getElementById('vmu-dl-btn')) tryInjectDlButton();
+    // Inject download buttons on music/playlist pages
+    if (!document.getElementById('vmu-dl-btn-wrap')) tryInjectDlButton();
 
     // Inject dupes button into playlist edit dialog (debounced)
     clearTimeout(_dupesDialogTimer);
