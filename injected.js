@@ -1,4 +1,4 @@
-// Runs in page context — intercepts XHR/fetch and handles file/UI injection from content script
+﻿// Runs in page context — intercepts XHR/fetch and handles file/UI injection from content script
 (function () {
   if (window.__vkMultiUploadInjected) return;
   window.__vkMultiUploadInjected = true;

@@ -1,4 +1,4 @@
-// Runs at document_start to patch fetch/XHR before VK scripts fire
+﻿// Runs at document_start to patch fetch/XHR before VK scripts fire
 (function () {
   if (window.__vkMultiUploadInjected) return;
   const s = document.createElement('script');
@@ -23,7 +23,11 @@
   let dndCounter = 0;
   for (const evt of ['dragenter', 'dragover', 'dragleave', 'drop']) {
     window.addEventListener(evt, e => {
-      const box = document.querySelector('.audio_add_box');
+      const box = document.querySelector('.audio_add_box') ||
+        [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+          .find(m => m.getBoundingClientRect().width > 0 &&
+                     (m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
+                      m.querySelector('[data-testid="UploadAudio_SelectFileButton"]')));
       if (!box) return;
       e.preventDefault();
       e.stopPropagation();

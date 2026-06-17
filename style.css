@@ -835,62 +835,76 @@
 .vmu-single-dl:hover {
   color: #e1e3e6;
 }
-/* Tooltip shared */
+/* z-index keeps the button above VK's hover overlays. The actual tooltip is
+   rendered as a portal element (#vmu-tooltip) on document.body via
+   showDlTooltip in content.js — CSS ::after pseudos used to be clipped by
+   VK's gallery containers (`ui_gallery__inner_cont` has overflow:hidden),
+   so the first row of every column showed a truncated tooltip. */
 .vmu-single-dl {
   position: relative;
+  z-index: 2;
 }
-.vmu-single-dl::after,
-.vmu-single-dl::before {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
+/* Mirrors VK's own .tt_w.tt_black tooltip (audio rows, top-bar icons, etc.):
+   60 % black, 3 px radius, ~12.5 px white text with 4/7/5/7 padding, no
+   shadow, 5×5 px CSS-triangle tail. The .vmu-tooltip-new modifier swaps to
+   vkui's tooltip look for buttons inside the new playlist modal.
+   .vmu-tooltip-below flips the tail when the tooltip is rendered under the
+   button (used when there's no room above). */
+#vmu-tooltip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 99999;
   pointer-events: none;
-  opacity: 0;
-  transition: opacity .15s;
-  z-index: 100;
-}
-.vmu-single-dl::after {
-  content: attr(data-vmu-tip);
-  white-space: nowrap;
-  font-weight: 400;
-  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
-}
-.vmu-single-dl::before {
-  content: '';
-  border: 6px solid transparent;
-}
-.vmu-single-dl:hover::after,
-.vmu-single-dl:hover::before {
-  opacity: 1;
-}
-/* Old VK tooltip — above button, matches .tt_w.tt_black */
-.vmu-single-dl-act::after {
-  bottom: calc(100% + 5px);
   background: rgba(0,0,0,0.6);
   color: #fff;
-  font-size: 13px;
-  padding: 9px 12px 10px;
-  border-radius: 2px;
+  padding: 4px 7px 5px;
+  border-radius: 3px;
+  font-size: 12.5px;
+  line-height: 1.15;
+  font-weight: 400;
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .12s;
 }
-.vmu-single-dl-act::before {
-  bottom: calc(100% - 1px);
+#vmu-tooltip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border: 5px solid transparent;
   border-top-color: rgba(0,0,0,0.6);
-  border-bottom: none;
 }
-/* Vkit tooltip — below button, matches vkuiTooltipBase__content */
-.vmu-single-dl-vkit::after {
-  top: calc(100% + 5px);
+#vmu-tooltip.vmu-tooltip-below::after {
+  top: auto;
+  bottom: 100%;
+  border-top-color: transparent;
+  border-bottom-color: rgba(0,0,0,0.6);
+}
+#vmu-tooltip.vmu-tooltip-new {
   background: rgb(50,50,50);
   color: #e1e3e6;
-  font-size: 13px;
   padding: 9px 12px 10px;
   border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.2;
   box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
 }
-.vmu-single-dl-vkit::before {
-  top: calc(100% - 1px);
+#vmu-tooltip.vmu-tooltip-new::after {
+  border-top-color: rgb(50,50,50);
+}
+#vmu-tooltip.vmu-tooltip-new.vmu-tooltip-below::after {
+  border-top-color: transparent;
   border-bottom-color: rgb(50,50,50);
-  border-top: none;
+}
+#vmu-tooltip.vmu-tooltip-show {
+  opacity: 1;
+  visibility: visible;
 }
 /* Native VK actions sit at .7 opacity until directly hovered — match that */
 .audio_row__actions .vmu-single-dl-act {
@@ -928,17 +942,4 @@
   color: #e1e3e6;
   background: rgba(255,255,255,.08);
 }
-.vmu-single-dl-after::after {
-  top: calc(100% + 5px);
-  background: rgb(50,50,50);
-  color: #e1e3e6;
-  font-size: 13px;
-  padding: 9px 12px 10px;
-  border-radius: 8px;
-  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
-}
-.vmu-single-dl-after::before {
-  top: calc(100% - 1px);
-  border-bottom-color: rgb(50,50,50);
-  border-top: none;
-}
+/* Tooltip handled by portal #vmu-tooltip (showDlTooltip in content.js). */

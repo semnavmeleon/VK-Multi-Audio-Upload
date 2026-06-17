@@ -1,4 +1,4 @@
-(function () {
+﻿(function () {
   'use strict';
 
   // ─── inject page-context script ──────────────────────────────────────────────
@@ -892,7 +892,7 @@
 
       const stats = [];
       if (blockedIndices.length) stats.push(`Недоступно: ${blockedIndices.length}`);
-      if (dupeIndices.length) stats.push(`Дубл: ${dupeIndices.length}`);
+      if (dupeIndices.length) stats.push(`Дубликаты: ${dupeIndices.length}`);
       const head = document.createElement('div');
       head.className = 'vmu-bl-head';
       head.innerHTML = `<span class="vmu-bl-title">${stats.join(' · ')}</span>
@@ -1346,6 +1346,21 @@
     if (!isProcessing) processQueue();
   }
 
+  // ─── helpers to find VK's upload dialog (new and old VK) ────────────────────
+  function getUploadDialog() {
+    // New VK: vkitInternalModalBox containing audio file input
+    const newDlg = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+      .find(m => m.getBoundingClientRect().width > 0 &&
+                 (m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
+                  m.querySelector('[data-testid="UploadAudio_SelectFileButton"]')));
+    if (newDlg) return newDlg;
+    // Old VK fallback
+    return document.querySelector('.audio_add_box') || null;
+  }
+  function getUploadDialogBody(box) {
+    return box?.querySelector('[class*="vkitModalBody__container"]') || box;
+  }
+
   // ─── global drag & drop interceptor ──────────────────────────────────────────
   // VK's own upload dialog (.audio_add_box) overlays an invisible native drop
   // target on top of our embedded panel, so e.target during drop is VK's element,
@@ -1442,8 +1457,8 @@
     console.log('[VMU UPLOAD] uploadOne start:', file.name, 'size=', file.size);
     // Snapshot dialog state for diagnostics
     try {
-      const box = document.querySelector('.audio_add_box');
-      const layer = box?.closest('#box_layer, .popup_box_container');
+      const box = getUploadDialog();
+      const layer = box?.closest('#box_layer, .popup_box_container') || box;
       console.log('[VMU UPLOAD] dialog state', {
         boxOpen: !!box,
         boxStyle: box ? box.style.cssText.slice(0, 100) : null,
@@ -1553,8 +1568,8 @@
       if (old) { old._vmuCleanup?.(); old.remove(); }
       return;
     }
-    const box = document.querySelector('.audio_add_box');
-    const popup = box?.closest('.popup_box_container');
+    const box = getUploadDialog();
+    const popup = box?.closest('.popup_box_container') || box;
     if (!popup) {
       const old = document.getElementById('vmu-upload-side');
       if (old) { old._vmuCleanup?.(); old.remove(); }
@@ -1606,7 +1621,7 @@
     }
     panel.innerHTML = buttonsHtml;
     // Re-center vertically against the popup after the content height changes
-    const popup2 = document.querySelector('.audio_add_box')?.closest('.popup_box_container');
+    const popup2 = getUploadDialog()?.closest('.popup_box_container') || getUploadDialog();
     if (popup2) {
       const r = popup2.getBoundingClientRect();
       const ph = panel.offsetHeight || 0;
@@ -1664,12 +1679,13 @@
       vkInput.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:0;height:0;overflow:hidden;';
     }
 
-    // Clear VK's content and inject our UI
-    box.innerHTML = '';
-    box.appendChild(buildEmbeddedUI());
+    // In new VK inject into modal body only (keep header/close btn intact)
+    const body = getUploadDialogBody(box);
+    body.innerHTML = '';
+    body.appendChild(buildEmbeddedUI());
 
     // Re-append VK's input so it stays in the DOM with its event listeners
-    if (vkInput) box.appendChild(vkInput);
+    if (vkInput) body.appendChild(vkInput);
 
     attachEmbeddedHandlers();
     renderQueue();
@@ -1829,56 +1845,6 @@
 
   // ─── playlist download feature ────────────────────────────────────────────────
 
-  const ICON_DL_SM = `<svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 1v8M4 6.5l2.5 2.5 2.5-2.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M1 11.5h11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
-
-  const DL_HDR_SELS = [
-    '.AudioPlaylistSnippet__controls',
-    '.AudioPlaylistHeader__controls',
-    '.audio_page_header__controls',
-    '[class*="PlaylistHeader"][class*="controls"]',
-    '.AudioFilters',
-    '.audio_page_header',
-    '.CatalogSection__titleWrapped',
-  ];
-
-  function tryInjectDlButton() {
-    const h = location.href;
-    if (!h.includes('/music') && !h.includes('/audio')) return;
-    if (document.getElementById('vmu-dl-btn-wrap')) return;
-    let target = null;
-    for (const sel of DL_HDR_SELS) {
-      target = document.querySelector(sel);
-      if (target) break;
-    }
-    if (!target) return;
-    const wrap = document.createElement('span');
-    wrap.id = 'vmu-dl-btn-wrap';
-    wrap.className = 'vmu-dl-page-wrap';
-
-    const make = (mode, label) => {
-      const b = document.createElement('button');
-      b.className = 'vmu-dl-page-btn vmu-dl-page-btn-' + mode;
-      b.innerHTML = `${ICON_DL_SM} ${label}`;
-      b.onclick = () => {
-        if (document.getElementById('vmu-dlp-strip')) return;
-        // If a playlist popup isn't currently open, open it first so progress
-        // can render inside the modal.
-        if (!getActiveModal()) {
-          const link = document.querySelector('a[href*="/music/playlist"], a[href*="audio_playlist"]');
-          if (link) {
-            link.click();
-            setTimeout(() => startDlSession(getPlaylistInfoFromUrl(), mode), 900);
-            return;
-          }
-        }
-        startDlSession(getPlaylistInfoFromUrl(), mode);
-      };
-      return b;
-    };
-    wrap.appendChild(make('individual', 'Треками'));
-    wrap.appendChild(make('zip', 'ZIP'));
-    target.appendChild(wrap);
-  }
 
   // ─── Embedded download progress (no backdrop) ────────────────────────────────
   // The progress strip is injected into the visible playlist modal between its
@@ -2180,9 +2146,6 @@
     dlTracks.clear();
     window.postMessage({ type: 'VKD_RESET_DL' }, '*');
 
-    const pageBtns = document.querySelectorAll('.vmu-dl-page-btn');
-    pageBtns.forEach(b => b.disabled = true);
-
     try {
       if (plInfo?.ownerId && plInfo?.playlistId) {
         dlSetPhase('Загружаем треки плейлиста…');
@@ -2281,7 +2244,8 @@
         dlAddRow(track, 'uploading');
         dlSetPhase(`${i + 1}/${total} — ${track.artist ? track.artist + ' — ' : ''}${track.title}`);
 
-        const fn = dlSanitize(`${dlPad(i + 1, total)} - ${track.artist} - ${track.title}`);
+        const meta = [track.artist, track.title].filter(s => String(s || '').trim()).join(' - ') || 'track';
+        const fn = dlSanitize(`${dlPad(i + 1, total)} - ${meta}`);
         const isHls = track.url.includes('/a2/') || track.url.includes('.m3u8');
         let res, ext = 'mp3', bytes = null;
 
@@ -2334,8 +2298,6 @@
       dlSetPhase('Ошибка: ' + err.message);
       dlSetFinished(false);
       console.error('[VK Multi Upload DL]', err);
-    } finally {
-      pageBtns.forEach(b => b.disabled = false);
     }
   }
 
@@ -2397,7 +2359,7 @@
     }
 
     btnEl.classList.add('vmu-single-dl-loading');
-    const fn = dlSanitize(`${track.artist} - ${track.title}`);
+    const fn = dlSanitize([track.artist, track.title].filter(s => String(s || '').trim()).join(' - ') || 'track');
     const isHls = track.url.includes('/a2/') || track.url.includes('.m3u8');
     let res;
 
@@ -2440,6 +2402,53 @@
     }
   }
 
+  // Single body-portal tooltip for all download buttons. CSS ::after tooltips
+  // get clipped by VK's gallery containers (ui_gallery__inner_cont has
+  // overflow: hidden) on the first row of every column; rendering the tooltip
+  // as a position:fixed element appended to body escapes any ancestor clip.
+  function getDlTooltipEl() {
+    let el = document.getElementById('vmu-tooltip');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'vmu-tooltip';
+      document.body.appendChild(el);
+    }
+    return el;
+  }
+  function showDlTooltip(btn) {
+    const text = btn.getAttribute('data-vmu-tip');
+    if (!text) return;
+    const el = getDlTooltipEl();
+    el.textContent = text;
+    // Default flavour matches VK's old tt_w.tt_black tooltip (used across the
+    // legacy audio rows and top-bar icons). Buttons inside the new vkui
+    // playlist modal get the vkui-style tooltip via .vmu-tooltip-new.
+    const isNewVk = btn.classList.contains('vmu-single-dl-vkit')
+      || btn.classList.contains('vmu-single-dl-after');
+    el.classList.toggle('vmu-tooltip-new', isNewVk);
+    // Reset placement modifier before measuring so layout reflects the
+    // default-above tail height.
+    el.classList.remove('vmu-tooltip-below');
+    el.classList.add('vmu-tooltip-show');
+    const br = btn.getBoundingClientRect();
+    const tr = el.getBoundingClientRect();
+    // 8 px gap so the 5 px tail tip just touches the icon's edge.
+    const GAP = 8;
+    let top = br.top - tr.height - GAP;
+    if (top < 4) {
+      top = br.bottom + GAP;
+      el.classList.add('vmu-tooltip-below');
+    }
+    let left = br.left + br.width / 2 - tr.width / 2;
+    left = Math.max(4, Math.min(window.innerWidth - tr.width - 4, left));
+    el.style.top = top + 'px';
+    el.style.left = left + 'px';
+  }
+  function hideDlTooltip() {
+    const el = document.getElementById('vmu-tooltip');
+    if (el) el.classList.remove('vmu-tooltip-show');
+  }
+
   function makeSingleDlBtn(row, extraClass) {
     const btn = document.createElement('button');
     btn.className = 'vmu-single-dl' + (extraClass ? ' ' + extraClass : '');
@@ -2449,10 +2458,13 @@
     for (const evt of ['mousedown', 'pointerdown', 'touchstart']) {
       btn.addEventListener(evt, e => { e.stopPropagation(); e.stopImmediatePropagation(); }, true);
     }
+    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
+    btn.addEventListener('mouseleave', hideDlTooltip);
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation();
+      hideDlTooltip();
       if (btn.classList.contains('vmu-single-dl-loading')) return;
       const track = getTrackDataFromRow(row);
       if (!track) { showToast('Не удалось определить трек', true); return; }
@@ -2588,18 +2600,14 @@
     }
 
     // Inject into VK's upload dialog whenever it appears
-    const box = document.querySelector('.audio_add_box:not([data-vmu-injected])');
-    if (box) injectIntoVkDialog(box);
+    const box = getUploadDialog();
+    if (box && !box.dataset.vmuInjected) injectIntoVkDialog(box);
 
-    // Place "Очистить" next to VK's native "Выбрать из своих аудиозаписей" link
+    // Place "Очистить" and settings gear (old VK only — new VK header survives injection)
     if (document.querySelector('.audio_add_box') && !document.getElementById('vmu-clear')) tryInjectClearButton();
-
-    // Move settings gear into the dialog's native header row
     if (document.querySelector('.audio_add_box') && !document.getElementById('vmu-settings-btn')) tryInjectSettingsIntoHeader();
 
     // Inject download buttons on music/playlist pages
-    if (!document.getElementById('vmu-dl-btn-wrap')) tryInjectDlButton();
-
     // Inject dupes button into playlist edit dialog (debounced)
     clearTimeout(_dupesDialogTimer);
     _dupesDialogTimer = setTimeout(tryInjectDupesIntoEditDialog, 300);
