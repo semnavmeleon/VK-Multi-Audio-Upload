@@ -1652,9 +1652,6 @@
   // survives box.innerHTML reset)
   function tryInjectSettingsIntoHeader() {
     if (document.getElementById('vmu-settings-btn')) return;
-    const titleEl = [...document.querySelectorAll('div, span, h1, h2, h3, p')]
-      .find(el => el.children.length === 0 && (el.textContent || '').trim() === 'Выберите аудиозапись на вашем компьютере');
-    if (!titleEl) return;
 
     const btn = document.createElement('button');
     btn.id = 'vmu-settings-btn';
@@ -1663,6 +1660,18 @@
     btn.innerHTML = ICON_SETTINGS;
     btn.addEventListener('click', toggleSettings);
 
+    // New VK: inject into the header's after slot (right side, visually aligns with ✕)
+    const box = getUploadDialog();
+    const afterSlot = box?.querySelector('[class*="vkitModalHeader__after"]');
+    if (afterSlot) {
+      afterSlot.appendChild(btn);
+      return;
+    }
+
+    // Old VK fallback — inject into the title element
+    const titleEl = [...document.querySelectorAll('div, span, h1, h2, h3, p')]
+      .find(el => el.children.length === 0 && (el.textContent || '').trim() === 'Выберите аудиозапись на вашем компьютере');
+    if (!titleEl) return;
     titleEl.style.display = 'flex';
     titleEl.style.alignItems = 'center';
     titleEl.appendChild(btn);
@@ -2604,8 +2613,8 @@
     if (box && !box.dataset.vmuInjected) injectIntoVkDialog(box);
 
     // Place "Очистить" and settings gear (old VK only — new VK header survives injection)
-    if (document.querySelector('.audio_add_box') && !document.getElementById('vmu-clear')) tryInjectClearButton();
-    if (document.querySelector('.audio_add_box') && !document.getElementById('vmu-settings-btn')) tryInjectSettingsIntoHeader();
+    if (getUploadDialog() && !document.getElementById('vmu-clear')) tryInjectClearButton();
+    if (getUploadDialog() && !document.getElementById('vmu-settings-btn')) tryInjectSettingsIntoHeader();
 
     // Inject download buttons on music/playlist pages
     // Inject dupes button into playlist edit dialog (debounced)

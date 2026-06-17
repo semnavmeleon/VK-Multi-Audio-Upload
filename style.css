@@ -6,17 +6,17 @@
   font-size: 13px;
   color: #e1e3e6;
   user-select: none;
-  padding: 4px 0 0;
+  padding: 8px 16px 4px;
+  box-sizing: border-box;
 }
 
 /* ── Settings gear injected into VK's native dialog header ──────────────────── */
 .vmu-settings-btn-header {
-  width: 28px;
-  height: 28px;
+  width: 36px;
+  height: 36px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  vertical-align: middle;
   border: none;
   background: rgba(255,255,255,0.06);
   border-radius: 50%;
@@ -24,8 +24,6 @@
   cursor: pointer;
   transition: background .12s, color .12s;
   padding: 0;
-  margin-left: auto;
-  margin-right: 16px;
   flex-shrink: 0;
 }
 .vmu-settings-btn-header:hover { background: rgba(255,255,255,0.13); color: #e1e3e6; }
@@ -140,6 +138,7 @@
 /* ── "Очистить" placed next to VK's native "Выбрать из своих аудиозаписей" ── */
 .vmu-clear-native {
   font-size: 13px;
+  font-weight: 700;
   color: #71aaeb;
   text-decoration: none;
   background: none;
@@ -148,8 +147,9 @@
   margin-left: 12px;
   padding: 0;
   font-family: inherit;
+  align-self: center;
 }
-.vmu-clear-native:hover { text-decoration: underline; }
+.vmu-clear-native:hover { color: #5a9ee0; text-decoration: none; }
 
 /* ── File list ────────────────────────────────────────────────────────────── */
 #vmu-list {
@@ -943,3 +943,9 @@
   background: rgba(255,255,255,.08);
 }
 /* Tooltip handled by portal #vmu-tooltip (showDlTooltip in content.js). */
+
+/* ── Wider upload dialog (override VK's default 420px) ───────────────────── */
+[class*="vkitInternalModalBox"]:has(input[accept*="audio"]),
+[class*="vkitInternalModalBox"]:has([data-testid="UploadAudio_SelectFileButton"]) {
+  width: 500px !important;
+}
