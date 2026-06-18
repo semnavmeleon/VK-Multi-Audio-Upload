@@ -23,11 +23,19 @@
   let dndCounter = 0;
   for (const evt of ['dragenter', 'dragover', 'dragleave', 'drop']) {
     window.addEventListener(evt, e => {
+      // Detect any incarnation of our upload UI: VK's native dialog, the held-open
+      // protected zombie, or just the presence of our injected panel.
+      // After the first file VK strips its own audio input + SelectFileButton,
+      // so the original (input/testid-based) check fails — we'd miss subsequent
+      // drops onto the still-open dialog.
       const box = document.querySelector('.audio_add_box') ||
+        document.querySelector('[data-vmu-protected]') ||
+        document.getElementById('vmu-embedded')?.closest('[class*="vkitInternalModalBox"]') ||
         [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
           .find(m => m.getBoundingClientRect().width > 0 &&
                      (m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
-                      m.querySelector('[data-testid="UploadAudio_SelectFileButton"]')));
+                      m.querySelector('[data-testid="UploadAudio_SelectFileButton"]') ||
+                      m.querySelector('#vmu-embedded')));
       if (!box) return;
       e.preventDefault();
       e.stopPropagation();

@@ -169,6 +169,7 @@
   background: rgba(255,255,255,0.03);
   position: relative;
   overflow: hidden;
+  flex-shrink: 0;
 }
 .vmu-progress {
   position: absolute;

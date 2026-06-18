@@ -1348,6 +1348,12 @@
 
   // ─── helpers to find VK's upload dialog (new and old VK) ────────────────────
   function getUploadDialog() {
+    // Protected zombie: injected.js kept this element alive while our flag is
+    // set. VK may have replaced the body with a success screen AND started a
+    // close animation (display:none / opacity:0), so skip the width check —
+    // armBoxVisibility will restore visibility on the next 300 ms tick.
+    const zombie = document.querySelector('[class*="vkitInternalModalBox"][data-vmu-protected]');
+    if (zombie) return zombie;
     // New VK: vkitInternalModalBox containing audio file input
     const newDlg = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0 &&
@@ -1390,7 +1396,8 @@
       'error=', fileQueue.filter(f => f.status === 'error').length,
       'next=', next?.file?.name);
     if (!next) {
-      setBlockAudioHide(false);
+      // Intentionally NOT calling setBlockAudioHide(false) here — keep the
+      // dialog open so user can drop more files. They dismiss it via the X.
       renderQueue();
       if (fileQueue.length > 0 && !fileQueue.some(f => f.status === 'uploading')) {
         // Trigger auto-playlist if enabled (once per completed batch)
@@ -1442,12 +1449,8 @@
     currentUploadingItem = null;
     renderQueue();
     isProcessing = false;
-    // Drop the hold-open flag the moment there's nothing more pending, so
-    // the user can immediately close the panel without waiting out the 2s
-    // settle delay below.
-    if (!fileQueue.some(f => f.status === 'pending' || f.status === 'uploading')) {
-      setBlockAudioHide(false);
-    }
+    // Hold-open stays on until the user explicitly closes — drag-and-drop
+    // of more files keeps working without re-opening the dialog.
     await sleep(2000);
     processQueue();
   }
@@ -2608,9 +2611,14 @@
       dlpClose();
     }
 
-    // Inject into VK's upload dialog whenever it appears
+    // Inject into VK's upload dialog whenever it appears;
+    // also re-inject if VK replaced the body content (success screen after upload)
     const box = getUploadDialog();
     if (box && !box.dataset.vmuInjected) injectIntoVkDialog(box);
+    if (box && box.dataset.vmuInjected && !document.getElementById('vmu-embedded')) {
+      delete box.dataset.vmuInjected;
+      injectIntoVkDialog(box);
+    }
 
     // Place "Очистить" and settings gear (old VK only — new VK header survives injection)
     if (getUploadDialog() && !document.getElementById('vmu-clear')) tryInjectClearButton();
