@@ -1396,15 +1396,18 @@
       'error=', fileQueue.filter(f => f.status === 'error').length,
       'next=', next?.file?.name);
     if (!next) {
-      // Intentionally NOT calling setBlockAudioHide(false) here — keep the
-      // dialog open so user can drop more files. They dismiss it via the X.
       renderQueue();
       if (fileQueue.length > 0 && !fileQueue.some(f => f.status === 'uploading')) {
         // Trigger auto-playlist if enabled (once per completed batch)
         if (settings.autoPlaylist && !autoPlaylistRunning) {
           autoPlaylistRunning = true;
           if (!settingsPanelOpen) toggleSettings();
-          runAutoPlaylist([...fileQueue]).finally(() => { autoPlaylistRunning = false; });
+          runAutoPlaylist([...fileQueue]).finally(() => {
+            autoPlaylistRunning = false;
+            reloadAfterBatchIfNeeded();
+          });
+        } else if (!autoPlaylistRunning) {
+          reloadAfterBatchIfNeeded();
         }
       }
       return;
@@ -1453,6 +1456,21 @@
     // of more files keeps working without re-opening the dialog.
     await sleep(2000);
     processQueue();
+  }
+
+  // VK's own UI re-renders the audio list only for the very first file of a
+  // session (it drives that one through Upload.onFileApiSend); every file
+  // after that is committed via our own direct upload (see injected.js'
+  // doDirectUpload), which never touches VK's store, so the visible list
+  // stays stale until the page reloads.
+  function reloadAfterBatchIfNeeded() {
+    if (itemIdCounter < 2) {
+      // Single file already renders correctly natively — release the close
+      // lock so the user can dismiss the dialog or keep dropping more files.
+      setBlockAudioHide(false);
+      return;
+    }
+    location.reload();
   }
 
   async function uploadOne(item) {

@@ -136,14 +136,27 @@
     const isCloseBtn = closeBtn && /^\s*Закрыть\s*$/.test(closeBtn.textContent || '');
 
     if (isXIcon || isCloseBtn) {
+      if (__vmuBlockAudioBoxHide) {
+        // Queue is still working (or waiting on the end-of-batch reload) —
+        // closing now would orphan the batch and skip the reload that's
+        // supposed to make the 2nd+ files show up. Swallow the click.
+        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+        console.log('[VMU CLOSE] close blocked — upload in progress');
+        return;
+      }
       console.log('[VMU CLOSE] user-close intercepted — flag off');
-      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
       __vmuBlockAudioBoxHide = false;
       clearArmedStyles();
 
       if (isNew) {
-        // New VK: let React handle its own teardown; just unblock
+        // New VK: don't preventDefault/stopPropagation here — this listener
+        // runs in the capture phase on `document`, which sits above the
+        // button in the tree. Stopping propagation here means the click
+        // never reaches React's own handler on the button, so VK's modal
+        // never actually closes. Just drop our own state and let the click
+        // continue through to VK's code.
       } else {
+        e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
         // Old VK: manually remove popup and backdrop
         const popup = box.closest('.popup_box_container');
         try { popup?.remove(); } catch {}
@@ -205,7 +218,13 @@
         U.obj[0]        = snap.obj;
         U.vars[0]       = snap.vars;
         U.types[0]      = snap.types;
-        U.uploadUrls[0] = snap.url;
+        // Do NOT restore snap.url — it's a one-shot JWT that VK already burned
+        // during the first upload. Leaving it null forces VK's onFileApiSend
+        // to re-mint a fresh upload URL via audio.getUploadServer, which in
+        // turn uses VK's current (live) access_token — the cached body we'd
+        // call ourselves carries a single-use token that returns error_code:5
+        // ("access_token has expired") on the second upload onwards.
+        U.uploadUrls[0] = null;
         U.dropbox[0]    = snap.dropbox;
         U.files[0]      = snap.files;
         // Reset per-upload counters so VK treats this as a fresh queue
@@ -523,22 +542,58 @@
     // and we can also resolve VK_UPLOAD_DONE immediately (no 8s wait).
     try {
       const r = JSON.parse(uploadResponseText);
+      // Detect VK rate-limit / size / quality errors that come back at the
+      // upload-server stage with no "redirect" field.
+      if (r && (r.error_code != null || r.error != null) && !r.redirect) {
+        const msg = r.error_msg || r.error || ('VK error ' + r.error_code);
+        trace('[VMU UPLOAD] upload-server error: ' + msg);
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: r.error_code }, '*');
+        return;
+      }
       if (r && typeof r.redirect === 'string' && r.redirect.includes('done_add')) {
-        // Extract sha from redirect URL for de-dup diagnostics
-        let sha = '', meta = '';
+        // v2 upload server returned a "redirect" URL that points to done_add
+        // with an audio={...sha,hash,server,...} payload. Whether we need to
+        // follow it depends on which path drove this upload:
+        //   • Upload.onFileApiSend (file #1): VK's React UI eats this response
+        //     itself, navigates to the redirect (via form/sendBeacon), and the
+        //     library gets the new track. Following it ourselves would double-
+        //     commit.
+        //   • doDirectUpload (file #2+): VK's UI is gone by the time the upload
+        //     response comes back, so nobody follows the redirect. Without our
+        //     fetch the track sits on pu.vk.com forever and never attaches to
+        //     the user's audio library — exactly the "second file didn't
+        //     upload" symptom.
+        let sha = '';
         try {
           const audioEnc = r.redirect.match(/[?&]audio=([^&]+)/)?.[1];
           if (audioEnc) {
             const audio = JSON.parse(decodeURIComponent(audioEnc));
-            sha = audio.sha?.slice(0, 12) || '';
-            meta = (audio.meta?.artist || '') + ' - ' + (audio.meta?.kad || '');
+            sha = (audio.sha || '').slice(0, 12);
           }
         } catch {}
-        trace('[VMU UPLOAD] v2 redirect sha=' + sha + ' meta=' + meta);
-        window.fetch(r.redirect, { credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
-          .then(resp => resp.text())
-          .then(txt => trace('[VMU UPLOAD] commit[sha=' + sha + '] resp=' + txt.slice(0, 80)))
-          .catch(err => trace('[VMU UPLOAD] commit failed:', err.message));
+        const weDrove = !!window.__vmuOurUpload;
+        window.__vmuOurUpload = false;
+        if (weDrove) {
+          trace('[VMU UPLOAD] v2 upload ok sha=' + sha + ' — following redirect to commit');
+          // Normalise //vk.com/... shape and follow with cookies so the server
+          // attaches the track to this user's library.
+          let redirectUrl = r.redirect;
+          if (redirectUrl.startsWith('//')) redirectUrl = location.protocol + redirectUrl;
+          else if (redirectUrl.startsWith('/')) redirectUrl = location.origin + redirectUrl;
+          origFetch(redirectUrl, { method: 'GET', credentials: 'include' })
+            .then(resp => {
+              trace('[VMU UPLOAD] redirect commit status=' + resp.status);
+              window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText }, '*');
+            })
+            .catch(err => {
+              trace('[VMU UPLOAD] redirect commit failed: ' + err.message);
+              // Still resolve — the upload itself succeeded, even if the commit
+              // navigation failed the row UI shouldn't hang forever.
+              window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText }, '*');
+            });
+          return;
+        }
+        trace('[VMU UPLOAD] v2 upload ok sha=' + sha + ' (VK UI will commit)');
         window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText }, '*');
         return;
       }
@@ -846,7 +901,8 @@
 
         // Direct v2 pipeline: mint a fresh JWT through audio.getUploadServer
         // ourselves, then POST the file. fetch wrapper's deferUploadDone() will
-        // see the {"redirect":...} response and follow it to commit save.
+        // see the {"redirect":...} response and (because we set __vmuOurUpload)
+        // follow that redirect to commit the track to the library.
         // This bypasses VK's Upload manager entirely from the 2nd file onwards
         // (it kept a stale one-shot JWT in uploadUrls[0] and re-using it hung).
         async function doDirectUpload() {
@@ -878,18 +934,26 @@
           }
           const fd = new FormData();
           fd.append('file', file, file.name);
-          // fetch wrapper auto-fires deferUploadDone() on the response, which
-          // detects the v2 {"redirect":...} shape and emits VK_UPLOAD_DONE.
-          window.fetch(uploadUrl, { method: 'POST', body: fd })
-            .catch(err => {
-              console.log('[VMU INJECT] direct upload failed:', err.message);
-              window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: err.message }, '*');
-            });
+          // Mark that WE drove this upload (not VK's Upload manager). When the
+          // pu.vk.com response comes back with a `redirect` URL, deferUploadDone
+          // checks this flag — if we drove it, no VK UI is alive to follow the
+          // redirect, so we must fetch it ourselves to commit the track to the
+          // library.
+          window.__vmuOurUpload = true;
+          // Use XHR (not fetch): the XHR interceptor above auto-attaches
+          // upload.progress → VK_UPLOAD_PROGRESS so the row's progress bar
+          // animates, registers __vmuCurrentUpload for cancel, and fires
+          // deferUploadDone on `load` (which detects v2 {"redirect":...}
+          // and emits VK_UPLOAD_DONE). Fetch has no upload-progress events,
+          // so 2nd+ tracks looked stuck at 0% with no visible activity.
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', uploadUrl);
+          xhr.send(fd);
           window.postMessage({ type: 'VK_FILE_INJECTED', ok: true }, '*');
         }
 
-        // Once we've captured a getUploadServer template, ALWAYS prefer our
-        // own pipeline. VK's onFileApiSend reuses a dead JWT after file #1.
+        // Once we've captured a getUploadServer template, prefer our own
+        // pipeline. VK's onFileApiSend reuses a dead JWT after file #1.
         if (window.__vmuGetUploadServerBody && window.__vmuGetUploadServerUrl) {
           console.log('[VMU INJECT] using direct v2 pipeline (template captured)');
           doDirectUpload();
@@ -898,6 +962,8 @@
 
         // First-ever upload of the session — no template yet. Let VK drive
         // the flow once via Upload.onFileApiSend so we capture audio.getUploadServer.
+        // Do NOT touch uploadUrls[0] here: for the first file VK already has a
+        // fresh one in there and our React-portal upload modal works as-is.
         if (!window.Upload?.options?.[0]) {
           const restored = restoreUploadSlot();
           console.log('[VMU INJECT] slot was empty, restored=', restored);
