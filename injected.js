@@ -1474,9 +1474,18 @@
 
   // ── Stamp data-vmu-track on audio rows so the content script (isolated world,
   // no access to React fiber expandos) can read track data from the DOM ──
+  // The selector explicitly skips rows that already have data-vmu-id. This
+  // avoids the expensive findTrackEntityFromFiber walk (up to 20 fiber
+  // hops per row) for rows we've already processed. VK's popup playlist
+  // lazy-loads by APPENDING new DOM nodes rather than recycling existing
+  // ones (verified live — row count grows monotonically as you scroll), so
+  // trusting an existing stamp is safe for the dupe-scan use case. Without
+  // this filter the per-iter cost is O(all DOM rows); with it the cost is
+  // O(newly-added rows) — flat instead of quadratic over the whole scan.
   function markRowTrackData() {
     let marked = 0;
-    for (const row of document.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow')) {
+    const rows = document.querySelectorAll('[class*="vkitAudioRow__root"]:not([data-vmu-id]), .AudioRow:not([data-vmu-id])');
+    for (const row of rows) {
       try {
         const entity = findTrackEntityFromFiber(row);
         if (!entity) continue;
@@ -1492,9 +1501,10 @@
           || entity.subtitle
           || entity.data?.subtitle
           || '';
-        // Always overwrite — virtualized lists recycle row elements for other tracks
+        const expectedId = `${ownerId}_${audioId}`;
+        row.dataset.vmuId = expectedId;
         row.dataset.vmuTrack = JSON.stringify({
-          id: `${ownerId}_${audioId}`,
+          id: expectedId,
           title: entity.title || entity.data?.title || '',
           artist,
           url: entity.url || null,

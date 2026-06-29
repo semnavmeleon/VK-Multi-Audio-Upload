@@ -74,6 +74,28 @@
 
   // ─── helpers ─────────────────────────────────────────────────────────────────
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  // Trigger injected.js' markRowTrackData and wait for its done-message.
+  // Used by both expandPlaylistModal and harvestPageTracks — was previously a
+  // fixed 80ms sleep, which over-waits when there's nothing to do and
+  // under-waits during the initial big stamp. Awaiting the done-message is
+  // self-paced.
+  function waitForMarkRows(timeoutMs = 2000) {
+    return new Promise(resolve => {
+      const t = setTimeout(() => {
+        window.removeEventListener('message', h);
+        resolve();
+      }, timeoutMs);
+      function h(e) {
+        if (e.source !== window || e.data?.type !== 'VKD_MARK_ROWS_DONE') return;
+        clearTimeout(t);
+        window.removeEventListener('message', h);
+        resolve();
+      }
+      window.addEventListener('message', h);
+      window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
+    });
+  }
   const isMP3 = (f) => f.type === 'audio/mpeg' || f.name.toLowerCase().endsWith('.mp3');
   const fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
   const escHtml = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -93,7 +115,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0 };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false };
 
   function loadSettings() {
     try {
@@ -114,6 +136,7 @@
         checkFullPage: settings.checkFullPage,
         pinSidebar: settings.pinSidebar,
         contentOffsetX: settings.contentOffsetX,
+        optimizeBigPlaylists: settings.optimizeBigPlaylists,
       }));
     } catch {}
   }
@@ -156,6 +179,18 @@
       // across the entire scroll range.
       parts.push(
         `#layout_sidebar [class*="inset-block-start-2xl"], #ads_wrapper > * { position: static !important; top: auto !important; bottom: auto !important; inset-block-start: auto !important; inset-block-end: auto !important; }`
+      );
+    }
+
+    if (settings.optimizeBigPlaylists) {
+      // content-visibility: auto tells the browser to skip layout/paint for
+      // any row outside the viewport. contain-intrinsic-size keeps the
+      // scrollbar accurate by reserving height for skipped rows (`auto`
+      // remembers the actual size once each row has rendered at least once).
+      // DOM nodes stay intact, so data-vmu-track stamps, dupe scan and
+      // scroll-to behaviour keep working.
+      parts.push(
+        `[class*="vkitAudioRow__root"], .audio_row, .AudioRow { content-visibility: auto !important; contain-intrinsic-size: auto 56px !important; }`
       );
     }
 
@@ -688,10 +723,16 @@
     const collected = new Map();
 
     async function harvest() {
-      window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
-      await sleep(80);
+      await waitForMarkRows();
       const rows = modal.querySelectorAll('[class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
       for (const r of rows) {
+        // Fast path — skip the full JSON.parse if we've already collected
+        // this track (looked up via the tiny data-vmu-id attribute). Without
+        // this, every iteration re-parses every row's data-vmu-track and
+        // the cost grows linearly with collected size → quadratic overall.
+        const fastId = r.dataset?.vmuId;
+        if (fastId && collected.has(fastId)) continue;
+
         let id = null, title = '', artist = '', fullId = null, isBlocked = false;
         if (r.dataset && r.dataset.vmuTrack) {
           try {
@@ -709,21 +750,7 @@
       }
     }
 
-    // Pick a way to "scroll for more" that doesn't move the underlying page.
-    // Order of preference:
-    //   1. An in-modal scrollable container — set its scrollTop = scrollHeight
-    //   2. scrollIntoView on the last mounted audio row (block: 'nearest' so
-    //      the page scroll position is preserved)
     const modalScroller = findInModalScroller();
-    function nudgeForMore() {
-      if (modalScroller) {
-        modalScroller.scrollTop = modalScroller.scrollHeight;
-        return;
-      }
-      const rows = modal.querySelectorAll('[class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
-      const last = rows[rows.length - 1];
-      if (last) last.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-    }
 
     await harvest();
     const reportProgress = () => {
@@ -732,11 +759,39 @@
     };
     reportProgress();
 
+    // Aggressive scroll-and-harvest loop. The earlier version (60 iters,
+    // stable < 4, simple scrollTop = scrollHeight) plateaued on long playlists
+    // — VK's lazy-loader needs *motion* between batches, not just being at the
+    // bottom. Same recipe that fixed the audios-page harvest works here:
+    //   - 200 iter cap, 15 stable iters before giving up
+    //   - every 3rd iter, jump up first so the next bottom-jump registers
+    //     as fresh motion
+    //   - every 4th iter, scrollIntoView({ block:'end' }) on the last row
+    //     pokes any bottom-sentinel IntersectionObserver even when
+    //     scrollHeight hasn't grown
     let stable = 0, lastSize = collected.size;
-    const MAX_ITER = 60;
-    for (let i = 0; i < MAX_ITER && stable < 4; i++) {
-      nudgeForMore();
-      await sleep(500);
+    const MAX_ITER = 200;
+    const STABLE_LIMIT = 15;
+    for (let i = 0; i < MAX_ITER && stable < STABLE_LIMIT; i++) {
+      if (modalScroller) {
+        if (i % 3 === 2) {
+          modalScroller.scrollTop = Math.max(0, modalScroller.scrollHeight - modalScroller.clientHeight - 800);
+          await sleep(120);
+        }
+        modalScroller.scrollTop = modalScroller.scrollHeight;
+      }
+      await sleep(450);
+      // Always nudge the last mounted row into view — this is the most reliable
+      // way to wake the popup's lazy-load when no internal scroller exists.
+      const rowsNow = modal.querySelectorAll('[class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
+      const lastRow = rowsNow[rowsNow.length - 1];
+      if (lastRow) {
+        // `end` actually scrolls the nearest scrollable ancestor when the row
+        // is off-screen (which is when lazy-load needs to fire). `nearest`
+        // bails out if the row is technically visible and skips the trigger.
+        lastRow.scrollIntoView({ block: i % 4 === 3 ? 'end' : 'nearest' });
+        await sleep(250);
+      }
       await harvest();
       reportProgress();
       if (collected.size === lastSize) stable++; else { stable = 0; lastSize = collected.size; }
@@ -1316,6 +1371,17 @@
               <button type="button" id="vmu-offset-x-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
             </div>
           </div>
+
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Оптимизация больших плейлистов</span>
+              <span class="vmu-setting-hint">Пропускать рендеринг строк за пределами экрана — меньше лагов при скролле длинных списков</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-optimize-toggle" ${settings.optimizeBigPlaylists ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
         </div>
 
         <div id="vmu-pl-status" style="display:none">
@@ -1351,6 +1417,15 @@
         if (dzHint) dzHint.textContent = isCheck
           ? 'имена файлов будут сверены с треками на странице'
           : 'не более 200 МБ каждый';
+      });
+    }
+
+    const optimizeToggle = document.getElementById('vmu-optimize-toggle');
+    if (optimizeToggle) {
+      optimizeToggle.addEventListener('change', () => {
+        settings.optimizeBigPlaylists = optimizeToggle.checked;
+        saveSettings();
+        applyLayoutCustomizations();
       });
     }
 
@@ -1708,6 +1783,14 @@
       const rows = document.querySelectorAll('[data-vmu-track]');
       for (const row of rows) {
         if (uploadBox && uploadBox.contains(row)) continue;
+        // Fast path — same as expandPlaylistModal's harvest(): use the tiny
+        // data-vmu-id attribute to short-circuit known rows without paying
+        // for JSON.parse on every iteration.
+        const fastId = row.dataset?.vmuId;
+        if (fastId && collected.has(fastId)) {
+          if (limit && collected.size >= limit) return;
+          continue;
+        }
         try {
           const t = JSON.parse(row.dataset.vmuTrack);
           if (t?.id && !collected.has(t.id)) collected.set(t.id, t);
@@ -1727,9 +1810,12 @@
     const initialTop = sc ? sc.scrollTop : 0;
 
     async function refreshStamps() {
-      // Ask injected.js to (re-)stamp every audio row currently mounted
-      window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
-      await sleep(80);
+      // Ask injected.js to (re-)stamp every newly-mounted audio row and
+      // wait for its done-message instead of a fixed sleep. With the
+      // :not([data-vmu-id]) filter in injected.js, this is now O(new rows)
+      // rather than O(all rows), so the response comes back ~immediately
+      // once the initial big batch is processed.
+      await waitForMarkRows();
     }
 
     await refreshStamps();
