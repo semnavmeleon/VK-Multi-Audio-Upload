@@ -947,6 +947,70 @@
 }
 /* Tooltip handled by portal #vmu-tooltip (showDlTooltip in content.js). */
 
+/* ── Slider (range input) used by the content-offset setting ─────────────── */
+.vmu-slider-row .vmu-setting-info { min-width: 0; flex: 1 1 auto; }
+.vmu-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.vmu-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 140px;
+  height: 4px;
+  background: rgba(255,255,255,0.12);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+  padding: 0;
+  margin: 0;
+}
+.vmu-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: #2688eb;
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+}
+.vmu-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: #2688eb;
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+}
+.vmu-slider:hover::-webkit-slider-thumb { background: #3d97f0; }
+.vmu-slider-value {
+  font-size: 11px;
+  color: #999;
+  font-variant-numeric: tabular-nums;
+  min-width: 46px;
+  text-align: right;
+}
+.vmu-slider-reset {
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: rgba(255,255,255,0.06);
+  border-radius: 50%;
+  color: #888;
+  cursor: pointer;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1;
+}
+.vmu-slider-reset:hover { background: rgba(255,255,255,0.14); color: #fff; }
+
 /* ── Work-mode switch (segmented control) ────────────────────────────────── */
 .vmu-mode-section .vmu-setting-row { align-items: flex-start; gap: 14px; }
 .vmu-mode-switch {

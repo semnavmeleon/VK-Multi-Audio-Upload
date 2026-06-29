@@ -93,7 +93,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0 };
 
   function loadSettings() {
     try {
@@ -112,11 +112,80 @@
         autoCoverFromId3: settings.autoCoverFromId3,
         workMode: settings.workMode,
         checkFullPage: settings.checkFullPage,
+        pinSidebar: settings.pinSidebar,
+        contentOffsetX: settings.contentOffsetX,
       }));
     } catch {}
   }
 
   loadSettings();
+
+  // ─── layout customizations (pin sidebar, horizontal offset) ──────────────
+  // Drive layout tweaks through a single <style id="vmu-layout-style"> tag so
+  // changes apply globally and survive React re-renders without per-element
+  // mutation. Targets VK's #layout_sidebar and #page_body by id.
+  function applyLayoutCustomizations() {
+    let el = document.getElementById('vmu-layout-style');
+    if (!el) {
+      el = document.createElement('style');
+      el.id = 'vmu-layout-style';
+      (document.head || document.documentElement).appendChild(el);
+    }
+    const parts = [];
+    const dx = Math.round(Number(settings.contentOffsetX) || 0);
+
+    if (settings.pinSidebar) {
+      // Pin the sidebar BELOW VK's fixed top bar — otherwise the first nav
+      // item (Профиль) gets hidden behind it once stuck. Measure the top bar
+      // at apply time so we're robust to VK UI changes (compact vs full).
+      const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
+      const topBarH = topBar ? Math.round(topBar.getBoundingClientRect().height) : 48;
+      // align-self: flex-start prevents the parent flex from stretching the
+      // sidebar to its row's height so sticky has a finite anchor.
+      parts.push(
+        `#layout_sidebar { position: sticky !important; top: ${topBarH}px !important; align-self: flex-start !important; }`
+      );
+      // VK applies sticky-like behaviour to the sidebar footer
+      // (`.vkui-inset-block-start-2xl` inside `#ads_wrapper`: Блог / Авторам /
+      // Информация о контенте). With the sidebar pinned, that footer jumps
+      // to viewport-top=48 as soon as the page scrolls past ~500px. The
+      // element's computed `position` reports "static" but `top: 16px` is set
+      // and an as-yet-unclear VK behaviour treats it like sticky in this
+      // configuration. Forcing `position: static; top: auto` neutralises it —
+      // confirmed live: footer stays at its natural in-flow position (391)
+      // across the entire scroll range.
+      parts.push(
+        `#layout_sidebar [class*="inset-block-start-2xl"], #ads_wrapper > * { position: static !important; top: auto !important; bottom: auto !important; inset-block-start: auto !important; inset-block-end: auto !important; }`
+      );
+    }
+
+    if (dx !== 0) {
+      // Shift two containers in sync:
+      //   1. LayoutWrapper__body  — the flex parent of sidebar + page_body
+      //   2. TopNavigationWrapper__outer — the content wrapper INSIDE VK's
+      //      fixed top bar (vkuiFixedLayout). The top bar itself is
+      //      position: fixed so shifting it directly is awkward; instead we
+      //      shift its inner content so logo/search/player/avatar move in
+      //      lockstep with the page content underneath.
+      // Why position:relative + left, not transform:
+      //   - Browser quirk: `position: sticky` + `left` is ignored on elements
+      //     whose containing block has no horizontal scroll (verified live —
+      //     sticky + left:-230 → no visual offset). Shifting the parent
+      //     instead of the sticky child sidesteps this entirely.
+      //   - `transform` would move both at once, but it creates a new
+      //     containing block for `position: fixed` descendants. VK modals
+      //     would then anchor to the shifted container and disappear.
+      // `position: relative` shifts the visible content without creating a
+      // containing block for fixed children, so modals stay viewport-anchored
+      // and the pinned sidebar's sticky behaviour keeps working.
+      parts.push(
+        `[class*="LayoutWrapper__body"], [class*="TopNavigationWrapper__outer"] { position: relative !important; left: ${dx}px !important; transition: left .15s ease; }`
+      );
+    }
+
+    el.textContent = parts.join('\n');
+  }
+  applyLayoutCustomizations();
 
   // ─── filename → meta parser ───────────────────────────────────────────────────
   function parseMetaFromFilename(filename) {
@@ -1224,6 +1293,31 @@
           </div>
         </div>
 
+        <div class="vmu-settings-section">
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Закрепить сайдбар</span>
+              <span class="vmu-setting-hint">Левая колонка следует за прокруткой страницы</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-pin-sidebar-toggle" ${settings.pinSidebar ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+
+          <div class="vmu-setting-row vmu-slider-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Смещение контента</span>
+              <span class="vmu-setting-hint">Сдвиг сайдбара и основной колонки по горизонтали</span>
+            </div>
+            <div class="vmu-slider-wrap">
+              <input type="range" id="vmu-offset-x" class="vmu-slider" min="-400" max="400" step="5" value="${settings.contentOffsetX}">
+              <span class="vmu-slider-value" id="vmu-offset-x-val">${settings.contentOffsetX > 0 ? '+' : ''}${settings.contentOffsetX}px</span>
+              <button type="button" id="vmu-offset-x-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
+            </div>
+          </div>
+        </div>
+
         <div id="vmu-pl-status" style="display:none">
           <div class="vmu-pl-status-text"></div>
           <div class="vmu-pl-progress"><div class="vmu-pl-progress-bar"></div></div>
@@ -1257,6 +1351,37 @@
         if (dzHint) dzHint.textContent = isCheck
           ? 'имена файлов будут сверены с треками на странице'
           : 'не более 200 МБ каждый';
+      });
+    }
+
+    const pinSidebarToggle = document.getElementById('vmu-pin-sidebar-toggle');
+    if (pinSidebarToggle) {
+      pinSidebarToggle.addEventListener('change', () => {
+        settings.pinSidebar = pinSidebarToggle.checked;
+        saveSettings();
+        applyLayoutCustomizations();
+      });
+    }
+
+    const offsetSlider = document.getElementById('vmu-offset-x');
+    const offsetVal = document.getElementById('vmu-offset-x-val');
+    if (offsetSlider) {
+      offsetSlider.addEventListener('input', () => {
+        const v = parseInt(offsetSlider.value, 10) || 0;
+        settings.contentOffsetX = v;
+        if (offsetVal) offsetVal.textContent = (v > 0 ? '+' : '') + v + 'px';
+        applyLayoutCustomizations();
+      });
+      offsetSlider.addEventListener('change', saveSettings);
+    }
+    const offsetReset = document.getElementById('vmu-offset-x-reset');
+    if (offsetReset && offsetSlider) {
+      offsetReset.addEventListener('click', () => {
+        settings.contentOffsetX = 0;
+        offsetSlider.value = '0';
+        if (offsetVal) offsetVal.textContent = '0px';
+        saveSettings();
+        applyLayoutCustomizations();
       });
     }
 
@@ -1613,13 +1738,37 @@
 
     // Scroll-and-harvest loop. Stops on either:
     //   - limit reached
-    //   - lazy-load is exhausted (stable count for 5 iterations)
+    //   - lazy-load is exhausted (stable count for 15 iterations)
+    //
+    // Plain `scrollTop = scrollHeight` triggers VK's lazy-load only for the
+    // first few batches — measured live on a 684-row library, it plateaued
+    // at ~340 rows. VK's IntersectionObserver seems to need *motion*, not
+    // just being at the bottom. Mixing in a backwards scroll and a periodic
+    // `scrollIntoView` on the last row keeps the observer firing all the way
+    // to the end (verified live — full 684/684 with the same library).
     let stable = 0, last = collected.size;
-    const MAX_ITER = 120;
-    for (let i = 0; i < MAX_ITER && stable < 5; i++) {
+    const MAX_ITER = 200;
+    const STABLE_LIMIT = 15;
+    for (let i = 0; i < MAX_ITER && stable < STABLE_LIMIT; i++) {
       if (limit && collected.size >= limit) break;
-      if (sc) sc.scrollTop = sc.scrollHeight;
+      if (sc) {
+        // Every 3rd iter, jump up first so the next scroll-to-bottom registers
+        // as fresh motion. This wakes lazy-load up after it plateaus.
+        if (i % 3 === 2) {
+          sc.scrollTop = Math.max(0, sc.scrollHeight - sc.clientHeight - 1000);
+          await sleep(120);
+        }
+        sc.scrollTop = sc.scrollHeight;
+      }
       await sleep(450);
+      // Every 4th iter, ask the LAST currently-mounted row to scrollIntoView.
+      // This pokes VK's bottom-sentinel even when scrollHeight already matches.
+      if (i % 4 === 3) {
+        const rows = document.querySelectorAll('[class*="vkitAudioRow__root"]');
+        const lastRow = rows[rows.length - 1];
+        if (lastRow) lastRow.scrollIntoView({ block: 'end' });
+        await sleep(300);
+      }
       await refreshStamps();
       pull();
       if (onProgress) onProgress(collected.size);
