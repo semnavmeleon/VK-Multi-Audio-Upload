@@ -1080,7 +1080,10 @@
         const onProgress = (done, total) => {
           window.postMessage({ type: 'VKD_HLS_PROGRESS', trackId, done, total }, '*');
         };
-        downloadHlsAsBlob(url, onProgress).then(async result => {
+        const cancelToken = { cancelled: false };
+        __vmuSoloDlCancel.set(trackId, cancelToken);
+        downloadHlsAsBlob(url, onProgress, cancelToken).then(async result => {
+          __vmuSoloDlCancel.delete(trackId);
           const msg = { type: 'VKD_HLS_DOWNLOAD_DONE', ok: true, trackId, ext: result.ext };
           const transfers = [];
           if (returnBuffer && result.blob) {
@@ -1092,19 +1095,24 @@
           }
           window.postMessage(msg, '*', transfers);
         }).catch(err => {
-          window.postMessage({ type: 'VKD_HLS_DOWNLOAD_DONE', ok: false, trackId, error: err.message }, '*');
+          __vmuSoloDlCancel.delete(trackId);
+          const aborted = err.message === '__SOLO_CANCELLED__';
+          window.postMessage({ type: 'VKD_HLS_DOWNLOAD_DONE', ok: false, trackId, aborted, error: err.message }, '*');
         });
         break;
       }
 
       case 'VKD_FETCH_BLOB': {
         const { url, trackId, returnBuffer } = e.data;
-        origFetch(url, { headers: { Referer: 'https://vk.com/' } })
+        const ac = new AbortController();
+        __vmuSoloDlCancel.set(trackId, { cancelled: false, abort: () => ac.abort() });
+        origFetch(url, { headers: { Referer: 'https://vk.com/' }, signal: ac.signal })
           .then(resp => {
             if (!resp.ok) throw new Error('fetch failed: ' + resp.status);
             return resp.blob();
           })
           .then(async blob => {
+            __vmuSoloDlCancel.delete(trackId);
             const msg = { type: 'VKD_FETCH_BLOB_DONE', ok: true, trackId, size: blob.size };
             const transfers = [];
             if (returnBuffer) {
@@ -1117,8 +1125,20 @@
             window.postMessage(msg, '*', transfers);
           })
           .catch(err => {
-            window.postMessage({ type: 'VKD_FETCH_BLOB_DONE', ok: false, trackId, error: err.message }, '*');
+            __vmuSoloDlCancel.delete(trackId);
+            const aborted = err.name === 'AbortError';
+            window.postMessage({ type: 'VKD_FETCH_BLOB_DONE', ok: false, trackId, aborted, error: err.message }, '*');
           });
+        break;
+      }
+
+      case 'VKD_CANCEL_SOLO_DL': {
+        const { trackId } = e.data;
+        const tok = __vmuSoloDlCancel.get(trackId);
+        if (tok) {
+          tok.cancelled = true;
+          if (typeof tok.abort === 'function') { try { tok.abort(); } catch {} }
+        }
         break;
       }
 
@@ -1179,7 +1199,13 @@
     return segments;
   }
 
-  async function downloadHlsAsBlob(m3u8Url, onProgress) {
+  // Per-trackId cancel registry. content.js sends VKD_CANCEL_SOLO_DL with a
+  // trackId; the handler sets the token's cancelled flag (and aborts any
+  // outstanding fetch). The HLS loop polls the token between segments.
+  const __vmuSoloDlCancel = new Map();
+  const __VMU_SOLO_CANCELLED__ = '__SOLO_CANCELLED__';
+
+  async function downloadHlsAsBlob(m3u8Url, onProgress, cancelToken) {
     // Fix doubled /index.m3u8 (content.js may append it when URL already has .m3u8?query)
     m3u8Url = m3u8Url.replace(/(\.m3u8[^/]*?)\/index\.m3u8$/, '$1');
     const hlsFetch = (url) => origFetch(url, { headers: { Referer: 'https://vk.com/' } });
@@ -1258,6 +1284,7 @@
     // Download and optionally decrypt segments
     const chunks = [];
     for (let i = 0; i < segments.length; i++) {
+      if (cancelToken?.cancelled) throw new Error(__VMU_SOLO_CANCELLED__);
       const seg = segments[i];
       const resp = await hlsFetch(seg.url);
       if (!resp.ok) throw new Error(`segment ${i} failed: ${resp.status}`);
@@ -1457,11 +1484,19 @@
         const ownerId = identity?.ownerId;
         const audioId = identity?.id;
         if (!ownerId || !audioId) continue;
+        // entity.authors.main is empty for unmapped VK artists — fall back to
+        // entity.data.authors.raw which holds the visible artist text.
+        const artist = entity.authors?.main?.[0]?.name
+          || entity.data?.authors?.main?.[0]?.name
+          || entity.data?.authors?.raw
+          || entity.subtitle
+          || entity.data?.subtitle
+          || '';
         // Always overwrite — virtualized lists recycle row elements for other tracks
         row.dataset.vmuTrack = JSON.stringify({
           id: `${ownerId}_${audioId}`,
-          title: entity.title || '',
-          artist: entity.authors?.main?.[0]?.name || entity.subtitle || '',
+          title: entity.title || entity.data?.title || '',
+          artist,
           url: entity.url || null,
           isBlocked: !!(entity.data?.isBlocked) || entity.data?.url === null,
         });
@@ -1492,10 +1527,15 @@
           if (seen.has(trackId)) continue;
           seen.add(trackId);
 
-          const artistName = entity.authors?.main?.[0]?.name || entity.subtitle || '';
+          const artistName = entity.authors?.main?.[0]?.name
+            || entity.data?.authors?.main?.[0]?.name
+            || entity.data?.authors?.raw
+            || entity.subtitle
+            || entity.data?.subtitle
+            || '';
           tracks.push({
             id: trackId,
-            title: entity.title || '',
+            title: entity.title || entity.data?.title || '',
             artist: artistName,
             url: entity.url || null,
             duration: entity.duration || 0,

@@ -93,13 +93,14 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false };
 
   function loadSettings() {
     try {
       const s = localStorage.getItem(SETTINGS_KEY);
       if (s) Object.assign(settings, JSON.parse(s));
     } catch {}
+    if (settings.workMode !== 'check') settings.workMode = 'upload';
   }
 
   function saveSettings() {
@@ -109,6 +110,8 @@
         coverDataUrl: settings.coverDataUrl,
         autoMeta: settings.autoMeta,
         autoCoverFromId3: settings.autoCoverFromId3,
+        workMode: settings.workMode,
+        checkFullPage: settings.checkFullPage,
       }));
     } catch {}
   }
@@ -601,13 +604,17 @@
       await sleep(900);
     }
 
-    // VK virtualizes the playlist popup against the page-level scroller, not
-    // a container inside the modal. Find the first ancestor (or any element)
-    // that's actually scrollable — that's where scrolling triggers lazy load.
-    const findScroller = () => [...document.querySelectorAll('*')].find(el => {
+    // Find a scroller INSIDE the modal. Earlier versions fell back to
+    // document.scrollingElement (the audios- page underneath), but the new VK
+    // popup doesn't lazy-load on page scroll — it just scrolled the row list
+    // visibly under the modal, which the user (correctly) complained about.
+    // If the modal exposes no internal scroller, we drive lazy-loading by
+    // scrolling the LAST audio row into view: that pokes any IntersectionObserver
+    // sentinel without touching the underlying page scroll position.
+    const findInModalScroller = () => [...modal.querySelectorAll('*')].find(el => {
       const cs = getComputedStyle(el);
       return (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
-    }) || document.scrollingElement;
+    }) || null;
 
     const collected = new Map();
 
@@ -633,10 +640,21 @@
       }
     }
 
-    // Snapshot the scroll position before we start jumping to the bottom to
-    // trigger lazy-loading, so we can put the user back where they were.
-    const initialScroller = findScroller();
-    const initialScrollTop = initialScroller ? initialScroller.scrollTop : 0;
+    // Pick a way to "scroll for more" that doesn't move the underlying page.
+    // Order of preference:
+    //   1. An in-modal scrollable container — set its scrollTop = scrollHeight
+    //   2. scrollIntoView on the last mounted audio row (block: 'nearest' so
+    //      the page scroll position is preserved)
+    const modalScroller = findInModalScroller();
+    function nudgeForMore() {
+      if (modalScroller) {
+        modalScroller.scrollTop = modalScroller.scrollHeight;
+        return;
+      }
+      const rows = modal.querySelectorAll('[class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
+      const last = rows[rows.length - 1];
+      if (last) last.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
 
     await harvest();
     const reportProgress = () => {
@@ -644,24 +662,86 @@
       try { onProgress(collected.size, declaredTotal); } catch {}
     };
     reportProgress();
+
     let stable = 0, lastSize = collected.size;
     const MAX_ITER = 60;
     for (let i = 0; i < MAX_ITER && stable < 4; i++) {
-      const sc = findScroller();
-      sc.scrollTop = sc.scrollHeight;
+      nudgeForMore();
       await sleep(500);
       await harvest();
       reportProgress();
       if (collected.size === lastSize) stable++; else { stable = 0; lastSize = collected.size; }
     }
 
-    // Restore the original scroll position. Rows stay mounted (no
-    // virtualization here once VK has loaded them), so the user lands back
-    // where they started with the full playlist already in the DOM.
-    const sc = findScroller();
-    if (sc) sc.scrollTop = initialScrollTop;
+    // Reset the modal-internal scroller so the user sees the playlist top
+    // when scanning finishes. Don't touch document.scrollingElement.
+    if (modalScroller) modalScroller.scrollTop = 0;
 
     return [...collected.values()];
+  }
+
+  // Load a playlist's full track list via VKD_LOAD_SECTIONS (al_audio.php).
+  // Tracks arrive as VKD_TRACK messages; we consume them into a fresh array
+  // (NOT the global dlTracks Map, to avoid contaminating playlist download).
+  async function loadPlaylistTracksViaAPI(pl, onProgress) {
+    if (!pl?.ownerId || !pl?.playlistId) return [];
+
+    // Capture VKD_TRACK messages until VKD_SECTIONS_DONE
+    const captured = new Map();
+    const onMsg = e => {
+      if (e.source !== window || !e.data) return;
+      if (e.data.type === 'VKD_TRACK') {
+        const t = e.data.track;
+        if (t?.id && !captured.has(t.id)) {
+          captured.set(t.id, {
+            id: t.id,
+            fullId: t.id,
+            title: t.title || '',
+            artist: t.artist || '',
+            duration: t.duration || 0,
+            url: t.url || null,
+            isBlocked: false,
+          });
+          if (onProgress) onProgress(captured.size);
+        }
+      }
+    };
+    window.addEventListener('message', onMsg);
+
+    // Reset injected.js' dedup set so we get a clean stream
+    window.postMessage({ type: 'VKD_RESET_DL' }, '*');
+
+    const done = new Promise(resolve => {
+      const t = setTimeout(resolve, 30000);
+      const h = e => {
+        if (e.source === window && e.data?.type === 'VKD_SECTIONS_DONE') {
+          clearTimeout(t); window.removeEventListener('message', h); resolve();
+        }
+      };
+      window.addEventListener('message', h);
+      window.postMessage({
+        type: 'VKD_LOAD_SECTIONS',
+        ownerId: pl.ownerId,
+        playlistId: pl.playlistId,
+        accessHash: pl.accessHash || null,
+      }, '*');
+    });
+    await done;
+    window.removeEventListener('message', onMsg);
+    return [...captured.values()];
+  }
+
+  // For each currently-mounted popup row, look up its track in the array and
+  // copy isBlocked. Tracks not visible stay isBlocked=false (we can't know).
+  function enrichBlockedFromDom(tracks) {
+    const byId = new Map(tracks.map(t => [t.id || t.fullId, t]));
+    const rows = document.querySelectorAll('[data-vmu-track]');
+    for (const r of rows) {
+      try {
+        const d = JSON.parse(r.dataset.vmuTrack);
+        if (d?.isBlocked && byId.has(d.id)) byId.get(d.id).isBlocked = true;
+      } catch {}
+    }
   }
 
   async function scanForDuplicates(plInfoArg, statusCallback) {
@@ -677,35 +757,40 @@
     report('Раскрываем плейлист…');
 
     try {
+      // Primary path: expand the playlist popup (click "Показать все") and
+      // scroll until lazy-loading stops yielding new rows. This is the only
+      // approach that reliably hits isBlocked and works without CSRF/API
+      // success. API path failed on observed playlists (returned ERR_105 or
+      // 0 items), so it's now a fallback.
       let tracks = await expandPlaylistModal((loaded, total) => {
         if (total) report(`Раскрываем плейлист… ${loaded} / ${total}`, false, { loaded, total });
         else report(`Раскрываем плейлист… ${loaded}`);
       });
-      if (!tracks.length) tracks = getTracksFromDOM(pl);
 
-      if (!tracks.length) {
+      // Fallback A: API-based loading via al_audio.php?act=load_section.
+      // Useful when DOM expansion fails (closed popup, no scrollable host, etc).
+      if (!tracks.length && pl.ownerId && pl.playlistId) {
         report('Загружаем через API…');
-        try {
-          const result = await pageCall('VK_LOAD_PLAYLIST', 'VK_PLAYLIST_LOADED', {
-            ownerId: pl.ownerId,
-            playlistId: pl.playlistId,
-            offset: 0,
-          }, 10000);
-          try {
-            const raw = JSON.parse(result.raw || '{}');
-            const list = raw?.payload?.[1];
-            if (Array.isArray(list)) tracks = parseTracksFromPayload(list);
-          } catch {}
-        } catch (apiErr) {
-          report(`Не удалось загрузить треки: ${apiErr.message}`, true);
-          return;
-        }
+        const apiTracks = await loadPlaylistTracksViaAPI(pl, n => {
+          report(`Загружаем через API… ${n}`);
+        });
+        if (apiTracks.length) tracks = apiTracks;
+      }
+
+      // Fallback B: rows already mounted in popup DOM
+      if (!tracks.length) {
+        const fromDom = getTracksFromDOM(pl);
+        if (fromDom.length) tracks = fromDom;
       }
 
       if (!tracks.length) {
         report('Треки не найдены', true);
         return;
       }
+
+      // Mark blocked tracks from any currently-visible popup rows (best-effort).
+      // API path doesn't carry isBlocked; this fills it for the rows we can see.
+      enrichBlockedFromDom(tracks);
 
       const seen = new Map();
       const dupes = [];
@@ -1060,9 +1145,34 @@
 
   function buildSettingsPanel() {
     const hasCover = !!settings.coverDataUrl;
+    const isCheck = settings.workMode === 'check';
     return `
       <div id="vmu-settings-panel" style="display:none">
-        <div class="vmu-settings-section">
+        <div class="vmu-settings-section vmu-mode-section">
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Режим работы</span>
+              <span class="vmu-setting-hint">Проверка — сверить имена файлов с треками на странице, без загрузки</span>
+            </div>
+            <div class="vmu-mode-switch" id="vmu-mode-switch" role="tablist">
+              <button type="button" data-vmu-mode="upload" class="${isCheck ? '' : 'active'}">Загрузка</button>
+              <button type="button" data-vmu-mode="check" class="${isCheck ? 'active' : ''}">Проверка</button>
+            </div>
+          </div>
+
+          <div class="vmu-setting-row ${isCheck ? '' : 'vmu-row-disabled'}" id="vmu-check-scope-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Сканировать всю страницу</span>
+              <span class="vmu-setting-hint">По умолчанию — только первые 100 треков</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-check-fullpage-toggle" ${settings.checkFullPage ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="vmu-settings-section ${isCheck ? 'vmu-row-disabled' : ''}" id="vmu-upload-only-section">
           <div class="vmu-setting-row">
             <div class="vmu-setting-info">
               <span class="vmu-setting-label">Авто-плейлист</span>
@@ -1090,7 +1200,7 @@
           </div>
         </div>
 
-        <div class="vmu-settings-section">
+        <div class="vmu-settings-section ${isCheck ? 'vmu-row-disabled' : ''}" id="vmu-meta-section">
           <div class="vmu-setting-row">
             <div class="vmu-setting-info">
               <span class="vmu-setting-label">Авто-метаданные</span>
@@ -1122,6 +1232,42 @@
   }
 
   function attachSettingsHandlers() {
+    const modeSwitch = document.getElementById('vmu-mode-switch');
+    if (modeSwitch) {
+      modeSwitch.addEventListener('click', e => {
+        const btn = e.target.closest('button[data-vmu-mode]');
+        if (!btn) return;
+        const mode = btn.dataset.vmuMode;
+        if (mode === settings.workMode) return;
+        settings.workMode = mode;
+        saveSettings();
+        modeSwitch.querySelectorAll('button').forEach(b => {
+          b.classList.toggle('active', b.dataset.vmuMode === mode);
+        });
+        const isCheck = mode === 'check';
+        document.getElementById('vmu-upload-only-section')?.classList.toggle('vmu-row-disabled', isCheck);
+        document.getElementById('vmu-meta-section')?.classList.toggle('vmu-row-disabled', isCheck);
+        document.getElementById('vmu-check-scope-row')?.classList.toggle('vmu-row-disabled', !isCheck);
+        // Update dropzone hint to reflect the active mode
+        const dzLabel = document.querySelector('#vmu-dropzone .vmu-dz-label');
+        const dzHint = document.querySelector('#vmu-dropzone .vmu-dz-hint');
+        if (dzLabel) dzLabel.textContent = isCheck
+          ? 'Перетащите MP3 для проверки'
+          : 'Перетащите MP3 файлы сюда';
+        if (dzHint) dzHint.textContent = isCheck
+          ? 'имена файлов будут сверены с треками на странице'
+          : 'не более 200 МБ каждый';
+      });
+    }
+
+    const fullPageToggle = document.getElementById('vmu-check-fullpage-toggle');
+    if (fullPageToggle) {
+      fullPageToggle.addEventListener('change', () => {
+        settings.checkFullPage = fullPageToggle.checked;
+        saveSettings();
+      });
+    }
+
     const toggle = document.getElementById('vmu-ap-toggle');
     if (toggle) {
       toggle.addEventListener('change', () => {
@@ -1335,6 +1481,10 @@
   // ─── queue ────────────────────────────────────────────────────────────────────
   function addFiles(files) {
     if (!files.length) return;
+    if (settings.workMode === 'check') {
+      runCheckMode(files);
+      return;
+    }
     autoPlaylistRunning = false;
     files.forEach(f => {
       const item = { id: ++itemIdCounter, file: f, status: 'pending', errorMsg: null, tags: {}, progress: 0 };
@@ -1344,6 +1494,396 @@
     });
     renderQueue();
     if (!isProcessing) processQueue();
+  }
+
+  // ─── check mode ──────────────────────────────────────────────────────────────
+  // "Проверка" mode: read filenames + ID3 of dropped files, close the upload
+  // modal, scroll the page list to harvest every audio row's track info via the
+  // injected.js fiber walker, then compare and show which files are already
+  // present on the page and which are missing.
+  let checkModeRunning = false;
+
+  function normalizeKey(artist, title) {
+    const norm = s => String(s || '')
+      .toLowerCase()
+      .replace(/[–—]/g, '-')
+      // strip square/curly bracket tags like "[vk.com/reuploadunder]" or "(Live)"
+      .replace(/[\[\{].*?[\]\}]/g, ' ')
+      .replace(/\([^)]*\)\s*$/g, ' ')
+      // drop "feat. X" / "ft. X" suffixes so credits don't break matching
+      .replace(/\s+(?:feat\.?|ft\.?|при\s+участии)\s+.*$/i, '')
+      .replace(/[«»"'`’]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return norm(artist) + '|||' + norm(title);
+  }
+
+  async function fileToCheckEntry(f) {
+    const tags = await readID3(f).catch(() => ({}));
+    const tagArtist = tags.TPE1 || tags.TPE2 || '';
+    const tagTitle = tags.TIT2 || '';
+    let artist = tagArtist, title = tagTitle;
+    if (!artist || !title) {
+      const parsed = parseMetaFromFilename(f.name);
+      if (!artist) artist = parsed.artist;
+      if (!title) title = parsed.title;
+    }
+    return {
+      name: f.name,
+      artist,
+      title,
+      key: normalizeKey(artist, title),
+    };
+  }
+
+  // Close the upload dialog. VK's modal has a "Закрыть" button at the bottom
+  // of the body (not in the header), so look for it by text first. Fall back
+  // to header X (old VK), then Escape, then DOM removal as last resort.
+  function closeUploadModal() {
+    setBlockAudioHide(false);
+    const box = getUploadDialog();
+    if (!box) return;
+    // Find a button with close-text inside the modal, ignoring our own buttons
+    const closeByText = [...box.querySelectorAll('button')].find(b => {
+      if (b.id?.startsWith('vmu-') || b.classList.contains('vmu-clear-native')) return false;
+      const t = (b.textContent || '').trim().toLowerCase();
+      return t === 'закрыть' || t === 'отмена' || t === 'close' || t === 'cancel';
+    });
+    if (closeByText) { closeByText.click(); return; }
+    // Header after-slot X (old VK)
+    const afterSlot = box.querySelector('[class*="vkitModalHeader__after"]');
+    if (afterSlot) {
+      const closeBtn = [...afterSlot.querySelectorAll('button')]
+        .find(b => !b.id?.startsWith('vmu-'));
+      if (closeBtn) { closeBtn.click(); return; }
+    }
+    // Escape fallback
+    box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+    // Last resort — hide the popup so it doesn't shadow the page
+    const popup = box.closest('.popup_box_container, [class*="vkitModalPage"]') || box;
+    popup.style.display = 'none';
+  }
+
+  // Auto-scroll the audios page to load every row and harvest tracks. Reads
+  // `data-vmu-track` stamps set by injected.js' markRowTrackData — content.js
+  // can't reach React fiber from the isolated world, but the data attribute
+  // bridges that gap. Triggers VKD_MARK_ROWS each iteration so freshly mounted
+  // rows are stamped before we read them. Rows inside the upload dialog are
+  // explicitly skipped — that dialog has no audio rows on the audios page but
+  // sometimes shadows the row selector if it stays open.
+  // limit = null → full page until lazy-load stops yielding more rows
+  // limit = N    → stop after collecting N tracks (no scrolling beyond what
+  //                is already loaded; the page renders ~100 rows on open)
+  async function harvestPageTracks(onProgress, limit) {
+    const collected = new Map();
+
+    function pull() {
+      const uploadBox = getUploadDialog();
+      const rows = document.querySelectorAll('[data-vmu-track]');
+      for (const row of rows) {
+        if (uploadBox && uploadBox.contains(row)) continue;
+        try {
+          const t = JSON.parse(row.dataset.vmuTrack);
+          if (t?.id && !collected.has(t.id)) collected.set(t.id, t);
+          if (limit && collected.size >= limit) return;
+        } catch {}
+      }
+    }
+
+    const findScroller = () => {
+      const candidates = [...document.querySelectorAll('*')].filter(el => {
+        const cs = getComputedStyle(el);
+        return (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
+      });
+      return candidates[0] || document.scrollingElement;
+    };
+    const sc = findScroller();
+    const initialTop = sc ? sc.scrollTop : 0;
+
+    async function refreshStamps() {
+      // Ask injected.js to (re-)stamp every audio row currently mounted
+      window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
+      await sleep(80);
+    }
+
+    await refreshStamps();
+    pull();
+    if (onProgress) onProgress(collected.size);
+
+    // Scroll-and-harvest loop. Stops on either:
+    //   - limit reached
+    //   - lazy-load is exhausted (stable count for 5 iterations)
+    let stable = 0, last = collected.size;
+    const MAX_ITER = 120;
+    for (let i = 0; i < MAX_ITER && stable < 5; i++) {
+      if (limit && collected.size >= limit) break;
+      if (sc) sc.scrollTop = sc.scrollHeight;
+      await sleep(450);
+      await refreshStamps();
+      pull();
+      if (onProgress) onProgress(collected.size);
+      if (collected.size === last) stable++; else { stable = 0; last = collected.size; }
+    }
+
+    // Restore scroll position so the user lands where they were
+    if (sc) sc.scrollTop = initialTop;
+
+    // Honour the limit strictly — trim insertion-ordered Map to first N
+    if (limit && collected.size > limit) {
+      const trimmed = new Map();
+      let n = 0;
+      for (const [k, v] of collected) {
+        if (n++ >= limit) break;
+        trimmed.set(k, v);
+      }
+      return trimmed;
+    }
+    return collected;
+  }
+
+  async function runCheckMode(files) {
+    if (checkModeRunning) return;
+    checkModeRunning = true;
+    try {
+      // 1) parse names
+      const entries = [];
+      for (const f of files) {
+        entries.push(await fileToCheckEntry(f));
+      }
+
+      // 2) close the upload modal
+      closeUploadModal();
+      await sleep(250);
+
+      // 3) harvest tracks from the page (default: first 100; full page on demand)
+      const limit = settings.checkFullPage ? null : 100;
+      const limitTxt = limit ? ` / ${limit}` : '';
+      showProgressToast(`Сверка: считываем треки страницы (0${limitTxt})…`, { kind: 'progress', id: 'vmu-check-toast' });
+      const pageMap = await harvestPageTracks(n => {
+        showProgressToast(`Сверка: считываем треки страницы (${n}${limitTxt})…`, { kind: 'progress', id: 'vmu-check-toast' });
+      }, limit);
+
+      // 4) build lookup by normalized key, also track ids for click-to-jump
+      const pageTracks = [...pageMap.values()];
+      const pageKeyToTrack = new Map();
+      pageTracks.forEach((t, index) => {
+        const k = normalizeKey(t.artist, t.title);
+        if (!pageKeyToTrack.has(k)) pageKeyToTrack.set(k, { track: t, index });
+      });
+
+      const present = [];
+      const missing = [];
+      for (const e of entries) {
+        const hit = pageKeyToTrack.get(e.key);
+        if (hit) present.push({ ...e, match: hit.track, pageIndex: hit.index });
+        else missing.push(e);
+      }
+
+      buildCheckResultPanel({ entries, present, missing, pageTracks });
+      const doneEl = document.getElementById('vmu-check-toast');
+      if (doneEl) doneEl.remove();
+    } catch (err) {
+      console.warn('[VMU CHECK]', err);
+      showProgressToast(`Сверка не удалась: ${err.message}`, { kind: 'error', id: 'vmu-check-toast' });
+    } finally {
+      checkModeRunning = false;
+    }
+  }
+
+  // Scroll the audios page to a row matching trackId and flash it. Used by
+  // both minimap markers and clickable "present" list items.
+  function focusPageRowByTrackId(trackId) {
+    const rows = document.querySelectorAll('[data-vmu-track]');
+    let target = null;
+    for (const row of rows) {
+      try {
+        const t = JSON.parse(row.dataset.vmuTrack);
+        if (t.id === trackId) { target = row; break; }
+      } catch {}
+    }
+    if (!target) {
+      // Row likely virtualized out — scroll roughly to its expected position
+      // by finding any audio row index match via VKD_MARK_ROWS refresh
+      window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
+      return;
+    }
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    target.classList.remove('vmu-dupe-flash');
+    void target.offsetWidth;
+    target.classList.add('vmu-dupe-flash');
+    setTimeout(() => target.classList.remove('vmu-dupe-flash'), 1400);
+  }
+
+  function buildCheckResultPanel({ entries, present, missing, pageTracks }) {
+    document.getElementById('vmu-check-panel')?.remove();
+    const pageCount = pageTracks.length;
+
+    const panel = document.createElement('div');
+    panel.id = 'vmu-check-panel';
+    panel.className = 'vmu-check-panel';
+
+    const head = document.createElement('div');
+    head.className = 'vmu-check-head';
+    head.innerHTML = `
+      <div class="vmu-check-title-wrap">
+        <span class="vmu-check-title">Сверка</span>
+        <span class="vmu-check-subtitle">${entries.length} файлов · ${pageCount} на странице · найдено ${present.length}</span>
+      </div>
+      <div class="vmu-check-head-actions">
+        <button class="vmu-check-close" type="button" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+    `;
+    panel.appendChild(head);
+
+    // Small copy-icon helper. Shows brief "Скопировано" feedback in title attr.
+    const COPY_SVG = `<svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="12" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>`;
+    function makeCopyBtn(getText, title) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'vmu-check-section-copy';
+      b.title = title;
+      b.innerHTML = COPY_SVG;
+      b.addEventListener('click', e => {
+        e.preventDefault(); e.stopPropagation();
+        const text = getText();
+        if (!text) return;
+        navigator.clipboard.writeText(text).then(() => {
+          const orig = b.title;
+          b.title = '✓ Скопировано';
+          b.classList.add('vmu-check-section-copy-ok');
+          setTimeout(() => {
+            if (!b.isConnected) return;
+            b.title = orig;
+            b.classList.remove('vmu-check-section-copy-ok');
+          }, 1400);
+        }).catch(() => {});
+      });
+      return b;
+    }
+    function joinArtistTitle(items, getter) {
+      return items.map(it => {
+        const x = getter ? getter(it) : it;
+        return (x.artist ? x.artist + ' — ' : '') + (x.title || x.name || '');
+      }).join('\n');
+    }
+    function uniqueArtists(items, getter) {
+      const seen = new Set();
+      const out = [];
+      for (const it of items) {
+        const x = getter ? getter(it) : it;
+        const a = (x.artist || '').trim();
+        if (!a) continue;
+        const k = a.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(a);
+      }
+      return out.join('\n');
+    }
+
+    // Body: two columns — minimap strip on the left, scrollable list on the right
+    const body = document.createElement('div');
+    body.className = 'vmu-check-body';
+
+    // ── minimap ──────────────────────────────────────────────────────────
+    const mm = document.createElement('div');
+    mm.className = 'vmu-check-mm';
+    const mmInner = document.createElement('div');
+    mmInner.className = 'vmu-check-mm-inner';
+    mm.appendChild(mmInner);
+
+    // Build a Set of page indexes that are "found"
+    const foundIndices = new Set(present.map(p => p.pageIndex));
+    const presentByIndex = new Map(present.map(p => [p.pageIndex, p]));
+
+    for (let i = 0; i < pageTracks.length; i++) {
+      const t = pageTracks[i];
+      const isFound = foundIndices.has(i);
+      const mark = document.createElement('button');
+      mark.type = 'button';
+      mark.className = 'vmu-check-marker' + (isFound ? ' vmu-check-marker-found' : '');
+      mark.style.top = `${((i + 0.5) / Math.max(1, pageTracks.length)) * 100}%`;
+      const label = `${i + 1}. ${(t.artist ? t.artist + ' — ' : '')}${t.title || ''}`.trim();
+      mark.title = (isFound ? '✓ ' : '') + label;
+      mark.addEventListener('click', e => {
+        e.preventDefault(); e.stopPropagation();
+        if (t?.id) focusPageRowByTrackId(t.id);
+      });
+      mmInner.appendChild(mark);
+    }
+    body.appendChild(mm);
+
+    // ── list column ──────────────────────────────────────────────────────
+    const list = document.createElement('div');
+    list.className = 'vmu-check-list';
+
+    function section(title, cls, items, formatter, onClickItem, copyBtns) {
+      const sh = document.createElement('div');
+      sh.className = 'vmu-check-section-head ' + cls;
+      const txt = document.createElement('span');
+      txt.className = 'vmu-check-section-text';
+      txt.textContent = `${title} · ${items.length}`;
+      sh.appendChild(txt);
+      if (copyBtns) for (const b of copyBtns) sh.appendChild(b);
+      list.appendChild(sh);
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'vmu-check-empty';
+        empty.textContent = '—';
+        list.appendChild(empty);
+        return;
+      }
+      for (const item of items) {
+        const row = document.createElement(onClickItem ? 'button' : 'div');
+        if (onClickItem) row.type = 'button';
+        row.className = 'vmu-check-item ' + cls + '-item' + (onClickItem ? ' vmu-check-item-clickable' : '');
+        row.innerHTML = formatter(item);
+        if (onClickItem) {
+          row.addEventListener('click', e => {
+            e.preventDefault(); e.stopPropagation();
+            onClickItem(item);
+          });
+        }
+        list.appendChild(row);
+      }
+    }
+
+    section('Отсутствуют на странице', 'vmu-check-missing', missing, e => {
+      const label = (e.artist ? escHtml(e.artist) + ' — ' : '') + escHtml(e.title || e.name);
+      return `<span class="vmu-check-dot"></span><span class="vmu-check-item-text" title="${escHtml(e.name)}">${label}</span>`;
+    }, null, [
+      makeCopyBtn(() => joinArtistTitle(missing), 'Скопировать отсутствующие'),
+    ]);
+
+    section('Уже есть на странице', 'vmu-check-present', present, p => {
+      const label = (p.artist ? escHtml(p.artist) + ' — ' : '') + escHtml(p.title || p.name);
+      const pos = `<span class="vmu-check-pos">#${p.pageIndex + 1}</span>`;
+      return `<span class="vmu-check-dot"></span><span class="vmu-check-item-text" title="${escHtml(p.name)}">${label}</span>${pos}`;
+    }, p => focusPageRowByTrackId(p.match?.id), [
+      makeCopyBtn(() => joinArtistTitle(present), 'Скопировать имеющиеся'),
+    ]);
+
+    // ── full page-track list (mini-menu like duplicate finder) ───────────
+    section('Все треки страницы', 'vmu-check-all', pageTracks.map((t, i) => ({ t, i })), ({ t, i }) => {
+      const label = (t.artist ? escHtml(t.artist) + ' — ' : '') + escHtml(t.title || '');
+      const status = foundIndices.has(i) ? '<span class="vmu-check-tick">✓</span>' : '';
+      return `<span class="vmu-check-num">#${i + 1}</span><span class="vmu-check-item-text" title="${escHtml(label)}">${label}</span>${status}`;
+    }, ({ t }) => focusPageRowByTrackId(t.id), [
+      makeCopyBtn(() => joinArtistTitle(pageTracks), 'Скопировать все треки (Artist — Title)'),
+      (() => {
+        const b = makeCopyBtn(() => uniqueArtists(pageTracks), 'Скопировать только артистов (уникальные)');
+        b.classList.add('vmu-check-section-copy-alt');
+        b.innerHTML = `<svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="7" r="3"/><path d="M4 17c0-3 3-5 6-5s6 2 6 5"/></svg>`;
+        return b;
+      })(),
+    ]);
+
+    body.appendChild(list);
+    panel.appendChild(body);
+    document.body.appendChild(panel);
+
+    head.querySelector('.vmu-check-close').addEventListener('click', () => panel.remove());
   }
 
   // ─── helpers to find VK's upload dialog (new and old VK) ────────────────────
@@ -1557,12 +2097,15 @@
   function buildEmbeddedUI() {
     const wrap = document.createElement('div');
     wrap.id = 'vmu-embedded';
+    const isCheck = settings.workMode === 'check';
+    const dzLabel = isCheck ? 'Перетащите MP3 для проверки' : 'Перетащите MP3 файлы сюда';
+    const dzHint = isCheck ? 'имена файлов будут сверены с треками на странице' : 'не более 200 МБ каждый';
     wrap.innerHTML = `
       ${buildSettingsPanel()}
 
       <div id="vmu-dropzone">
-        <div class="vmu-dz-label">Перетащите MP3 файлы сюда</div>
-        <div class="vmu-dz-hint">не более 200 МБ каждый</div>
+        <div class="vmu-dz-label">${dzLabel}</div>
+        <div class="vmu-dz-hint">${dzHint}</div>
         <label class="vmu-pick-btn">
           ${ICON_UPLOAD}
           Выбрать файлы
@@ -1854,15 +2397,24 @@
     if (modal.querySelector('input[type="text"]')) return;
     if (modal.querySelector('[data-vmu-dupes-dialog]')) return;
 
-    const listenBtn = [...modal.querySelectorAll('button')]
-      .find(b => b.textContent.trim() === 'Слушать');
-    if (!listenBtn) return;
+    // VK's playlist popup body has two rows of icon-only buttons rendered as
+    // vkuiButtonGroup__stretch inside a vkuiFlex__wrap container. The old code
+    // looked for a button with literal text "Слушать", which VK removed when
+    // they switched the play/follow/share/etc buttons to icon-only. Anchor on
+    // the structural class instead — works whether or not labels are present.
+    let anchorGroup = modal.querySelector('[class*="vkuiButtonGroup__stretch"]');
+    if (!anchorGroup) {
+      // Legacy fallback: look for the "Слушать" text button
+      const listenBtn = [...modal.querySelectorAll('button')]
+        .find(b => b.textContent.trim() === 'Слушать');
+      anchorGroup = listenBtn?.closest('[class*="vkuiButtonGroup"]') || null;
+    }
+    if (!anchorGroup) return;
 
-    const btnGroup = listenBtn.closest('[class*="vkuiButtonGroup"]');
-    if (!btnGroup) return;
-
-    // Create a new row below the existing buttons
-    const flexParent = btnGroup.parentElement?.parentElement;
+    // The flex wrapper that hosts all body-button rows. Append our row there
+    // so it sits below VK's own buttons regardless of how many rows VK rendered.
+    const flexParent = anchorGroup.closest('[class*="vkuiFlex__host"]')
+      || anchorGroup.parentElement?.parentElement;
     if (!flexParent) return;
 
     const newRow = document.createElement('div');
@@ -2341,6 +2893,7 @@
   // ─── Single-track download on hover ──────────────────────────────────────────
 
   const ICON_DL_SINGLE = `<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2.5a.75.75 0 0 1 .75.75v8.19l2.72-2.72a.75.75 0 1 1 1.06 1.06l-4 4a.75.75 0 0 1-1.06 0l-4-4a.75.75 0 0 1 1.06-1.06l2.72 2.72V3.25A.75.75 0 0 1 10 2.5zM3.5 14.25a.75.75 0 0 1 .75.75v1.5h11.5V15a.75.75 0 0 1 1.5 0v2.25a.75.75 0 0 1-.75.75H3.5a.75.75 0 0 1-.75-.75V15a.75.75 0 0 1 .75-.75z"/></svg>`;
+  const ICON_DL_STOP = `<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5.5" y="5.5" width="9" height="9" rx="1.5"/></svg>`;
 
   function getTrackDataFromRow(row) {
     // New VK: data stamped by injected.js (React fiber is not visible from the isolated world)
@@ -2388,7 +2941,23 @@
       return;
     }
 
+    // Mark loading + swap icon to "stop" so the click-handler knows to send
+    // VKD_CANCEL_SOLO_DL on the next click. Tooltip updates too.
     btnEl.classList.add('vmu-single-dl-loading');
+    btnEl.dataset.vmuTrackId = track.id;
+    btnEl.dataset.vmuCancelled = '';
+    const origIcon = btnEl.innerHTML;
+    const origTip = btnEl.getAttribute('data-vmu-tip') || 'Скачать';
+    btnEl.innerHTML = ICON_DL_STOP;
+    btnEl.setAttribute('data-vmu-tip', 'Отменить');
+    const restoreBtn = () => {
+      btnEl.classList.remove('vmu-single-dl-loading');
+      btnEl.innerHTML = origIcon;
+      btnEl.setAttribute('data-vmu-tip', origTip);
+      delete btnEl.dataset.vmuTrackId;
+      delete btnEl.dataset.vmuCancelled;
+    };
+
     const fn = dlSanitize([track.artist, track.title].filter(s => String(s || '').trim()).join(' - ') || 'track');
     const isHls = track.url.includes('/a2/') || track.url.includes('.m3u8');
     let res;
@@ -2403,7 +2972,9 @@
         const hlsUrl = track.url.includes('.m3u8') ? track.url : track.url + '/index.m3u8';
         const hlsResult = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id }, 300000);
         hlsProgressHandlers.delete(track.id);
-        if (hlsResult?.ok && hlsResult.blobUrl) {
+        if (hlsResult?.aborted) {
+          res = { ok: false, aborted: true };
+        } else if (hlsResult?.ok && hlsResult.blobUrl) {
           showProgressToast(`Сохранение файла… ${label}`, { kind: 'progress', pct: 100 });
           res = await sendDlMsg(hlsResult.blobUrl, fn + '.' + (hlsResult.ext || 'ts'));
         } else {
@@ -2412,7 +2983,9 @@
       } else {
         showProgressToast(`Скачивание… ${label}`, { kind: 'progress' });
         const fetchResult = await pageCall('VKD_FETCH_BLOB', 'VKD_FETCH_BLOB_DONE', { url: track.url, trackId: track.id }, 120000);
-        if (fetchResult?.ok && fetchResult.blobUrl) {
+        if (fetchResult?.aborted) {
+          res = { ok: false, aborted: true };
+        } else if (fetchResult?.ok && fetchResult.blobUrl) {
           res = await sendDlMsg(fetchResult.blobUrl, fn + '.mp3');
         } else {
           res = { ok: false, error: fetchResult?.error || 'fetch failed' };
@@ -2424,8 +2997,10 @@
       hlsProgressHandlers.delete(track.id);
     }
 
-    btnEl.classList.remove('vmu-single-dl-loading');
-    if (res?.ok) {
+    restoreBtn();
+    if (res?.aborted) {
+      showProgressToast(`Отменено · ${label}`, { kind: 'error' });
+    } else if (res?.ok) {
       showProgressToast(`Готово · ${label}`, { kind: 'done' });
     } else {
       showProgressToast('Ошибка: ' + (res?.error || 'unknown'), { kind: 'error' });
@@ -2495,7 +3070,15 @@
       e.stopPropagation();
       e.stopImmediatePropagation();
       hideDlTooltip();
-      if (btn.classList.contains('vmu-single-dl-loading')) return;
+      if (btn.classList.contains('vmu-single-dl-loading')) {
+        // Second click while the download is running = abort it.
+        const tid = btn.dataset.vmuTrackId;
+        if (tid) {
+          btn.dataset.vmuCancelled = '1';
+          window.postMessage({ type: 'VKD_CANCEL_SOLO_DL', trackId: tid }, '*');
+        }
+        return;
+      }
       const track = getTrackDataFromRow(row);
       if (!track) { showToast('Не удалось определить трек', true); return; }
       downloadSingleTrack(track, btn);

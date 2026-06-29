@@ -917,7 +917,9 @@
 }
 .vmu-single-dl-loading {
   opacity: 1 !important;
+  color: #e64646 !important;
 }
+.vmu-single-dl-loading:hover { color: #ff5757 !important; }
 /* New VK playlist modal — row has no buttonGroup; my button shares the
    right "after" slot with the duration label. Make the slot inline-flex so
    they sit on one line, with the button hover-revealed like native VK rows. */
@@ -935,7 +937,7 @@
   color: #99a2ad;
   box-sizing: border-box;
 }
-/* Hover reveal — same pattern as native VK action buttons */
+/* Hover-reveal — same pattern as native VK action buttons */
 [class*="vkitAudioRow__root"]:hover .vmu-single-dl-after {
   opacity: 1;
 }
@@ -944,6 +946,232 @@
   background: rgba(255,255,255,.08);
 }
 /* Tooltip handled by portal #vmu-tooltip (showDlTooltip in content.js). */
+
+/* ── Work-mode switch (segmented control) ────────────────────────────────── */
+.vmu-mode-section .vmu-setting-row { align-items: flex-start; gap: 14px; }
+.vmu-mode-switch {
+  display: inline-flex;
+  flex-shrink: 0;
+  background: rgba(255,255,255,0.06);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+.vmu-mode-switch button {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: #9ea1a3;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.vmu-mode-switch button:hover { color: #d0d2d4; }
+.vmu-mode-switch button.active {
+  background: rgba(38,136,235,0.85);
+  color: #fff;
+}
+.vmu-mode-switch button.active:hover { background: rgba(38,136,235,1); color: #fff; }
+
+/* ── Check-mode result panel ─────────────────────────────────────────────── */
+.vmu-check-panel {
+  position: fixed;
+  top: 76px;
+  right: 24px;
+  width: 420px;
+  max-height: calc(100vh - 120px);
+  display: flex;
+  flex-direction: column;
+  background: #1a1b1d;
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  box-shadow: 0 12px 36px rgba(0,0,0,0.55);
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+  font-size: 13px;
+  color: #d0d2d4;
+  z-index: 9999;
+  overflow: hidden;
+}
+.vmu-check-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.vmu-check-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  background: rgba(255,255,255,0.02);
+}
+.vmu-check-title-wrap { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.vmu-check-title { font-size: 12px; color: #c0c2c4; font-weight: 600; }
+.vmu-check-subtitle { font-size: 11px; color: #777; }
+
+/* ── Minimap (vertical marker strip along the panel left edge) ──────────── */
+.vmu-check-mm {
+  position: relative;
+  width: 18px;
+  flex-shrink: 0;
+  padding: 8px 4px 12px;
+  border-right: 1px solid rgba(255,255,255,0.05);
+  background: rgba(255,255,255,0.015);
+}
+.vmu-check-mm-inner {
+  position: relative;
+  width: 10px;
+  margin: 0 auto;
+  height: 100%;
+  background: rgba(255,255,255,0.04);
+  border-radius: 5px;
+}
+.vmu-check-marker {
+  position: absolute;
+  left: 0;
+  width: 10px;
+  height: 4px;
+  margin-top: -2px;
+  background: rgba(255,255,255,0.18);
+  border: none;
+  border-radius: 2px;
+  padding: 0;
+  cursor: pointer;
+  transition: background .12s, transform .12s, width .12s, left .12s;
+}
+.vmu-check-marker:hover {
+  width: 14px;
+  left: -2px;
+  background: rgba(255,255,255,0.45);
+}
+.vmu-check-marker-found {
+  background: #4bb34b;
+  height: 6px;
+  margin-top: -3px;
+}
+.vmu-check-marker-found:hover { background: #5fc25f; }
+.vmu-check-head-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.vmu-check-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: inherit;
+  font-size: 11px;
+  color: #c0c2c4;
+  background: rgba(255,255,255,0.06);
+  border: none;
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: background .12s;
+}
+.vmu-check-copy:hover { background: rgba(255,255,255,0.12); color: #fff; }
+.vmu-check-close {
+  width: 22px; height: 22px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,0.06);
+  border: none;
+  border-radius: 50%;
+  color: #888;
+  cursor: pointer;
+  padding: 0;
+}
+.vmu-check-close:hover { background: rgba(255,255,255,0.14); color: #fff; }
+.vmu-check-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 6px 0 10px;
+}
+.vmu-check-list::-webkit-scrollbar { width: 4px; }
+.vmu-check-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 2px; }
+.vmu-check-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 8px 12px 4px;
+}
+.vmu-check-section-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vmu-check-section-copy {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255,255,255,0.06);
+  border: none;
+  border-radius: 5px;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  padding: 0;
+  transition: background .12s, opacity .12s;
+}
+.vmu-check-section-copy:hover { background: rgba(255,255,255,0.16); opacity: 1; }
+.vmu-check-section-copy-ok { background: #4bb34b !important; color: #fff; opacity: 1; }
+.vmu-check-missing { color: #e64646; }
+.vmu-check-present { color: #4bb34b; }
+.vmu-check-empty { padding: 2px 12px 6px; color: #555; font-size: 12px; }
+.vmu-check-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+}
+.vmu-check-dot {
+  width: 6px; height: 6px;
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+.vmu-check-missing-item .vmu-check-dot { background: #e64646; }
+.vmu-check-present-item .vmu-check-dot { background: #4bb34b; }
+.vmu-check-item-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.vmu-check-missing-item .vmu-check-item-text { color: #f0d2d2; }
+.vmu-check-present-item .vmu-check-item-text { color: #b0c8b0; }
+
+.vmu-check-item-clickable {
+  font-family: inherit;
+  text-align: left;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  width: 100%;
+  transition: background .12s;
+}
+.vmu-check-item-clickable:hover { background: rgba(255,255,255,0.05); }
+.vmu-check-present-item.vmu-check-item-clickable:hover { background: rgba(75,179,75,0.10); }
+.vmu-check-all-item.vmu-check-item-clickable:hover { background: rgba(255,255,255,0.06); }
+
+.vmu-check-all { color: #9ea1a3; }
+.vmu-check-num, .vmu-check-pos {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: #666;
+  min-width: 28px;
+}
+.vmu-check-pos { margin-left: auto; text-align: right; color: #4bb34b; }
+.vmu-check-tick { color: #4bb34b; font-size: 12px; flex-shrink: 0; margin-left: 6px; }
+.vmu-check-all-item .vmu-check-dot { display: none; }
+.vmu-check-all-item .vmu-check-item-text { color: #c0c2c4; }
+
+/* Flash highlight on page audio rows reuses .vmu-dupe-flash from the
+   playlist duplicate panel (defined above). */
 
 /* ── Wider upload dialog (override VK's default 420px) ───────────────────── */
 [class*="vkitInternalModalBox"]:has(input[accept*="audio"]),
