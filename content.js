@@ -115,7 +115,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false };
 
   function loadSettings() {
     try {
@@ -137,6 +137,7 @@
         pinSidebar: settings.pinSidebar,
         contentOffsetX: settings.contentOffsetX,
         optimizeBigPlaylists: settings.optimizeBigPlaylists,
+        hideScrollToTop: settings.hideScrollToTop,
       }));
     } catch {}
   }
@@ -180,6 +181,25 @@
       parts.push(
         `#layout_sidebar [class*="inset-block-start-2xl"], #ads_wrapper > * { position: static !important; top: auto !important; bottom: auto !important; inset-block-start: auto !important; inset-block-end: auto !important; }`
       );
+    }
+
+    // VK's left "Наверх" scroll-to-top strip is a 397px-wide position:fixed
+    // click-catcher that overlaps the sidebar whenever the horizontal offset
+    // slider is used. Two modes:
+    //   - hidden entirely (settings toggle)
+    //   - shrunk to a small icon-only chip (default — keeps it usable but
+    //     stops it from grabbing clicks past x=40)
+    if (settings.hideScrollToTop) {
+      parts.push(`#stl_left { display: none !important; }`);
+    } else {
+      // Constrain both outer #stl_left (click area) and inner #stl_bg (chip),
+      // strip the original "60px top padding + truncated label" layout, hide
+      // the "Наверх" text via font-size:0 on #stl_text (SVG keeps its pixel
+      // width/height attributes so the arrow icon stays visible).
+      parts.push(`#stl_left { width: 40px !important; }`);
+      parts.push(`#stl_bg { width: 40px !important; height: 40px !important; padding: 0 !important; margin: 60px 0 0 !important; overflow: hidden !important; display: flex !important; align-items: center !important; justify-content: center !important; }`);
+      parts.push(`#stl_text { font-size: 0 !important; display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; height: 100% !important; }`);
+      parts.push(`#stl_text svg { width: 20px !important; height: 20px !important; }`);
     }
 
     if (settings.optimizeBigPlaylists) {
@@ -1382,6 +1402,17 @@
               <span class="vmu-toggle-track"></span>
             </label>
           </div>
+
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Скрыть кнопку «Наверх»</span>
+              <span class="vmu-setting-hint">Полностью убрать левую полосу со скроллом наверх</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-hide-stl-toggle" ${settings.hideScrollToTop ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
         </div>
 
         <div id="vmu-pl-status" style="display:none">
@@ -1417,6 +1448,15 @@
         if (dzHint) dzHint.textContent = isCheck
           ? 'имена файлов будут сверены с треками на странице'
           : 'не более 200 МБ каждый';
+      });
+    }
+
+    const hideStlToggle = document.getElementById('vmu-hide-stl-toggle');
+    if (hideStlToggle) {
+      hideStlToggle.addEventListener('change', () => {
+        settings.hideScrollToTop = hideStlToggle.checked;
+        saveSettings();
+        applyLayoutCustomizations();
       });
     }
 
