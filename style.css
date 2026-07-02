@@ -996,6 +996,38 @@
   z-index: 100;
 }
 
+/* The multimedia player card (AudioPage_PlayerBlock's card wrapper) draws its
+   border via a uniform 4-side inset box-shadow on ::before, not a real
+   border. While our tabs/search bar is merged under it, that shadow is
+   swapped for a top+left+right-only version (own box-shadow on the real
+   element, so it doesn't affect layout) — keeps the border on the outer
+   edges but drops the bottom line where it now touches our panel, so the two
+   read as one continuous outlined shape instead of two boxes glued together
+   (toggled in applyTabsBarPin). */
+.vmu-multimedia-flat::before {
+  box-shadow: none !important;
+}
+.vmu-multimedia-flat {
+  box-shadow:
+    inset 0 1px 0 0 var(--vmu-pin-border, rgba(255, 255, 255, 0.08)),
+    inset 1px 0 0 0 var(--vmu-pin-border, rgba(255, 255, 255, 0.08)),
+    inset -1px 0 0 0 var(--vmu-pin-border, rgba(255, 255, 255, 0.08));
+}
+
+/* Our pinned tabs+search bar gets the border back on its own outer edges,
+   rounded at the bottom — reads as a panel hanging from the multimedia card
+   above it. Color is borrowed live from that same card (--vmu-pin-border set
+   in applyTabsBarPin) so it matches whatever theme VK is rendering. */
+.vmu-pin-top,
+.vmu-pin-bottom {
+  border-left: 1px solid var(--vmu-pin-border, rgba(255, 255, 255, 0.08));
+  border-right: 1px solid var(--vmu-pin-border, rgba(255, 255, 255, 0.08));
+}
+.vmu-pin-bottom {
+  border-bottom: 1px solid var(--vmu-pin-border, rgba(255, 255, 255, 0.08));
+  border-radius: 0 0 12px 12px;
+}
+
 /* ── Slider (range input) used by the content-offset setting ─────────────── */
 .vmu-slider-row .vmu-setting-info { min-width: 0; flex: 1 1 auto; }
 .vmu-slider-wrap {

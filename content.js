@@ -378,10 +378,29 @@
     // back too early, overlapping the real bar. Taking the max bottom across
     // all matches always lands on whichever is actually visible.
     let playerBottom = 0;
+    let visiblePlayerBlock = null;
     for (const pb of document.querySelectorAll('[data-testid="AudioPage_PlayerBlock"]')) {
-      playerBottom = Math.max(playerBottom, pb.getBoundingClientRect().bottom);
+      const b = pb.getBoundingClientRect().bottom;
+      if (b > playerBottom) { playerBottom = b; visiblePlayerBlock = pb; }
     }
     const anchor = Math.round(Math.max(48, topBarBottom, playerBottom));
+
+    // The multimedia card (AudioPage_PlayerBlock's own vkitInternalGroupCard
+    // wrapper) draws its "border" via a uniform inset box-shadow on ::before,
+    // not a real border property. While merged, .vmu-multimedia-flat (CSS)
+    // disables that and substitutes a top+left+right-only version — keeps
+    // the outer edges bordered but drops the bottom line where it now
+    // touches our panel, so the two read as one continuous outline instead
+    // of a seam. Borrow the exact same color for both so it still looks
+    // intentional, instead of hardcoding a color that'd drift from whatever
+    // theme VK is currently rendering.
+    const mmCard = visiblePlayerBlock ? visiblePlayerBlock.closest('section') : null;
+    if (mmCard) {
+      const mmBorder = getComputedStyle(mmCard, '::before').boxShadow;
+      const m = mmBorder.match(/rgba?\([^)]+\)/);
+      if (m) document.documentElement.style.setProperty('--vmu-pin-border', m[0]);
+    }
+    let anyEngaged = false;
 
     for (const section of sections) {
       const tabs = section.querySelector(':scope > [data-testid="headerlayout"]');
@@ -392,7 +411,7 @@
       const unpin = () => {
         for (const el of [tabs, isSearchWrap ? search : null]) {
           if (!el) continue;
-          el.classList.remove('vmu-tabs-pinned');
+          el.classList.remove('vmu-tabs-pinned', 'vmu-pin-top', 'vmu-pin-bottom');
           el.style.top = el.style.left = el.style.width = el.style.background = '';
         }
         section.style.paddingTop = '';
@@ -418,7 +437,8 @@
       const bg = getComputedStyle(section).backgroundColor;
       const sRect = section.getBoundingClientRect(); // already reflects any active content-offset shift
 
-      tabs.classList.add('vmu-tabs-pinned');
+      anyEngaged = true;
+      tabs.classList.add('vmu-tabs-pinned', 'vmu-pin-top');
       tabs.style.left = sRect.left + 'px';
       tabs.style.width = sRect.width + 'px';
       tabs.style.top = anchor + 'px';
@@ -427,16 +447,22 @@
 
       let searchH = 0;
       if (isSearchWrap) {
-        search.classList.add('vmu-tabs-pinned');
+        search.classList.add('vmu-tabs-pinned', 'vmu-pin-bottom');
         search.style.left = sRect.left + 'px';
         search.style.width = sRect.width + 'px';
         search.style.top = (anchor + tabsH) + 'px';
         search.style.background = bg;
         searchH = search.getBoundingClientRect().height;
+      } else {
+        // No separate search wrapper on this tab — tabs is the last piece,
+        // so it needs the bottom rounding+border itself.
+        tabs.classList.add('vmu-pin-bottom');
       }
 
       section.style.paddingTop = (basePad + tabsH + searchH) + 'px';
     }
+
+    if (mmCard) mmCard.classList.toggle('vmu-multimedia-flat', anyEngaged);
   }
 
   function applyAudioCatalogLayout() {
