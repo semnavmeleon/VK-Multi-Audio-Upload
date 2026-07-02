@@ -10,7 +10,23 @@
   box-sizing: border-box;
 }
 
-/* ── Settings gear injected into VK's native dialog header ──────────────────── */
+/* ── Own dialog header (title + settings gear + close) ───────────────────── */
+#vmu-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 6px;
+  flex-shrink: 0;
+}
+#vmu-header-title {
+  flex: 1;
+  font-size: 16px;
+  font-weight: 600;
+  color: #e1e3e6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .vmu-settings-btn-header {
   width: 36px;
   height: 36px;
@@ -135,7 +151,7 @@
 .vmu-pick-btn:active { background: #1567b5; }
 #vmu-input { display: none; }
 
-/* ── "Очистить" placed next to VK's native "Выбрать из своих аудиозаписей" ── */
+/* ── "Очистить" in the embedded footer ────────────────────────────────────── */
 .vmu-clear-native {
   font-size: 13px;
   font-weight: 700;
@@ -827,6 +843,7 @@
   line-height: 0;
 }
 /* Show on row hover */
+[data-testid="MusicTrackRow"]:hover .vmu-single-dl,
 [class*="vkitAudioRow__root"]:hover .vmu-single-dl,
 .audio_row:hover .vmu-single-dl,
 .AudioRow:hover .vmu-single-dl,
@@ -938,6 +955,7 @@
   box-sizing: border-box;
 }
 /* Hover-reveal — same pattern as native VK action buttons */
+[data-testid="MusicTrackRow"]:hover .vmu-single-dl-after,
 [class*="vkitAudioRow__root"]:hover .vmu-single-dl-after {
   opacity: 1;
 }

@@ -192,14 +192,17 @@
     if (settings.hideScrollToTop) {
       parts.push(`#stl_left { display: none !important; }`);
     } else {
-      // Constrain both outer #stl_left (click area) and inner #stl_bg (chip),
-      // strip the original "60px top padding + truncated label" layout, hide
-      // the "Наверх" text via font-size:0 on #stl_text (SVG keeps its pixel
-      // width/height attributes so the arrow icon stays visible).
+      // Constrain outer #stl_left (click area) to a 40px rail and stretch
+      // inner #stl_bg to the rail's full height so the hover highlight
+      // matches the clickable area instead of a clipped 40x40 chip. Kill
+      // VK's own offsets (#stl_text margin-left:19px, svg margin-right:4px)
+      // — they pushed the arrow off-center. The "Наверх" text is hidden via
+      // font-size:0 on #stl_text (SVG keeps its pixel width/height
+      // attributes so the arrow icon stays visible).
       parts.push(`#stl_left { width: 40px !important; }`);
-      parts.push(`#stl_bg { width: 40px !important; height: 40px !important; padding: 0 !important; margin: 60px 0 0 !important; overflow: hidden !important; display: flex !important; align-items: center !important; justify-content: center !important; }`);
-      parts.push(`#stl_text { font-size: 0 !important; display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; height: 100% !important; }`);
-      parts.push(`#stl_text svg { width: 20px !important; height: 20px !important; }`);
+      parts.push(`#stl_bg { width: 40px !important; height: calc(100% - 60px) !important; padding: 0 !important; margin: 60px 0 0 !important; overflow: hidden !important; display: flex !important; align-items: flex-start !important; justify-content: center !important; }`);
+      parts.push(`#stl_text { font-size: 0 !important; margin: 0 !important; display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; height: 40px !important; flex: none !important; }`);
+      parts.push(`#stl_text svg { width: 20px !important; height: 20px !important; margin: 0 !important; }`);
     }
 
     if (settings.optimizeBigPlaylists) {
@@ -210,7 +213,7 @@
       // DOM nodes stay intact, so data-vmu-track stamps, dupe scan and
       // scroll-to behaviour keep working.
       parts.push(
-        `[class*="vkitAudioRow__root"], .audio_row, .AudioRow { content-visibility: auto !important; contain-intrinsic-size: auto 56px !important; }`
+        `[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, .AudioRow { content-visibility: auto !important; contain-intrinsic-size: auto 56px !important; }`
       );
     }
 
@@ -650,7 +653,7 @@
     const seen = new Set();
 
     const rows = container.querySelectorAll(
-      '.audio_row[data-full-id], [data-full-id], [data-audio-id], .AudioRow'
+      '.audio_row[data-full-id], [data-full-id], [data-audio-id], .AudioRow, [data-testid="MusicTrackRow"]'
     );
 
     for (const row of rows) {
@@ -744,7 +747,7 @@
 
     async function harvest() {
       await waitForMarkRows();
-      const rows = modal.querySelectorAll('[class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
+      const rows = modal.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
       for (const r of rows) {
         // Fast path — skip the full JSON.parse if we've already collected
         // this track (looked up via the tiny data-vmu-id attribute). Without
@@ -803,7 +806,7 @@
       await sleep(450);
       // Always nudge the last mounted row into view — this is the most reliable
       // way to wake the popup's lazy-load when no internal scroller exists.
-      const rowsNow = modal.querySelectorAll('[class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
+      const rowsNow = modal.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
       const lastRow = rowsNow[rowsNow.length - 1];
       if (lastRow) {
         // `end` actually scrolls the nearest scrollable ancestor when the row
@@ -997,7 +1000,7 @@
       if (d.track?.id) ids.add(String(d.track.id));
       if (d.original?.id) ids.add(String(d.original.id));
     }
-    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [class*="vkitAudioRow__root"], .audio_row');
+    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row');
     for (const row of rows) {
       let rowId = row.dataset?.fullId || null;
       if (!rowId && row.dataset?.vmuTrack) {
@@ -1016,7 +1019,7 @@
       if (t?.fullId) ids.add(t.fullId);
       if (t?.id) ids.add(String(t.id));
     }
-    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [class*="vkitAudioRow__root"], .audio_row');
+    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row');
     for (const row of rows) {
       let rowId = row.dataset?.fullId || null;
       if (!rowId && row.dataset?.vmuTrack) {
@@ -1448,6 +1451,8 @@
         if (dzHint) dzHint.textContent = isCheck
           ? 'имена файлов будут сверены с треками на странице'
           : 'не более 200 МБ каждый';
+        const headerTitle = document.getElementById('vmu-header-title');
+        if (headerTitle) headerTitle.textContent = isCheck ? 'Проверка аудиозаписей' : 'Загрузка аудиозаписей';
       });
     }
 
@@ -1698,6 +1703,9 @@
     const st = document.getElementById('vmu-status');
     if (st) st.textContent = txt;
 
+    const clearBtn = document.getElementById('vmu-clear');
+    if (clearBtn) clearBtn.style.display = (counts.done || counts.error) ? '' : 'none';
+
     const hasWork = counts.pending > 0 || counts.uploading > 0;
     const allSettled = fileQueue.length > 0 && !hasWork;
     const buttons = [];
@@ -1776,13 +1784,17 @@
     };
   }
 
-  // Close the upload dialog. VK's modal has a "Закрыть" button at the bottom
-  // of the body (not in the header), so look for it by text first. Fall back
-  // to header X (old VK), then Escape, then DOM removal as last resort.
+  // Close the upload dialog through VK's own controls — the native close /
+  // cancel buttons are the only path that tears down both the modal and its
+  // dim overlay (Escape is ignored by this modal, verified live).
   function closeUploadModal() {
     setBlockAudioHide(false);
     const box = getUploadDialog();
     if (!box) return;
+    // Native controls (kept intact by injectIntoVkDialog)
+    const native = box.querySelector('[data-testid="UploadAudio_CancelButton"]')
+                || box.querySelector('[data-testid="modal-close-button"]');
+    if (native) { native.click(); return; }
     // Find a button with close-text inside the modal, ignoring our own buttons
     const closeByText = [...box.querySelectorAll('button')].find(b => {
       if (b.id?.startsWith('vmu-') || b.classList.contains('vmu-clear-native')) return false;
@@ -1790,18 +1802,11 @@
       return t === 'закрыть' || t === 'отмена' || t === 'close' || t === 'cancel';
     });
     if (closeByText) { closeByText.click(); return; }
-    // Header after-slot X (old VK)
-    const afterSlot = box.querySelector('[class*="vkitModalHeader__after"]');
-    if (afterSlot) {
-      const closeBtn = [...afterSlot.querySelectorAll('button')]
-        .find(b => !b.id?.startsWith('vmu-'));
-      if (closeBtn) { closeBtn.click(); return; }
-    }
     // Escape fallback
     box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
-    // Last resort — hide the popup so it doesn't shadow the page
-    const popup = box.closest('.popup_box_container, [class*="vkitModalPage"]') || box;
+    // Last resort — hide the whole popout (dim overlay included), not just the box
+    const popup = box.closest('[class*="vkuiPopoutWrapper__host"], .popup_box_container, [class*="vkitModalPage"]') || box;
     popup.style.display = 'none';
   }
 
@@ -1890,7 +1895,7 @@
       // Every 4th iter, ask the LAST currently-mounted row to scrollIntoView.
       // This pokes VK's bottom-sentinel even when scrollHeight already matches.
       if (i % 4 === 3) {
-        const rows = document.querySelectorAll('[class*="vkitAudioRow__root"]');
+        const rows = document.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"]');
         const lastRow = rows[rows.length - 1];
         if (lastRow) lastRow.scrollIntoView({ block: 'end' });
         await sleep(300);
@@ -2173,13 +2178,25 @@
     const newDlg = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0 &&
                  (m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
-                  m.querySelector('[data-testid="UploadAudio_SelectFileButton"]')));
+                  m.querySelector('[data-testid="UploadAudio_SelectFileButton"]')) &&
+                 !isPlaylistDialog(m));
     if (newDlg) return newDlg;
     // Old VK fallback
     return document.querySelector('.audio_add_box') || null;
   }
   function getUploadDialogBody(box) {
     return box?.querySelector('[class*="vkitModalBody__container"]') || box;
+  }
+  // The "create playlist" dialog contains its own audio upload input, so the
+  // vkitInternalModalBox matcher above would grab it and injectIntoVkDialog
+  // would wipe VK's playlist form (also breaking the auto-playlist flow).
+  // Detect it by the playlist-name input in the surrounding dialog.
+  function isPlaylistDialog(m) {
+    let el = m;
+    for (let i = 0; el && el !== document.body && el.id !== 'spa_layout_content' && i < 10; i++, el = el.parentElement) {
+      if (el.querySelector?.('input[placeholder*="лейлист"]')) return true;
+    }
+    return false;
   }
 
   // ─── global drag & drop interceptor ──────────────────────────────────────────
@@ -2369,13 +2386,24 @@
   }
 
   // ─── Embed full UI into VK's native upload dialog ────────────────────────────
-  function buildEmbeddedUI() {
+  function buildEmbeddedUI(withOwnHeader) {
     const wrap = document.createElement('div');
     wrap.id = 'vmu-embedded';
     const isCheck = settings.workMode === 'check';
     const dzLabel = isCheck ? 'Перетащите MP3 для проверки' : 'Перетащите MP3 файлы сюда';
     const dzHint = isCheck ? 'имена файлов будут сверены с треками на странице' : 'не более 200 МБ каждый';
+    // Own header (title + gear + ✕) is only rendered when the dialog has no
+    // native header we could keep — otherwise the native title and close
+    // button stay and the gear is injected next to them.
+    const ownHeader = withOwnHeader ? `
+      <div id="vmu-header">
+        <span id="vmu-header-title">${isCheck ? 'Проверка аудиозаписей' : 'Загрузка аудиозаписей'}</span>
+        <button type="button" id="vmu-settings-btn" class="vmu-settings-btn-header" title="Настройки">${ICON_SETTINGS}</button>
+        <button type="button" id="vmu-close-btn" class="vmu-settings-btn-header" title="Закрыть">${ICON_CLOSE}</button>
+      </div>` : '';
     wrap.innerHTML = `
+      ${ownHeader}
+
       ${buildSettingsPanel()}
 
       <div id="vmu-dropzone">
@@ -2392,6 +2420,7 @@
 
       <div id="vmu-footer">
         <span id="vmu-status"></span>
+        <button type="button" id="vmu-clear" class="vmu-clear-native" style="display:none">Очистить</button>
       </div>
     `;
     return wrap;
@@ -2468,54 +2497,6 @@
     }
   }
 
-  // Place "Очистить" in the same row as VK's native "Выбрать из своих аудиозаписей"
-  // link in the dialog footer (outside .audio_add_box, so it survives box.innerHTML reset)
-  function tryInjectClearButton() {
-    const pickLink = [...document.querySelectorAll('a, button')]
-      .find(el => (el.textContent || '').trim() === 'Выбрать из своих аудиозаписей');
-    if (!pickLink) return;
-
-    const btn = document.createElement('button');
-    btn.id = 'vmu-clear';
-    btn.className = 'vmu-clear-native';
-    btn.textContent = 'Очистить';
-    btn.addEventListener('click', () => {
-      fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
-      renderQueue();
-    });
-    pickLink.insertAdjacentElement('afterend', btn);
-  }
-
-  // Move the settings gear into VK's native dialog header, right after the title
-  // "Выберите аудиозапись на вашем компьютере" (outside .audio_add_box, so it
-  // survives box.innerHTML reset)
-  function tryInjectSettingsIntoHeader() {
-    if (document.getElementById('vmu-settings-btn')) return;
-
-    const btn = document.createElement('button');
-    btn.id = 'vmu-settings-btn';
-    btn.className = 'vmu-settings-btn-header';
-    btn.title = 'Настройки';
-    btn.innerHTML = ICON_SETTINGS;
-    btn.addEventListener('click', toggleSettings);
-
-    // New VK: inject into the header's after slot (right side, visually aligns with ✕)
-    const box = getUploadDialog();
-    const afterSlot = box?.querySelector('[class*="vkitModalHeader__after"]');
-    if (afterSlot) {
-      afterSlot.appendChild(btn);
-      return;
-    }
-
-    // Old VK fallback — inject into the title element
-    const titleEl = [...document.querySelectorAll('div, span, h1, h2, h3, p')]
-      .find(el => el.children.length === 0 && (el.textContent || '').trim() === 'Выберите аудиозапись на вашем компьютере');
-    if (!titleEl) return;
-    titleEl.style.display = 'flex';
-    titleEl.style.alignItems = 'center';
-    titleEl.appendChild(btn);
-  }
-
   function injectIntoVkDialog(box) {
     if (box.dataset.vmuInjected) return;
     box.dataset.vmuInjected = '1';
@@ -2527,19 +2508,69 @@
       vkInput.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:0;height:0;overflow:hidden;';
     }
 
-    // In new VK inject into modal body only (keep header/close btn intact)
-    const body = getUploadDialogBody(box);
-    body.innerHTML = '';
-    body.appendChild(buildEmbeddedUI());
-
-    // Re-append VK's input so it stays in the DOM with its event listeners
-    if (vkInput) body.appendChild(vkInput);
+    // New VK (2026): the box holds [data-testid="modalheader"] (title + the
+    // only close button that properly tears down the modal AND its overlay),
+    // a middle section (limitations text + "Выбрать файл") and
+    // [data-testid="modalfooter"] («Выбрать из своих аудиозаписей» /
+    // «Закрыть»). Keep header and footer, swap only the middle section.
+    const header = box.querySelector('[data-testid="modalheader"], [class*="vkitModalHeader"]');
+    const footer = box.querySelector('[data-testid="modalfooter"], [class*="vkitModalFooter"]');
+    if (header || footer) {
+      [...box.children].forEach(c => {
+        if (c !== header && c !== footer) c.remove();
+      });
+      const ui = buildEmbeddedUI(false);
+      if (footer) box.insertBefore(ui, footer);
+      else box.appendChild(ui);
+      if (vkInput) box.appendChild(vkInput);
+      injectGearIntoNativeHeader(header);
+    } else {
+      // No recognizable native chrome (old VK .audio_add_box) — replace the
+      // body and render our own header with gear and close button.
+      const body = getUploadDialogBody(box);
+      body.innerHTML = '';
+      body.appendChild(buildEmbeddedUI(true));
+      if (vkInput) body.appendChild(vkInput);
+    }
 
     attachEmbeddedHandlers();
     renderQueue();
   }
 
+  // Settings gear placed next to the native close button so it survives our
+  // injection (we keep the native header) and looks like part of VK's dialog.
+  function injectGearIntoNativeHeader(header) {
+    if (!header || document.getElementById('vmu-settings-btn')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vmu-settings-btn';
+    btn.className = 'vmu-settings-btn-header';
+    btn.title = 'Настройки';
+    btn.innerHTML = ICON_SETTINGS;
+    btn.addEventListener('click', toggleSettings);
+    if (settingsPanelOpen) btn.style.color = '#2688eb';
+    const closeWrap = header.querySelector('[data-testid="modal-close-button"]');
+    if (closeWrap && closeWrap.parentElement) closeWrap.parentElement.insertBefore(btn, closeWrap);
+    else header.appendChild(btn);
+  }
+
   function attachEmbeddedHandlers() {
+    // Scoped to our own header — the native-header gear gets its listener in
+    // injectGearIntoNativeHeader (binding by id here would double-toggle it)
+    document.querySelector('#vmu-embedded #vmu-settings-btn')?.addEventListener('click', toggleSettings);
+    document.getElementById('vmu-close-btn')?.addEventListener('click', closeUploadModal);
+    document.getElementById('vmu-clear')?.addEventListener('click', () => {
+      fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
+      renderQueue();
+    });
+    // The panel is rebuilt collapsed on every (re)injection — restore state
+    if (settingsPanelOpen) {
+      const panel = document.getElementById('vmu-settings-panel');
+      if (panel) panel.style.display = 'block';
+      const btn = document.getElementById('vmu-settings-btn');
+      if (btn) btn.style.color = '#2688eb';
+    }
+
     document.getElementById('vmu-input')?.addEventListener('change', e => {
       addFiles([...e.target.files].filter(isMP3));
       e.target.value = '';
@@ -2828,11 +2859,12 @@
     const tracks = [];
     const seen = new Set();
 
-    // New VK uses vkitAudioRow__root with CSS modules hash
+    // New VK (2026) uses [data-testid="MusicTrackRow"]; older builds used
+    // vkitAudioRow__root with CSS modules hash
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0);
     const container = modal || document;
-    const rows = container.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
+    const rows = container.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
 
     for (const row of rows) {
       try {
@@ -3416,7 +3448,7 @@
     const sweep = () => {
       window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
       setTimeout(() => {
-        const rows = document.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow, .audio_row, [data-full-id]');
+        const rows = document.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, .audio_row, [data-full-id]');
         for (const row of rows) injectSingleDlBtn(row);
       }, 50);
     };
@@ -3444,7 +3476,7 @@
       for (const mut of muts) {
         for (const node of mut.addedNodes) {
           if (node.nodeType !== 1) continue;
-          if (node.matches?.('[class*="vkitAudioRow__root"]') || node.querySelector?.('[class*="vkitAudioRow__root"]')) {
+          if (node.matches?.('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"]') || node.querySelector?.('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"]')) {
             clearTimeout(t);
             t = setTimeout(markAndInjectAll, 60);
             return;
@@ -3495,10 +3527,10 @@
       delete box.dataset.vmuInjected;
       injectIntoVkDialog(box);
     }
-
-    // Place "Очистить" and settings gear (old VK only — new VK header survives injection)
-    if (getUploadDialog() && !document.getElementById('vmu-clear')) tryInjectClearButton();
-    if (getUploadDialog() && !document.getElementById('vmu-settings-btn')) tryInjectSettingsIntoHeader();
+    // Restore the gear if VK re-rendered its native header
+    if (box && box.dataset.vmuInjected && !document.getElementById('vmu-settings-btn')) {
+      injectGearIntoNativeHeader(box.querySelector('[data-testid="modalheader"], [class*="vkitModalHeader"]'));
+    }
 
     // Inject download buttons on music/playlist pages
     // Inject dupes button into playlist edit dialog (debounced)

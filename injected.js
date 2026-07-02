@@ -1484,7 +1484,7 @@
   // O(newly-added rows) — flat instead of quadratic over the whole scan.
   function markRowTrackData() {
     let marked = 0;
-    const rows = document.querySelectorAll('[class*="vkitAudioRow__root"]:not([data-vmu-id]), .AudioRow:not([data-vmu-id])');
+    const rows = document.querySelectorAll('[data-testid="MusicTrackRow"]:not([data-vmu-id]), [class*="vkitAudioRow__root"]:not([data-vmu-id]), .AudioRow:not([data-vmu-id])');
     for (const row of rows) {
       try {
         const entity = findTrackEntityFromFiber(row);
@@ -1524,7 +1524,7 @@
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0);
     const container = modal || document;
-    const rows = container.querySelectorAll('[class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
+    const rows = container.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
 
     for (const row of rows) {
       try {
