@@ -40,6 +40,12 @@
   let isPaused = false;
   let currentUploadingItem = null;
   let itemIdCounter = 0;
+  // How many files were added to the CURRENT batch (resets when a fresh batch
+  // starts from an empty queue). itemIdCounter itself is a lifetime id
+  // generator and must stay monotonic for React-less list keying, so it can't
+  // double as this — reusing it here previously misclassified any batch after
+  // the first single-file one as "multi-file" (see reloadAfterBatchIfNeeded).
+  let sessionFileCount = 0;
 
   // ─── playlist download state ──────────────────────────────────────────────────
   const dlTracks = new Map();   // trackId -> {id, title, artist, url}
@@ -210,10 +216,15 @@
       // any row outside the viewport. contain-intrinsic-size keeps the
       // scrollbar accurate by reserving height for skipped rows (`auto`
       // remembers the actual size once each row has rendered at least once).
-      // DOM nodes stay intact, so data-vmu-track stamps, dupe scan and
-      // scroll-to behaviour keep working.
+      // Heights match the measured rows (page list 48px, playlist popup 56px)
+      // — a wrong estimate accumulates into phantom scroll height until every
+      // row renders once. DOM nodes stay intact, so data-vmu-track stamps,
+      // dupe scan and scroll-to behaviour keep working.
       parts.push(
-        `[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, .AudioRow { content-visibility: auto !important; contain-intrinsic-size: auto 56px !important; }`
+        `[data-testid="MusicTrackRow"] { content-visibility: auto !important; contain-intrinsic-size: auto 48px !important; }`
+      );
+      parts.push(
+        `[data-testid="MusicPlaylistTracks_MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, .AudioRow { content-visibility: auto !important; contain-intrinsic-size: auto 56px !important; }`
       );
     }
 
@@ -242,8 +253,40 @@
     }
 
     el.textContent = parts.join('\n');
+    positionCheckPanel();
   }
   applyLayoutCustomizations();
+
+  // Keeps the check-mode result panel clear of VK's content column. The
+  // column can be shifted horizontally via the "Смещение контента" slider
+  // above; when that eats into the panel's usual right-side spot, flip the
+  // panel to the left edge instead of letting it overlap the content.
+  // Also clears the top nav bar AND the in-flow "now playing" block — the
+  // latter (data-testid="AudioPage_PlayerBlock") isn't fixed/sticky, but it
+  // sits at a fixed-looking vertical band right under the nav bar and can
+  // reach further right on narrower viewports than the fixed top:76px
+  // assumed, colliding with a right-anchored panel there.
+  function positionCheckPanel() {
+    const panel = document.getElementById('vmu-check-panel');
+    if (!panel) return;
+    const margin = 24;
+    const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
+    const playerBlock = document.querySelector('[data-testid="AudioPage_PlayerBlock"]');
+    const topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
+    const playerBottom = playerBlock ? playerBlock.getBoundingClientRect().bottom : 0;
+    const top = Math.max(48, topBarBottom, playerBottom) + margin;
+    panel.style.top = top + 'px';
+    panel.style.maxHeight = `calc(100vh - ${top + margin}px)`;
+
+    const layout = document.querySelector('[class*="LayoutWrapper__body"]');
+    const rect = layout ? layout.getBoundingClientRect() : null;
+    const vw = window.innerWidth;
+    const rightGap = rect ? vw - rect.right : vw;
+    const leftGap = rect ? rect.left : 0;
+    const needsFlip = rightGap < panel.offsetWidth + margin && leftGap > rightGap;
+    panel.classList.toggle('vmu-check-panel-left', needsFlip);
+    panel.style.left = needsFlip ? margin + 'px' : '';
+  }
 
   // ─── filename → meta parser ───────────────────────────────────────────────────
   function parseMetaFromFilename(filename) {
@@ -653,7 +696,7 @@
     const seen = new Set();
 
     const rows = container.querySelectorAll(
-      '.audio_row[data-full-id], [data-full-id], [data-audio-id], .AudioRow, [data-testid="MusicTrackRow"]'
+      '.audio_row[data-full-id], [data-full-id], [data-audio-id], .AudioRow, [data-testid$="MusicTrackRow"]'
     );
 
     for (const row of rows) {
@@ -714,7 +757,7 @@
     return Number.isFinite(n) && n > 0 ? n : null;
   }
 
-  async function expandPlaylistModal(onProgress) {
+  async function expandPlaylistModal(onProgress, isCancelled) {
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0);
     if (!modal) return [];
@@ -747,7 +790,7 @@
 
     async function harvest() {
       await waitForMarkRows();
-      const rows = modal.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
+      const rows = modal.querySelectorAll('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
       for (const r of rows) {
         // Fast path — skip the full JSON.parse if we've already collected
         // this track (looked up via the tiny data-vmu-id attribute). Without
@@ -782,41 +825,71 @@
     };
     reportProgress();
 
-    // Aggressive scroll-and-harvest loop. The earlier version (60 iters,
-    // stable < 4, simple scrollTop = scrollHeight) plateaued on long playlists
-    // — VK's lazy-loader needs *motion* between batches, not just being at the
-    // bottom. Same recipe that fixed the audios-page harvest works here:
-    //   - 200 iter cap, 15 stable iters before giving up
-    //   - every 3rd iter, jump up first so the next bottom-jump registers
-    //     as fresh motion
-    //   - every 4th iter, scrollIntoView({ block:'end' }) on the last row
-    //     pokes any bottom-sentinel IntersectionObserver even when
-    //     scrollHeight hasn't grown
+    // Ask injected.js to invoke VK's own tail-fetch callback via React fiber
+    // props (VK's IntersectionObserver sentinel doesn't fire in the hybrid
+    // old-box-layer hosting of the new playlist modal). Resolves true when the
+    // callback exists — in that mode no scrolling is needed at all.
+    const requestTailLoad = () => new Promise(resolve => {
+      let done = false;
+      const finish = ok => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        window.removeEventListener('message', h);
+        resolve(ok);
+      };
+      const t = setTimeout(() => finish(false), 400);
+      const h = e => {
+        if (e.source !== window || e.data?.type !== 'VKD_PLAYLIST_TAIL_LOAD_DONE') return;
+        finish(!!e.data.ok);
+      };
+      window.addEventListener('message', h);
+      window.postMessage({ type: 'VKD_PLAYLIST_TAIL_LOAD' }, '*');
+    });
+
+    // Harvest loop. Fast path drives VK's fetch callback directly and only
+    // waits for rows to actually land (poll, not fixed sleeps), so each
+    // ~20-track batch costs its network time — no scroll choreography.
+    // Scroll-dance fallback for markups without the fiber callback: VK's
+    // lazy-loader there needs *motion* between batches, not just being at
+    // the bottom (jump up every 3rd iter, poke last row every 4th).
+    const ROW_SEL = '[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, [data-full-id]';
     let stable = 0, lastSize = collected.size;
     const MAX_ITER = 200;
-    const STABLE_LIMIT = 15;
-    for (let i = 0; i < MAX_ITER && stable < STABLE_LIMIT; i++) {
-      if (modalScroller) {
-        if (i % 3 === 2) {
-          modalScroller.scrollTop = Math.max(0, modalScroller.scrollHeight - modalScroller.clientHeight - 800);
-          await sleep(120);
+    const STABLE_LIMIT = 15;      // scroll fallback needs many "motion" retries
+    const STABLE_LIMIT_FAST = 5;  // direct loader either fetches or is exhausted
+    let loaderMode = false;
+    for (let i = 0; i < MAX_ITER && stable < (loaderMode ? STABLE_LIMIT_FAST : STABLE_LIMIT); i++) {
+      if (isCancelled?.()) break;
+      loaderMode = await requestTailLoad();
+      if (loaderMode) {
+        const startRows = modal.querySelectorAll(ROW_SEL).length;
+        for (let w = 0; w < 12 && modal.querySelectorAll(ROW_SEL).length === startRows; w++) {
+          await sleep(125);
         }
-        modalScroller.scrollTop = modalScroller.scrollHeight;
-      }
-      await sleep(450);
-      // Always nudge the last mounted row into view — this is the most reliable
-      // way to wake the popup's lazy-load when no internal scroller exists.
-      const rowsNow = modal.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, [data-full-id]');
-      const lastRow = rowsNow[rowsNow.length - 1];
-      if (lastRow) {
+      } else {
+        if (modalScroller) {
+          if (i % 3 === 2) {
+            modalScroller.scrollTop = Math.max(0, modalScroller.scrollHeight - modalScroller.clientHeight - 800);
+            await sleep(120);
+          }
+          modalScroller.scrollTop = modalScroller.scrollHeight;
+        }
+        await sleep(450);
         // `end` actually scrolls the nearest scrollable ancestor when the row
         // is off-screen (which is when lazy-load needs to fire). `nearest`
         // bails out if the row is technically visible and skips the trigger.
-        lastRow.scrollIntoView({ block: i % 4 === 3 ? 'end' : 'nearest' });
-        await sleep(250);
+        const rowsNow = modal.querySelectorAll(ROW_SEL);
+        const lastRow = rowsNow[rowsNow.length - 1];
+        if (lastRow) {
+          lastRow.scrollIntoView({ block: i % 4 === 3 ? 'end' : 'nearest' });
+          await sleep(250);
+        }
       }
       await harvest();
       reportProgress();
+      // Everything the header declared is collected — skip the stable-tail wait
+      if (declaredTotal && collected.size >= declaredTotal) break;
       if (collected.size === lastSize) stable++; else { stable = 0; lastSize = collected.size; }
     }
 
@@ -891,9 +964,10 @@
     }
   }
 
-  async function scanForDuplicates(plInfoArg, statusCallback) {
+  async function scanForDuplicates(plInfoArg, statusCallback, cancelToken) {
     const pl = plInfoArg || getPlaylistInfoFromUrl();
     const report = statusCallback || ((msg, isError, progress) => setPlaylistStatus(msg, isError, progress));
+    const isCancelled = () => !!cancelToken?.cancelled;
 
     if (!pl) {
       report('Перейдите на страницу плейлиста для поиска дубликатов', true);
@@ -905,23 +979,29 @@
 
     try {
       // Primary path: expand the playlist popup (click "Показать все") and
-      // scroll until lazy-loading stops yielding new rows. This is the only
-      // approach that reliably hits isBlocked and works without CSRF/API
-      // success. API path failed on observed playlists (returned ERR_105 or
-      // 0 items), so it's now a fallback.
+      // drive VK's lazy-loader until it stops yielding new rows. This mounts
+      // every row into VK's own DOM/React state — required for both the
+      // in-popup highlight and the click-to-jump markers below, which can
+      // only scroll to a row that actually exists. The faster audio.get API
+      // path (used for playlist download, where no row needs to be visible)
+      // fetches data only and mounts nothing, so it can't drive those two
+      // features — it stays a fallback for when the modal can't be expanded.
       let tracks = await expandPlaylistModal((loaded, total) => {
         if (total) report(`Раскрываем плейлист… ${loaded} / ${total}`, false, { loaded, total });
         else report(`Раскрываем плейлист… ${loaded}`);
-      });
+      }, isCancelled);
 
-      // Fallback A: API-based loading via al_audio.php?act=load_section.
-      // Useful when DOM expansion fails (closed popup, no scrollable host, etc).
-      if (!tracks.length && pl.ownerId && pl.playlistId) {
-        report('Загружаем через API…');
-        const apiTracks = await loadPlaylistTracksViaAPI(pl, n => {
-          report(`Загружаем через API… ${n}`);
+      const wasCancelled = isCancelled() && tracks.length > 0;
+
+      // Fallback A: audio.get via VK's API client — no DOM mounting, so any
+      // resulting dupe/blocked markers won't be able to jump to their row.
+      // Skipped when the user stopped the scan early: partial DOM-mounted
+      // results are what they asked to see, not a fuller API-fetched set.
+      if (!tracks.length && !isCancelled() && pl.ownerId && pl.playlistId) {
+        report('Загружаем список треков…');
+        tracks = await loadPlaylistTracksViaAPI(pl, n => {
+          report(`Загружаем список треков… ${n}`);
         });
-        if (apiTracks.length) tracks = apiTracks;
       }
 
       // Fallback B: rows already mounted in popup DOM
@@ -931,7 +1011,7 @@
       }
 
       if (!tracks.length) {
-        report('Треки не найдены', true);
+        report(isCancelled() ? 'Остановлено' : 'Треки не найдены', true);
         return;
       }
 
@@ -969,15 +1049,17 @@
       const blockedIndices = [];
       for (let i = 0; i < tracks.length; i++) if (tracks[i].isBlocked) blockedIndices.push(i);
 
+      const scannedNote = wasCancelled ? ` (остановлено, проверено ${tracks.length})` : '';
+
       if (!dupes.length && !blockedIndices.length) {
-        report(`В ${tracks.length} треках всё чисто`);
+        report(`В ${tracks.length} треках всё чисто${scannedNote}`);
         return;
       }
 
       const msgParts = [];
       if (dupes.length) msgParts.push(`Дубликатов: ${dupes.length}`);
       if (blockedIndices.length) msgParts.push(`Недоступных: ${blockedIndices.length}`);
-      report(`${msgParts.join(' · ')} из ${tracks.length}`);
+      report(`${msgParts.join(' · ')} из ${tracks.length}${scannedNote}`);
 
       const dupeIndices = [...dupeIndexSet].sort((a, b) => a - b);
       if (dupes.length) highlightDuplicateTracks(dupes);
@@ -1000,7 +1082,7 @@
       if (d.track?.id) ids.add(String(d.track.id));
       if (d.original?.id) ids.add(String(d.original.id));
     }
-    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row');
+    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row');
     for (const row of rows) {
       let rowId = row.dataset?.fullId || null;
       if (!rowId && row.dataset?.vmuTrack) {
@@ -1019,7 +1101,7 @@
       if (t?.fullId) ids.add(t.fullId);
       if (t?.id) ids.add(String(t.id));
     }
-    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row');
+    const rows = document.querySelectorAll('[data-full-id], [data-vmu-track], [data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row');
     for (const row of rows) {
       let rowId = row.dataset?.fullId || null;
       if (!rowId && row.dataset?.vmuTrack) {
@@ -1734,6 +1816,8 @@
       return;
     }
     autoPlaylistRunning = false;
+    if (fileQueue.length === 0) sessionFileCount = 0;
+    sessionFileCount += files.length;
     files.forEach(f => {
       const item = { id: ++itemIdCounter, file: f, status: 'pending', errorMsg: null, tags: {}, progress: 0 };
       fileQueue.push(item);
@@ -1823,9 +1907,16 @@
   async function harvestPageTracks(onProgress, limit) {
     const collected = new Map();
 
+    // Scope to the "Треки" section specifically. The /audios overview page
+    // also renders "Недавно прослушанные" and other preview widgets using
+    // the exact same MusicTrackRow markup — scanning the whole document
+    // pulled those in as false "already on the page" matches. Falls back to
+    // the whole document on markups where this section isn't present.
+    const scanRoot = document.querySelector('[data-testid="AudioCatalog_SectionTracks"]') || document;
+
     function pull() {
       const uploadBox = getUploadDialog();
-      const rows = document.querySelectorAll('[data-vmu-track]');
+      const rows = scanRoot.querySelectorAll('[data-vmu-track]');
       for (const row of rows) {
         if (uploadBox && uploadBox.contains(row)) continue;
         // Fast path — same as expandPlaylistModal's harvest(): use the tiny
@@ -1895,7 +1986,7 @@
       // Every 4th iter, ask the LAST currently-mounted row to scrollIntoView.
       // This pokes VK's bottom-sentinel even when scrollHeight already matches.
       if (i % 4 === 3) {
-        const rows = document.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"]');
+        const rows = scanRoot.querySelectorAll('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]');
         const lastRow = rows[rows.length - 1];
         if (lastRow) lastRow.scrollIntoView({ block: 'end' });
         await sleep(300);
@@ -1996,6 +2087,7 @@
   }
 
   function buildCheckResultPanel({ entries, present, missing, pageTracks }) {
+    document.getElementById('vmu-check-panel')?._vmuCleanup?.();
     document.getElementById('vmu-check-panel')?.remove();
     const pageCount = pageTracks.length;
 
@@ -2163,7 +2255,15 @@
     panel.appendChild(body);
     document.body.appendChild(panel);
 
-    head.querySelector('.vmu-check-close').addEventListener('click', () => panel.remove());
+    positionCheckPanel();
+    const onResize = () => positionCheckPanel();
+    window.addEventListener('resize', onResize);
+    panel._vmuCleanup = () => window.removeEventListener('resize', onResize);
+
+    head.querySelector('.vmu-check-close').addEventListener('click', () => {
+      panel._vmuCleanup();
+      panel.remove();
+    });
   }
 
   // ─── helpers to find VK's upload dialog (new and old VK) ────────────────────
@@ -2296,7 +2396,7 @@
   // doDirectUpload), which never touches VK's store, so the visible list
   // stays stale until the page reloads.
   function reloadAfterBatchIfNeeded() {
-    if (itemIdCounter < 2) {
+    if (sessionFileCount < 2) {
       // Single file already renders correctly natively — release the close
       // lock so the user can dismiss the dialog or keep dropping more files.
       setBlockAudioHide(false);
@@ -2524,6 +2624,7 @@
       else box.appendChild(ui);
       if (vkInput) box.appendChild(vkInput);
       injectGearIntoNativeHeader(header);
+      injectClearIntoNativeFooter(footer);
     } else {
       // No recognizable native chrome (old VK .audio_add_box) — replace the
       // body and render our own header with gear and close button.
@@ -2552,6 +2653,22 @@
     const closeWrap = header.querySelector('[data-testid="modal-close-button"]');
     if (closeWrap && closeWrap.parentElement) closeWrap.parentElement.insertBefore(btn, closeWrap);
     else header.appendChild(btn);
+  }
+
+  // Relocates the (already-built, listener-attached) #vmu-clear button from
+  // our own footer to sit right after VK's native "Выбрать из своих
+  // аудиозаписей" button, instead of duplicating it — same DOM node, same
+  // visibility toggle in renderQueue and click handler in
+  // attachEmbeddedHandlers, just moved. No-op (stays in our own footer) on
+  // old-VK markup, which has no such native footer to anchor to.
+  function injectClearIntoNativeFooter(footer) {
+    if (!footer) return;
+    const clearBtn = document.getElementById('vmu-clear');
+    if (!clearBtn) return;
+    const pickBtn = [...footer.querySelectorAll('button')]
+      .find(b => (b.textContent || '').trim() === 'Выбрать из своих аудиозаписей');
+    if (!pickBtn || clearBtn.previousElementSibling === pickBtn) return;
+    pickBtn.insertAdjacentElement('afterend', clearBtn);
   }
 
   function attachEmbeddedHandlers() {
@@ -2653,19 +2770,39 @@
   // Per-trackId HLS progress callbacks registered by downloadSingleTrack
   const hlsProgressHandlers = new Map();
 
+  const ICON_DUPES_SCAN = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="10" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>`;
+  const ICON_DUPES_STOP = `<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`;
+
   function makeDupesBtn(plInfo) {
     const btn = document.createElement('button');
     btn.className = 'vmu-dupes-dialog-btn';
     btn.setAttribute('data-vmu-dupes-dialog', '1');
     btn.setAttribute('data-vmu-tip', 'Проверить на дубликаты');
-    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="10" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>`;
+    btn.innerHTML = ICON_DUPES_SCAN;
+    let cancelToken = null;
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
-      btn.disabled = true;
+      if (cancelToken) {
+        // Scan in progress — this click stops it and shows whatever was
+        // collected so far instead of starting a new scan.
+        cancelToken.cancelled = true;
+        btn.disabled = true;
+        return;
+      }
+      cancelToken = { cancelled: false };
+      btn.innerHTML = ICON_DUPES_STOP;
+      btn.classList.add('vmu-dupes-dialog-btn-scanning');
+      btn.setAttribute('data-vmu-tip', 'Остановить поиск');
       scanForDuplicates(plInfo, (msg, isError) => {
         showToast(msg, isError);
-      }).finally(() => { btn.disabled = false; });
+      }, cancelToken).finally(() => {
+        cancelToken = null;
+        btn.disabled = false;
+        btn.innerHTML = ICON_DUPES_SCAN;
+        btn.classList.remove('vmu-dupes-dialog-btn-scanning');
+        btn.setAttribute('data-vmu-tip', 'Проверить на дубликаты');
+      });
     });
     return btn;
   }
@@ -2859,12 +2996,12 @@
     const tracks = [];
     const seen = new Set();
 
-    // New VK (2026) uses [data-testid="MusicTrackRow"]; older builds used
+    // New VK (2026) uses [data-testid$="MusicTrackRow"]; older builds used
     // vkitAudioRow__root with CSS modules hash
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0);
     const container = modal || document;
-    const rows = container.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
+    const rows = container.querySelectorAll('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
 
     for (const row of rows) {
       try {
@@ -3396,11 +3533,17 @@
   function injectSingleDlBtn(row) {
     if (!getTrackDataFromRow(row)) return;
 
-    // Prefer buttonGroup: VK's own action panel. Works for both page-level rows
-    // and playlist-modal rows (modal rows have buttonGroup too, but VK mounts it
-    // after first sweep — so if a previous sweep placed the button into the
-    // after-slot fallback, migrate it here now that the proper slot exists).
-    const btnGroup = row.querySelector('[class*="buttonGroup"]');
+    // Prefer the actions button group: VK's own action panel, class
+    // vkuiButtonGroup__host — capital B, so a lowercase [class*="buttonGroup"]
+    // substring match silently never hits. Note this is nested one level
+    // inside a [data-testid="audiorow-actions"] wrapper (display:block, used
+    // for hover positioning) — target the inner flex row directly, not the
+    // wrapper, or the button renders outside the icon row's flex flow.
+    // Works for both page-level rows and playlist-modal rows (modal rows have
+    // it too, but VK mounts it after first sweep — so if a previous sweep
+    // placed the button into the after-slot fallback, migrate it here now
+    // that the proper slot exists).
+    const btnGroup = row.querySelector('[class*="buttonGroup" i]');
     if (btnGroup) {
       const existing = row.querySelector('.vmu-single-dl');
       if (existing && existing.parentElement === btnGroup) return;
@@ -3422,8 +3565,14 @@
     // Old VK: actions container appears only on hover — handled by the observer below
   }
 
-  // Old VK: .audio_row__actions is created on row hover and removed on mouseleave —
-  // inject immediately when it appears (no debounce, otherwise the hover is missed)
+  // Both old and new VK mount a row's action buttons lazily, only while the
+  // row is hovered (removed again on mouseleave) — old VK as
+  // .audio_row__actions, new VK as [data-testid="audiorow-actions"] inside
+  // MusicTrackRow. The debounced scanAndInjectDlBtns (150ms) plus the
+  // throttled page-mutation watcher (~120ms) run too late relative to that
+  // mount/unmount window, so the button only ever showed up if a hover
+  // happened to overlap a sweep — inject immediately on the mutation that
+  // creates either container instead of waiting for the next sweep.
   new MutationObserver(muts => {
     for (const mut of muts) {
       for (const node of mut.addedNodes) {
@@ -3435,6 +3584,14 @@
           const row = act.closest('.audio_row, [data-full-id]');
           if (!row || !getTrackDataFromRow(row)) continue;
           act.prepend(makeSingleDlBtn(row, 'vmu-single-dl-act'));
+        }
+
+        const groups = node.matches?.('[class*="buttonGroup" i]') ? [node]
+          : node.querySelectorAll ? [...node.querySelectorAll('[class*="buttonGroup" i]')] : [];
+        for (const group of groups) {
+          const row = group.closest('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]');
+          if (!row) continue;
+          injectSingleDlBtn(row);
         }
       }
     }
@@ -3448,7 +3605,7 @@
     const sweep = () => {
       window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
       setTimeout(() => {
-        const rows = document.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, .audio_row, [data-full-id]');
+        const rows = document.querySelectorAll('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, .audio_row, [data-full-id]');
         for (const row of rows) injectSingleDlBtn(row);
       }, 50);
     };
@@ -3476,7 +3633,7 @@
       for (const mut of muts) {
         for (const node of mut.addedNodes) {
           if (node.nodeType !== 1) continue;
-          if (node.matches?.('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"]') || node.querySelector?.('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"]')) {
+          if (node.matches?.('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]') || node.querySelector?.('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]')) {
             clearTimeout(t);
             t = setTimeout(markAndInjectAll, 60);
             return;
@@ -3505,7 +3662,8 @@
   let _dupesDialogTimer = null;
   // ─── SPA watcher + dialog watcher ────────────────────────────────────────────
   let lastHref = location.href;
-  new MutationObserver(() => {
+
+  function onPageMutated() {
     // SPA navigation: reset state
     if (location.href !== lastHref) {
       lastHref = location.href;
@@ -3531,6 +3689,11 @@
     if (box && box.dataset.vmuInjected && !document.getElementById('vmu-settings-btn')) {
       injectGearIntoNativeHeader(box.querySelector('[data-testid="modalheader"], [class*="vkitModalHeader"]'));
     }
+    // Restore Clear's spot next to "Выбрать из своих аудиозаписей" if VK
+    // re-rendered its native footer (cheap no-op once already in place)
+    if (box && box.dataset.vmuInjected) {
+      injectClearIntoNativeFooter(box.querySelector('[data-testid="modalfooter"], [class*="vkitModalFooter"]'));
+    }
 
     // Inject download buttons on music/playlist pages
     // Inject dupes button into playlist edit dialog (debounced)
@@ -3539,5 +3702,29 @@
 
     // Inject single-track download buttons
     scanAndInjectDlBtns();
+  }
+
+  // Coalesce mutation storms (scrolling a 1000-row playlist fires hundreds of
+  // childList batches per second) into at most ~8 handler runs/sec, and skip
+  // batches that add/remove no element nodes (text-only churn). Fixed-delay
+  // throttle rather than a resetting debounce so a continuous storm can't
+  // starve the handler.
+  let _mutScheduled = false;
+  const hasElementNode = list => {
+    for (let i = 0; i < list.length; i++) if (list[i].nodeType === 1) return true;
+    return false;
+  };
+  new MutationObserver(muts => {
+    if (_mutScheduled) return;
+    let relevant = false;
+    for (const m of muts) {
+      if (hasElementNode(m.addedNodes) || hasElementNode(m.removedNodes)) { relevant = true; break; }
+    }
+    if (!relevant) return;
+    _mutScheduled = true;
+    setTimeout(() => {
+      _mutScheduled = false;
+      onPageMutated();
+    }, 120);
   }).observe(document.body, { childList: true, subtree: true });
 })();

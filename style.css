@@ -633,6 +633,9 @@
 /* Feedback state for dupes btn — subtle tint instead of color override */
 .vmu-dupes-dialog-btn[data-error="1"] { background: rgba(230,70,70,0.12); color: #c0392b; }
 .vmu-dupes-dialog-btn[data-ok="1"]   { background: rgba(75,179,75,0.1);  color: #2e7d32; }
+/* Scanning state — click stops early and shows partial results */
+.vmu-dupes-dialog-btn-scanning { background: rgba(38,136,235,0.12); color: #2688eb; }
+.vmu-dupes-dialog-btn-scanning:hover:not(:disabled) { background: rgba(38,136,235,0.22); }
 
 /* Native-VK-style tooltip on hover for dialog buttons */
 .vmu-dupes-dialog-btn,
@@ -843,7 +846,7 @@
   line-height: 0;
 }
 /* Show on row hover */
-[data-testid="MusicTrackRow"]:hover .vmu-single-dl,
+[data-testid$="MusicTrackRow"]:hover .vmu-single-dl,
 [class*="vkitAudioRow__root"]:hover .vmu-single-dl,
 .audio_row:hover .vmu-single-dl,
 .AudioRow:hover .vmu-single-dl,
@@ -955,7 +958,7 @@
   box-sizing: border-box;
 }
 /* Hover-reveal — same pattern as native VK action buttons */
-[data-testid="MusicTrackRow"]:hover .vmu-single-dl-after,
+[data-testid$="MusicTrackRow"]:hover .vmu-single-dl-after,
 [class*="vkitAudioRow__root"]:hover .vmu-single-dl-after {
   opacity: 1;
 }
@@ -1059,6 +1062,8 @@
 .vmu-mode-switch button.active:hover { background: rgba(38,136,235,1); color: #fff; }
 
 /* ── Check-mode result panel ─────────────────────────────────────────────── */
+/* Chrome (bg/border/radius/shadow) matches #vmu-issue-panel — the same
+   floating-panel language used by the dupe/blocked-tracks finder. */
 .vmu-check-panel {
   position: fixed;
   top: 76px;
@@ -1067,16 +1072,20 @@
   max-height: calc(100vh - 120px);
   display: flex;
   flex-direction: column;
-  background: #1a1b1d;
+  background: rgba(35,35,36,0.95);
   border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 10px;
-  box-shadow: 0 12px 36px rgba(0,0,0,0.55);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
   font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
   font-size: 13px;
   color: #d0d2d4;
-  z-index: 9999;
+  z-index: 9700;
   overflow: hidden;
+  transition: left .15s ease, right .15s ease;
 }
+/* Flipped to the left edge when applyLayoutCustomizations' content offset
+   leaves too little room on the right (see positionCheckPanel in content.js) */
+.vmu-check-panel-left { right: auto; }
 .vmu-check-body {
   display: flex;
   flex: 1 1 auto;

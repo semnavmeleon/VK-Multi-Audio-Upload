@@ -283,6 +283,18 @@
   const __origReplaceChild = Node.prototype.replaceChild;
   function __markZombie(node) {
     if (!(node instanceof Element)) return false;
+    // #vmu-embedded is inserted as a plain DOM sibling of VK's own
+    // React-rendered header/footer inside the modal box (see
+    // injectIntoVkDialog in content.js) — it's invisible to React's vdom.
+    // When VK re-renders the box's children (e.g. switching to a "track
+    // added" state after upload), React's reconciler tries to reconcile an
+    // extra child it never put there and removes it directly, without ever
+    // touching the outer box — the existing vkitInternalModalBox guard below
+    // doesn't cover that case, so #vmu-embedded needs its own check.
+    if (node.id === 'vmu-embedded') {
+      node.dataset.vmuProtected = '1';
+      return true;
+    }
     const isModal =
       (typeof node.className === 'string' && node.className.includes('vkitInternalModalBox')) ||
       !!node.querySelector?.('[class*="vkitInternalModalBox"]');
@@ -1075,6 +1087,12 @@
         break;
       }
 
+      case 'VKD_PLAYLIST_TAIL_LOAD': {
+        const ok = callPlaylistTailLoader();
+        window.postMessage({ type: 'VKD_PLAYLIST_TAIL_LOAD_DONE', ok }, '*');
+        break;
+      }
+
       case 'VKD_HLS_DOWNLOAD': {
         const { url, trackId, returnBuffer } = e.data;
         const onProgress = (done, total) => {
@@ -1472,6 +1490,48 @@
     return null;
   }
 
+  // ── Playlist tail loader ─────────────────────────────────────────────────
+  // The new playlist modal is hosted inside VK's OLD popup layer
+  // (#box_layer_wrap), and VK's own IntersectionObserver tail-sentinel never
+  // fires there — scrolling loads nothing past the first ~25 rows (verified
+  // live: zero audio API calls on scroll-to-bottom). The fetch callback is
+  // still present in the React props of the tracks container, so we call it
+  // directly. Props are replaced on every render — re-resolve on each call,
+  // never cache the function.
+  function callPlaylistTailLoader() {
+    const el = document.querySelector('[data-testid="MusicPlaylistTracks_Items"], [data-testid="audiolistitems-list"]');
+    if (!el) return false;
+    const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    if (!fiberKey) return false;
+    let cur = el[fiberKey];
+    for (let i = 0; i < 15 && cur; i++) {
+      const props = cur.memoizedProps || cur.pendingProps;
+      if (props && typeof props.onFetchRestByTracksTailIntersection === 'function') {
+        if (props.isTailFetchingAvailable === false || props.hasFetching) return true; // exists, but busy or exhausted
+        try { props.onFetchRestByTracksTailIntersection(); } catch {}
+        return true;
+      }
+      cur = cur.return;
+    }
+    return false;
+  }
+
+  // Fix manual scrolling of the playlist popup: scroll events don't bubble,
+  // but a capture-phase window listener still sees the old popup layer
+  // scrolling. When the list tail is near the viewport bottom, invoke VK's
+  // loader ourselves (throttled).
+  let __vmuTailScrollLast = 0;
+  window.addEventListener('scroll', () => {
+    const now = Date.now();
+    if (now - __vmuTailScrollLast < 400) return;
+    __vmuTailScrollLast = now;
+    const items = document.querySelector('[data-testid="MusicPlaylistTracks_Items"]');
+    if (!items) return;
+    const r = items.getBoundingClientRect();
+    if (r.height === 0) return;
+    if (r.bottom < window.innerHeight + 800) callPlaylistTailLoader();
+  }, true);
+
   // ── Stamp data-vmu-track on audio rows so the content script (isolated world,
   // no access to React fiber expandos) can read track data from the DOM ──
   // The selector explicitly skips rows that already have data-vmu-id. This
@@ -1484,7 +1544,7 @@
   // O(newly-added rows) — flat instead of quadratic over the whole scan.
   function markRowTrackData() {
     let marked = 0;
-    const rows = document.querySelectorAll('[data-testid="MusicTrackRow"]:not([data-vmu-id]), [class*="vkitAudioRow__root"]:not([data-vmu-id]), .AudioRow:not([data-vmu-id])');
+    const rows = document.querySelectorAll('[data-testid$="MusicTrackRow"]:not([data-vmu-id]), [class*="vkitAudioRow__root"]:not([data-vmu-id]), .AudioRow:not([data-vmu-id])');
     for (const row of rows) {
       try {
         const entity = findTrackEntityFromFiber(row);
@@ -1524,7 +1584,7 @@
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
       .find(m => m.getBoundingClientRect().width > 0);
     const container = modal || document;
-    const rows = container.querySelectorAll('[data-testid="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
+    const rows = container.querySelectorAll('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
 
     for (const row of rows) {
       try {
@@ -1637,7 +1697,69 @@
     return resolved;
   }
 
+  // ── Fast path: audio.get through VK's own web API client ──────────────────
+  // al_audio.php act=load_section is dead (ERR_105 / 0 items on all observed
+  // playlists in 2026), but VK's SPA exposes its API client on the React
+  // fiber of any mounted playlist component. audio.get returns full track
+  // objects (artist/title/url/duration) in chunks of 250, parallelized —
+  // ~3.5s for a 1000-track playlist vs ~40s of UI tail-loading.
+  let _vmuApiClient = null;
+  function resolveApiClient() {
+    if (_vmuApiClient) return _vmuApiClient;
+    const anchors = document.querySelectorAll(
+      '[data-testid="MusicPlaylistTracks_Items"], [data-testid="audiolistitems-list"], [data-testid$="MusicTrackRow"]');
+    for (const el of anchors) {
+      const fk = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+      if (!fk) continue;
+      let cur = el[fk];
+      for (let i = 0; i < 25 && cur; i++) {
+        const p = cur.memoizedProps || cur.pendingProps;
+        const client = p?.playlist?.audioApi?.apiClient || p?.audioApi?.apiClient;
+        if (client && typeof client.request === 'function') { _vmuApiClient = client; return client; }
+        cur = cur.return;
+      }
+    }
+    return null;
+  }
+
+  async function loadPlaylistViaAudioGet(ownerId, playlistId, accessHash) {
+    const client = resolveApiClient();
+    if (!client) return false;
+    const CHUNK = 250;
+    const POOL = 4;
+    const base = { owner_id: ownerId, playlist_id: playlistId, count: CHUNK, offset: 0 };
+    if (accessHash) base.access_key = accessHash;
+    let first;
+    try { first = await client.request('audio.get', base); }
+    catch (e) { console.warn('[vmu] audio.get failed:', e); return false; }
+    if (!first || !Array.isArray(first.items) || !first.items.length) return false;
+    first.items.forEach(tryEmitTrackObj);
+    const total = first.count || first.items.length;
+    // Fetch the rest in parallel pools, but emit strictly in offset order —
+    // dupe indices and result panels depend on playlist order.
+    const offsets = [];
+    for (let off = CHUNK; off < total; off += CHUNK) offsets.push(off);
+    for (let i = 0; i < offsets.length; i += POOL) {
+      const chunk = offsets.slice(i, i + POOL);
+      const datas = await Promise.all(chunk.map(off =>
+        client.request('audio.get', { ...base, offset: off })
+          .then(r => (r && r.items) || [])
+          .catch(e => { console.warn('[vmu] audio.get offset', off, 'failed:', e); return []; })
+      ));
+      datas.forEach(items => items.forEach(tryEmitTrackObj));
+    }
+    return true;
+  }
+
   async function loadPlaylistSections(ownerId, playlistId, accessHash) {
+    // Primary: audio.get via VK's SPA api client. Legacy al_audio below is a fallback.
+    try {
+      if (await loadPlaylistViaAudioGet(ownerId, playlistId, accessHash)) {
+        window.postMessage({ type: 'VKD_SECTIONS_DONE' }, '*');
+        return;
+      }
+    } catch (e) { console.warn('[vmu] audio.get path error:', e); }
+
     const BATCH = 50;
     const hash = window.__vmuHashes.load_section || window.__vmuHashes._page || getPageHashFromDOM();
     if (!hash) {
