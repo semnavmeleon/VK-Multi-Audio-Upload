@@ -121,7 +121,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false };
 
   function loadSettings() {
     try {
@@ -144,6 +144,7 @@
         contentOffsetX: settings.contentOffsetX,
         optimizeBigPlaylists: settings.optimizeBigPlaylists,
         hideScrollToTop: settings.hideScrollToTop,
+        pinTabsBar: settings.pinTabsBar,
       }));
     } catch {}
   }
@@ -287,6 +288,163 @@
     panel.classList.toggle('vmu-check-panel-left', needsFlip);
     panel.style.left = needsFlip ? margin + 'px' : '';
   }
+
+  // ─── audio catalog header: split + pin ─────────────────────────────────────
+  // VK renders the tabs/search header and whatever follows it (recently-played,
+  // the VK Mix banner, etc.) as one flat card:
+  // section[data-testid="AudioCatalog_Header"] > [headerlayout, search-wrapper, ...rest].
+  // Physically moving "...rest" into a separate element to make it *look* like
+  // its own card breaks React: confirmed live that switching tabs afterwards
+  // throws "NotFoundError: Failed to execute 'removeChild'" because React still
+  // expects those nodes under the original section. So neither feature below
+  // ever reparents a VK-owned node — only CSS (margin/position) on the nodes
+  // where they already live, plus brand-new decorative elements we own.
+  const AHS_RADIUS = 12, AHS_GAP = 4, AHS_TOTAL = AHS_RADIUS * 2 + AHS_GAP;
+
+  // Push anything after the header+search down by AHS_TOTAL and paint a
+  // page-background "notch" over the gap with concave corners, faking a
+  // second rounded card without touching VK's own DOM tree.
+  function applyAudioHeaderSplit() {
+    const sections = document.querySelectorAll('[data-testid="AudioCatalog_Header"]');
+    for (const section of sections) {
+      // Scoped to the recently-played block specifically (not any trailing
+      // content) — e.g. the "Слушать VK Микс" banner on the Главная tab sits
+      // in the same slot and should stay put.
+      const rest = section.querySelector(':scope > [data-testid="AudioCatalog_BlockHeaderRecentlyPlayed"]');
+      if (!rest) {
+        section.querySelectorAll(':scope > .vmu-split-mask').forEach(el => el.remove());
+        const prevRest = section.querySelector('.vmu-split-below');
+        if (prevRest) { prevRest.classList.remove('vmu-split-below'); prevRest.style.marginTop = ''; }
+        continue;
+      }
+      if (getComputedStyle(section).position === 'static') section.style.position = 'relative';
+      rest.classList.add('vmu-split-below');
+      rest.style.marginTop = AHS_TOTAL + 'px';
+
+      let masks = [...section.querySelectorAll(':scope > .vmu-split-mask')];
+      if (masks.length !== 5) {
+        masks.forEach(el => el.remove());
+        const mk = () => {
+          const d = document.createElement('div');
+          d.className = 'vmu-split-mask vmu-split-mask-corner';
+          return d;
+        };
+        const tl = mk(), tr = mk(), bl = mk(), br = mk();
+        tl.classList.add('vmu-split-mask-tl');
+        tr.classList.add('vmu-split-mask-tr');
+        bl.classList.add('vmu-split-mask-bl');
+        br.classList.add('vmu-split-mask-br');
+        const strip = document.createElement('div');
+        strip.className = 'vmu-split-mask vmu-split-mask-strip';
+        section.append(tl, tr, bl, br, strip);
+        masks = [tl, tr, bl, br, strip];
+      }
+
+      const bg = getComputedStyle(section).backgroundColor;
+      const [tl, tr, bl, br, strip] = masks;
+      for (const m of [tl, tr, bl, br]) m.style.setProperty('--vmu-split-bg', bg);
+      strip.style.background = bg;
+
+      const sTop = section.getBoundingClientRect().top;
+      const gapTop = rest.getBoundingClientRect().top - sTop - AHS_TOTAL;
+      tl.style.top = tr.style.top = strip.style.top = gapTop + 'px';
+      bl.style.top = br.style.top = (gapTop + AHS_RADIUS + AHS_GAP) + 'px';
+      strip.style.height = AHS_TOTAL + 'px';
+    }
+  }
+
+  // Pin the tabs row + search box under VK's fixed top bar so they stay
+  // visible for the whole page scroll, merged with the top bar (matching
+  // background, flush against it, no gap) once scrolled past their natural
+  // position. position:sticky was tried first but it's bounded by the tabs'
+  // own parent box — since that card is only ~300-400px tall, the bar
+  // unstuck and vanished as soon as the user scrolled past it into
+  // "Плейлисты"/"Музыканты" (confirmed live). Real position:fixed doesn't
+  // have that ceiling, but needs the sticky threshold reimplemented by hand
+  // (engage only once scrolled past the natural position — otherwise it'd be
+  // permanently glued to the top, leaving a dead gap where it used to sit)
+  // and the space it vacates reserved (padding-top on the section) only
+  // while engaged, so content doesn't jump.
+  function applyTabsBarPin() {
+    const sections = document.querySelectorAll('[data-testid="AudioCatalog_Header"]');
+    const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
+    const topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
+    // AudioPage_PlayerBlock (album art / transport controls under the nav
+    // bar) is VK's persistent mini-player — confirmed live it stays fixed at
+    // the same viewport position no matter how far you scroll. VK actually
+    // renders *two* instances sharing this testid (a normal-flow one that
+    // scrolls away, plus the fixed one that's actually on screen); querying
+    // just the first one picked the wrong copy and made the anchor collapse
+    // back too early, overlapping the real bar. Taking the max bottom across
+    // all matches always lands on whichever is actually visible.
+    let playerBottom = 0;
+    for (const pb of document.querySelectorAll('[data-testid="AudioPage_PlayerBlock"]')) {
+      playerBottom = Math.max(playerBottom, pb.getBoundingClientRect().bottom);
+    }
+    const anchor = Math.round(Math.max(48, topBarBottom, playerBottom));
+
+    for (const section of sections) {
+      const tabs = section.querySelector(':scope > [data-testid="headerlayout"]');
+      const search = section.children[1];
+      const isSearchWrap = search && search !== tabs && search.querySelector('[class*="vkuiSearch"]');
+      if (!tabs) continue;
+
+      const unpin = () => {
+        for (const el of [tabs, isSearchWrap ? search : null]) {
+          if (!el) continue;
+          el.classList.remove('vmu-tabs-pinned');
+          el.style.top = el.style.left = el.style.width = el.style.background = '';
+        }
+        section.style.paddingTop = '';
+      };
+
+      if (!settings.pinTabsBar) { unpin(); continue; }
+
+      // Capture tabs' natural (in-flow) offset from the section's top exactly
+      // once, before we ever touch its position — section.getBoundingClientRect().top
+      // stays valid as an anchor even once pinned (a fixed child doesn't move
+      // its parent), but tabs' own rect no longer reflects "where it would be"
+      // once it's position:fixed, so the offset has to be cached up front.
+      if (section.dataset.vmuTabsOffset === undefined) {
+        section.dataset.vmuTabsOffset = String(tabs.getBoundingClientRect().top - section.getBoundingClientRect().top);
+        section.dataset.vmuBasePadTop = String(parseFloat(getComputedStyle(section).paddingTop) || 0);
+      }
+      const tabsOffset = Number(section.dataset.vmuTabsOffset) || 0;
+      const naturalTabsViewportTop = section.getBoundingClientRect().top + tabsOffset;
+
+      if (naturalTabsViewportTop > anchor) { unpin(); continue; }
+
+      const basePad = Number(section.dataset.vmuBasePadTop) || 0;
+      const bg = getComputedStyle(section).backgroundColor;
+      const sRect = section.getBoundingClientRect(); // already reflects any active content-offset shift
+
+      tabs.classList.add('vmu-tabs-pinned');
+      tabs.style.left = sRect.left + 'px';
+      tabs.style.width = sRect.width + 'px';
+      tabs.style.top = anchor + 'px';
+      tabs.style.background = bg;
+      const tabsH = tabs.getBoundingClientRect().height;
+
+      let searchH = 0;
+      if (isSearchWrap) {
+        search.classList.add('vmu-tabs-pinned');
+        search.style.left = sRect.left + 'px';
+        search.style.width = sRect.width + 'px';
+        search.style.top = (anchor + tabsH) + 'px';
+        search.style.background = bg;
+        searchH = search.getBoundingClientRect().height;
+      }
+
+      section.style.paddingTop = (basePad + tabsH + searchH) + 'px';
+    }
+  }
+
+  function applyAudioCatalogLayout() {
+    applyAudioHeaderSplit();
+    applyTabsBarPin();
+  }
+  window.addEventListener('resize', applyAudioCatalogLayout);
+  window.addEventListener('scroll', () => { if (settings.pinTabsBar) applyTabsBarPin(); }, { passive: true });
 
   // ─── filename → meta parser ───────────────────────────────────────────────────
   function parseMetaFromFilename(filename) {
@@ -1498,6 +1656,17 @@
               <span class="vmu-toggle-track"></span>
             </label>
           </div>
+
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Закрепить панель вкладок</span>
+              <span class="vmu-setting-hint">«Моя музыка» / «Обзор» / поиск сливаются с верхней панелью при прокрутке</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-pin-tabs-toggle" ${settings.pinTabsBar ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
         </div>
 
         <div id="vmu-pl-status" style="display:none">
@@ -1547,6 +1716,15 @@
       });
     }
 
+    const pinTabsToggle = document.getElementById('vmu-pin-tabs-toggle');
+    if (pinTabsToggle) {
+      pinTabsToggle.addEventListener('change', () => {
+        settings.pinTabsBar = pinTabsToggle.checked;
+        saveSettings();
+        applyTabsBarPin();
+      });
+    }
+
     const optimizeToggle = document.getElementById('vmu-optimize-toggle');
     if (optimizeToggle) {
       optimizeToggle.addEventListener('change', () => {
@@ -1573,6 +1751,7 @@
         settings.contentOffsetX = v;
         if (offsetVal) offsetVal.textContent = (v > 0 ? '+' : '') + v + 'px';
         applyLayoutCustomizations();
+        if (settings.pinTabsBar) applyTabsBarPin();
       });
       offsetSlider.addEventListener('change', saveSettings);
     }
@@ -1584,6 +1763,7 @@
         if (offsetVal) offsetVal.textContent = '0px';
         saveSettings();
         applyLayoutCustomizations();
+        if (settings.pinTabsBar) applyTabsBarPin();
       });
     }
 
@@ -3702,6 +3882,9 @@
 
     // Inject single-track download buttons
     scanAndInjectDlBtns();
+
+    // Keep the audio catalog header split/pin in sync with VK's re-renders
+    applyAudioCatalogLayout();
   }
 
   // Coalesce mutation storms (scrolling a 1000-row playlist fires hundreds of

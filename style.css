@@ -968,6 +968,34 @@
 }
 /* Tooltip handled by portal #vmu-tooltip (showDlTooltip in content.js). */
 
+/* ── Audio catalog header: split + pin (content.js applyAudioHeaderSplit /
+   applyTabsBarPin). Geometry (top/height) is set inline per-instance since it
+   depends on live layout; only static shape/paint rules live here. ────────── */
+.vmu-split-mask {
+  position: absolute;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+.vmu-split-mask-corner {
+  width: 12px;
+  height: 12px;
+  left: auto;
+  right: auto;
+}
+.vmu-split-mask-tl { left: 0; background: radial-gradient(circle at bottom right, transparent 12px, var(--vmu-split-bg, #141414) 12px); }
+.vmu-split-mask-tr { right: 0; background: radial-gradient(circle at bottom left, transparent 12px, var(--vmu-split-bg, #141414) 12px); }
+.vmu-split-mask-bl { left: 0; background: radial-gradient(circle at top right, transparent 12px, var(--vmu-split-bg, #141414) 12px); }
+.vmu-split-mask-br { right: 0; background: radial-gradient(circle at top left, transparent 12px, var(--vmu-split-bg, #141414) 12px); }
+.vmu-split-mask-strip { left: 12px; right: 12px; }
+
+.vmu-tabs-pinned {
+  position: fixed !important;
+  box-sizing: border-box;
+  z-index: 100;
+}
+
 /* ── Slider (range input) used by the content-offset setting ─────────────── */
 .vmu-slider-row .vmu-setting-info { min-width: 0; flex: 1 1 auto; }
 .vmu-slider-wrap {
