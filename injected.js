@@ -2435,29 +2435,30 @@
     document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', start) : start();
   })();
 
-  // ── Audio FX: 10-band graphic EQ + AudioWorklet lookahead limiter on VK's
-  // <audio> playback ────────────────────────────────────────────────────────
+  // ── Audio FX: 10-band graphic EQ + compressor + AudioWorklet lookahead
+  // limiter on VK's <audio> playback ─────────────────────────────────────────
   // createMediaElementSource() can only ever be called once per <audio> element
   // (throws InvalidStateError on a second call) and permanently reroutes that
   // element's output through the Web Audio graph — so the graph is only built
   // the first time the feature is turned on, and "disabling" it afterwards
-  // means driving the same nodes to neutral (unity gain, 0dB EQ, no reduction)
+  // means driving the same node to neutral (unity gain, 0dB EQ, no reduction)
   // rather than tearing anything down.
   //
-  // The limiter itself lives in limiter-worklet.js (registered as
-  // 'vmu-limiter') rather than using the native DynamicsCompressorNode —
-  // that's a soft compressor with no output guarantee; the worklet does real
-  // lookahead (gain computed from the live signal, applied to a delayed copy)
-  // plus a hard ceiling clamp, which is what makes a limiter a limiter.
+  // ALL processing — EQ, compressor and limiter, in a user-selectable order
+  // (fx.chainOrder) — lives inside the single 'vmu-limiter' worklet node from
+  // limiter-worklet.js. The EQ moved in there from native BiquadFilterNodes so
+  // reordering never has to splice the Web Audio graph (glitch-free, and lets
+  // the EQ sit between the two dynamics stages); band gains travel as
+  // AudioParams band0..band9.
   (function () {
     const EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
     let ctx = null;
-    // Independent bypass switches — limiterEnabled drives the worklet's own
-    // `enabled` param (threshold/ratio/knee/ceiling/attack/release/input-
-    // output gain/auto gain all bypass together with it), eqEnabled zeroes
-    // the 10 band gains. Either can be on while the other is off.
+    // Independent bypass switches for the worklet's three stages —
+    // limiterEnabled drives the `enabled` param (limiter stage), compEnabled
+    // the compressor stage, eqEnabled the EQ stage. Any combination.
     let limiterEnabled = false;
+    let compEnabled = false;
     let eqEnabled = false;
     let meteringActive = false; // transient — true only while content.js's Метринг tab is the open tab
     let workletUrl = null;
@@ -2467,12 +2468,14 @@
     let lastTruePeakDb = null;
     let lastMomentaryLufs = null, lastShortTermLufs = null, lastIntegratedLufs = null, lastLra = null;
     let lastAutoGainTrimDb = null;
+    let lastLimMeterDb = 0;
     const fx = {
       threshold: -3, ratio: 4, inputGain: 0, outputGain: 0, attack: 3, release: 250,
-      knee: 0, ceiling: -0.3, ceilingR: -0.3, style: 3, autoRelease: false, truePeakMode: false, autoGain: false,
-      oversampling: 1, processingMode: 0, bands: EQ_FREQS.map(() => 0),
+      knee: 0, ceiling: -0.3, ceilingR: -0.3, limRelease: 50, style: 3, autoRelease: false,
+      truePeakMode: false, autoGain: false, oversampling: 1, processingMode: 0, chainOrder: 0,
+      bands: EQ_FREQS.map(() => 0),
     };
-    const graphs = new WeakMap(); // audioEl -> { bands, limiter }
+    const graphs = new WeakMap(); // audioEl -> { limiter }
     const attachedEls = new Set();
 
     function ensureCtx() {
@@ -2498,9 +2501,12 @@
     }
 
     function applyToGraph(g) {
-      g.bands.forEach((b, i) => { b.gain.value = eqEnabled ? (fx.bands[i] || 0) : 0; });
       const lim = g.limiter;
       setParam(lim, 'enabled', limiterEnabled ? 1 : 0);
+      setParam(lim, 'compEnabled', compEnabled ? 1 : 0);
+      setParam(lim, 'eqEnabled', eqEnabled ? 1 : 0);
+      setParam(lim, 'chainOrder', fx.chainOrder);
+      fx.bands.forEach((gDb, i) => setParam(lim, 'band' + i, gDb || 0));
       setParam(lim, 'threshold', fx.threshold);
       setParam(lim, 'ratio', fx.ratio);
       setParam(lim, 'attack', fx.attack);
@@ -2508,6 +2514,7 @@
       setParam(lim, 'knee', fx.knee);
       setParam(lim, 'ceiling', fx.ceiling);
       setParam(lim, 'ceilingR', fx.ceilingR);
+      setParam(lim, 'limRelease', fx.limRelease);
       setParam(lim, 'inputGain', fx.inputGain);
       setParam(lim, 'outputGain', fx.outputGain);
       setParam(lim, 'style', fx.style);
@@ -2530,17 +2537,13 @@
       const c = ensureCtx();
       await ensureWorklet();
       const source = c.createMediaElementSource(el);
-      const bands = EQ_FREQS.map(freq => {
-        const f = c.createBiquadFilter();
-        f.type = 'peaking';
-        f.frequency.value = freq;
-        f.Q.value = 1.41;
-        return f;
-      });
+      // The whole chain (EQ/comp/limiter, reorderable) lives inside the one
+      // worklet node — see the block comment above.
       const limiter = new AudioWorkletNode(c, 'vmu-limiter');
       limiter.port.onmessage = e => {
         if (e.data && e.data.type === 'meter') {
           lastMeterDb = e.data.reductionDb;
+          lastLimMeterDb = e.data.limReductionDb;
           lastInputPeakDb = e.data.inputPeakDb;
           lastTruePeakDb = e.data.truePeakDb;
           lastMomentaryLufs = e.data.momentaryLufs;
@@ -2550,7 +2553,8 @@
           lastAutoGainTrimDb = e.data.autoGainTrimDb;
           window.postMessage({
             type: 'VMU_AUDIOFX_METER',
-            reductionDb: lastMeterDb, inputPeakDb: lastInputPeakDb, truePeakDb: lastTruePeakDb,
+            reductionDb: lastMeterDb, limReductionDb: lastLimMeterDb,
+            inputPeakDb: lastInputPeakDb, truePeakDb: lastTruePeakDb,
             momentaryLufs: lastMomentaryLufs, shortTermLufs: lastShortTermLufs,
             integratedLufs: lastIntegratedLufs, lra: lastLra,
             autoGainTrimDb: lastAutoGainTrimDb,
@@ -2558,12 +2562,10 @@
         }
       };
 
-      let node = source;
-      for (const band of bands) { node.connect(band); node = band; }
-      node.connect(limiter);
+      source.connect(limiter);
       limiter.connect(c.destination);
 
-      return { bands, limiter };
+      return { limiter };
     }
 
     function attachFx(el) {
@@ -2590,7 +2592,7 @@
     const origPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
       lastAudioEl = this;
-      if (limiterEnabled || eqEnabled) attachFx(this);
+      if (limiterEnabled || compEnabled || eqEnabled) attachFx(this);
       return origPlay.apply(this, args);
     };
 
@@ -2613,8 +2615,9 @@
         return;
       }
       if (e.data.type !== 'VMU_AUDIOFX_SET') return;
-      const wasActive = limiterEnabled || eqEnabled;
+      const wasActive = limiterEnabled || compEnabled || eqEnabled;
       limiterEnabled = !!e.data.limiterEnabled;
+      compEnabled = !!e.data.compEnabled;
       eqEnabled = !!e.data.eqEnabled;
       fx.threshold = Number(e.data.threshold) || 0;
       fx.ratio = Math.max(1, Number(e.data.ratio) || 1);
@@ -2625,18 +2628,21 @@
       fx.knee = Math.max(0, Number(e.data.knee) || 0);
       fx.ceiling = Number(e.data.ceiling) || 0;
       fx.ceilingR = Number(e.data.ceilingR) || 0;
+      const limRel = Number(e.data.limRelease);
+      fx.limRelease = isFinite(limRel) && limRel > 0 ? limRel : 50;
       fx.style = Math.max(0, Math.min(6, Math.round(Number(e.data.style)) || 0));
       fx.autoRelease = !!e.data.autoRelease;
       fx.truePeakMode = !!e.data.truePeak;
       fx.oversampling = Math.max(0, Math.min(3, Math.round(Number(e.data.oversampling)) || 0));
       fx.autoGain = !!e.data.autoGain;
       fx.processingMode = Math.max(0, Math.min(2, Math.round(Number(e.data.processingMode)) || 0));
+      fx.chainOrder = Math.max(0, Math.min(5, Math.round(Number(e.data.chainOrder)) || 0));
       if (Array.isArray(e.data.bands)) fx.bands = e.data.bands.map(v => Number(v) || 0);
 
       // Attach to whatever's already playing right away, instead of waiting
       // for the next play()/track change, so toggling either switch takes
       // effect immediately on the current track.
-      const nowActive = limiterEnabled || eqEnabled;
+      const nowActive = limiterEnabled || compEnabled || eqEnabled;
       if (nowActive && !wasActive && lastAudioEl) attachFx(lastAudioEl);
       applyToAll();
     });
@@ -2651,14 +2657,16 @@
       if (!g) return null;
       const val = name => g.limiter.parameters.get(name)?.value;
       return {
-        limiterEnabled, eqEnabled,
+        limiterEnabled, compEnabled, eqEnabled,
+        chainOrder: val('chainOrder'),
         threshold: val('threshold'), ratio: val('ratio'), attack: val('attack'), release: val('release'),
-        knee: val('knee'), ceiling: val('ceiling'), ceilingR: val('ceilingR'), inputGain: val('inputGain'), outputGain: val('outputGain'),
+        knee: val('knee'), ceiling: val('ceiling'), ceilingR: val('ceilingR'), limRelease: val('limRelease'),
+        inputGain: val('inputGain'), outputGain: val('outputGain'),
         style: val('style'), autoRelease: val('autoRelease'), truePeakMode: val('truePeakMode'), oversampling: val('oversampling'),
         meteringActive: val('meteringActive'), autoGain: val('autoGain'), processingMode: val('processingMode'),
-        lastMeterDb, lastInputPeakDb, lastTruePeakDb,
+        lastMeterDb, lastLimMeterDb, lastInputPeakDb, lastTruePeakDb,
         lastMomentaryLufs, lastShortTermLufs, lastIntegratedLufs, lastLra, lastAutoGainTrimDb,
-        bands: g.bands.map(b => b.gain.value),
+        bands: EQ_FREQS.map((_, i) => val('band' + i)),
         ctxState: ctx && ctx.state,
       };
     });

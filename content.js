@@ -130,7 +130,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, audioFxLimiterEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxActiveTab: 'limiter', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'limiter', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -139,6 +139,12 @@
   const AUDIOFX_STYLE_KNEE_SHAPES = [3.0, 2.5, 2.0, 2.0, 1.6, 1.3, 1.0];
   const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   const AUDIOFX_OVERSAMPLE_LABELS = ['2x', '4x', '8x', '16x'];
+  // Label i must describe limiter-worklet.js's CHAIN_ORDERS[i] — the dropdown
+  // index is sent as the worklet's chainOrder param verbatim. Keep in sync.
+  const AUDIOFX_CHAIN_ORDER_LABELS = [
+    'EQ → Комп → Лим', 'EQ → Лим → Комп', 'Комп → EQ → Лим',
+    'Комп → Лим → EQ', 'Лим → EQ → Комп', 'Лим → Комп → EQ',
+  ];
   // Single source of truth for "what counts as an audio-FX sound parameter" —
   // saveSettings()'s whitelist and preset snapshots both iterate this list,
   // so a new limiter/EQ field only ever needs adding here once. (Deliberately
@@ -146,9 +152,9 @@
   // are UI/meta navigation state, not sound parameters, so presets don't
   // touch them.)
   const AUDIOFX_FIELD_KEYS = [
-    'audioFxLimiterEnabled', 'audioFxEqEnabled', 'audioFxThreshold', 'audioFxRatio', 'audioFxInputGain', 'audioFxOutputGain',
-    'audioFxAttack', 'audioFxRelease', 'audioFxKnee', 'audioFxCeiling', 'audioFxCeilingR', 'audioFxStyle',
-    'audioFxAutoRelease', 'audioFxTruePeak', 'audioFxOversampling', 'audioFxAutoGain', 'audioFxProcessingMode', 'audioFxBands',
+    'audioFxLimiterEnabled', 'audioFxCompEnabled', 'audioFxEqEnabled', 'audioFxThreshold', 'audioFxRatio', 'audioFxInputGain', 'audioFxOutputGain',
+    'audioFxAttack', 'audioFxRelease', 'audioFxKnee', 'audioFxCeiling', 'audioFxCeilingR', 'audioFxLimRelease', 'audioFxStyle',
+    'audioFxAutoRelease', 'audioFxTruePeak', 'audioFxOversampling', 'audioFxAutoGain', 'audioFxProcessingMode', 'audioFxChainOrder', 'audioFxBands',
   ];
   const AUDIOFX_PRESETS_KEY = 'vmu_audiofx_presets_v1';
 
@@ -166,6 +172,15 @@
           && parsed.audioFxLimiterEnabled === undefined && parsed.audioFxEqEnabled === undefined) {
           settings.audioFxLimiterEnabled = parsed.audioFxEnabled;
           settings.audioFxEqEnabled = parsed.audioFxEnabled;
+        }
+        // Migrates blobs saved before the compressor/limiter stage split:
+        // the old single "Лимитер" toggle drove both the compression
+        // envelope and the ceiling, so it seeds the new compressor toggle
+        // too. A/B slots persist full snapshots — normalize those the same
+        // way so switching to an old slot doesn't zero the new fields.
+        if (parsed.audioFxCompEnabled === undefined) settings.audioFxCompEnabled = settings.audioFxLimiterEnabled;
+        for (const slot of ['A', 'B']) {
+          if (settings.audioFxAB && settings.audioFxAB[slot]) normalizeFxSnapshot(settings.audioFxAB[slot]);
         }
       }
     } catch {}
@@ -223,6 +238,16 @@
   // tags} instead. These three accessors read through either shape so
   // presets saved before this change keep working untouched.
   function presetSettingsOf(entry) { return entry && entry.settings ? entry.settings : entry; }
+  // Fills the stage-split fields into a snapshot saved before they existed
+  // (old presets / A-B slots), mutating it in place: the old "Лимитер"
+  // toggle covered the compression too, so it seeds audioFxCompEnabled.
+  function normalizeFxSnapshot(snap) {
+    if (!snap) return snap;
+    if (snap.audioFxCompEnabled === undefined) snap.audioFxCompEnabled = !!snap.audioFxLimiterEnabled;
+    if (snap.audioFxLimRelease === undefined) snap.audioFxLimRelease = 50;
+    if (snap.audioFxChainOrder === undefined) snap.audioFxChainOrder = 0;
+    return snap;
+  }
   function presetCategoryOf(entry) { return (entry && entry.category) || 'Без категории'; }
   function presetTagsOf(entry) { return (entry && Array.isArray(entry.tags)) ? entry.tags : []; }
 
@@ -232,6 +257,7 @@
     window.postMessage({
       type: 'VMU_AUDIOFX_SET',
       limiterEnabled: settings.audioFxLimiterEnabled,
+      compEnabled: settings.audioFxCompEnabled,
       eqEnabled: settings.audioFxEqEnabled,
       threshold: settings.audioFxThreshold,
       ratio: settings.audioFxRatio,
@@ -242,12 +268,14 @@
       knee: settings.audioFxKnee,
       ceiling: settings.audioFxCeiling,
       ceilingR: settings.audioFxCeilingR,
+      limRelease: settings.audioFxLimRelease,
       style: settings.audioFxStyle,
       autoRelease: settings.audioFxAutoRelease,
       truePeak: settings.audioFxTruePeak,
       oversampling: settings.audioFxOversampling,
       autoGain: settings.audioFxAutoGain,
       processingMode: settings.audioFxProcessingMode,
+      chainOrder: settings.audioFxChainOrder,
       bands: settings.audioFxBands,
     }, '*');
   }
@@ -270,7 +298,7 @@
   // block maxima with no smoothing at the source (unlike gain reduction,
   // which is already envelope-smoothed inside the worklet).
   const meterRaw = {
-    reductionDb: 0, inputPeakDb: null, truePeakDb: null,
+    reductionDb: 0, limReductionDb: 0, inputPeakDb: null, truePeakDb: null,
     momentaryLufs: null, shortTermLufs: null, integratedLufs: null, lra: null,
     autoGainTrimDb: null,
   };
@@ -288,6 +316,7 @@
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data || e.data.type !== 'VMU_AUDIOFX_METER') return;
     meterRaw.reductionDb = Number(e.data.reductionDb) || 0;
+    meterRaw.limReductionDb = Number(e.data.limReductionDb) || 0;
     meterRaw.inputPeakDb = typeof e.data.inputPeakDb === 'number' ? e.data.inputPeakDb : null;
     meterRaw.truePeakDb = typeof e.data.truePeakDb === 'number' ? e.data.truePeakDb : null;
     meterRaw.momentaryLufs = e.data.momentaryLufs;
@@ -389,11 +418,12 @@
     }
     ctx.stroke();
 
-    // Live operating point: measured input peak vs. measured reduction —
-    // the actual current point on the curve, not the theoretical one.
-    if (typeof meterRaw.inputPeakDb === 'number' && settings.audioFxLimiterEnabled) {
+    // Live operating point: measured input peak vs. measured reduction
+    // (both stages) — the actual current point on the curve, not the
+    // theoretical one.
+    if (typeof meterRaw.inputPeakDb === 'number' && (settings.audioFxCompEnabled || settings.audioFxLimiterEnabled)) {
       const inDb = meterDisp.inputPeakDb;
-      const outDb = Math.min(inDb - meterRaw.reductionDb, settings.audioFxCeiling);
+      const outDb = Math.min(inDb - meterRaw.reductionDb - meterRaw.limReductionDb, settings.audioFxCeiling);
       ctx.fillStyle = '#ffffff';
       ctx.beginPath();
       ctx.arc(xOf(inDb), yOf(outDb), 3, 0, Math.PI * 2);
@@ -468,6 +498,12 @@
     if (fill) fill.style.width = Math.max(0, Math.min(100, (db / 24) * 100)) + '%';
     if (val) val.textContent = '-' + db.toFixed(1) + ' дБ';
 
+    const limDb = meterRaw.limReductionDb;
+    const limFill = document.getElementById('vmu-fx-limmeter-fill');
+    const limVal = document.getElementById('vmu-fx-limmeter-val');
+    if (limFill) limFill.style.width = Math.max(0, Math.min(100, (limDb / 24) * 100)) + '%';
+    if (limVal) limVal.textContent = '-' + limDb.toFixed(1) + ' дБ';
+
     const tpFill = document.getElementById('vmu-fx-tp-fill');
     const tpVal = document.getElementById('vmu-fx-tp-val');
     if (meterRaw.truePeakDb !== null) {
@@ -495,7 +531,9 @@
       agVal.textContent = typeof ag === 'number' ? (ag >= 0 ? '+' : '') + ag.toFixed(1) + ' дБ' : '0.0 дБ';
     }
 
-    meterHistory.push({ t: nowMs, inputDb: meterRaw.inputPeakDb, reductionDb: db, truePeakDb: meterRaw.truePeakDb });
+    // History plots the total dynamics reduction — compressor + limiter
+    // stages together, which is what "how much is being taken off" means.
+    meterHistory.push({ t: nowMs, inputDb: meterRaw.inputPeakDb, reductionDb: db + limDb, truePeakDb: meterRaw.truePeakDb });
     const cutoff = nowMs - HISTORY_SECONDS * 1000;
     while (meterHistory.length && meterHistory[0].t < cutoff) meterHistory.shift();
 
@@ -792,7 +830,7 @@
           </div>
         </div>
         <div class="vmu-audiofx-tabs" id="vmu-audiofx-tabs" role="tablist">
-          <button type="button" data-vmu-fxtab="limiter" class="${isTab('limiter')}">Лимитер</button>
+          <button type="button" data-vmu-fxtab="limiter" class="${isTab('limiter')}">Динамика</button>
           <button type="button" data-vmu-fxtab="eq" class="${isTab('eq')}">EQ</button>
           <button type="button" data-vmu-fxtab="metering" class="${isTab('metering')}">Метринг</button>
         </div>
@@ -801,10 +839,20 @@
             <div class="vmu-audiofx-section">
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Лимитер</span>
+                  <span class="vmu-setting-label">Цепочка</span>
+                  <span class="vmu-setting-hint">Порядок стадий обработки</span>
+                </div>
+                ${buildDropdownHtml('vmu-fx-chain-dd', AUDIOFX_CHAIN_ORDER_LABELS, settings.audioFxChainOrder)}
+              </div>
+              ${limiterRow('vmu-fx-input', 'Input', -24, 24, 0.5, settings.audioFxInputGain, ' дБ')}
+              ${limiterRow('vmu-fx-output', 'Output', -24, 24, 0.5, settings.audioFxOutputGain, ' дБ')}
+              <div class="vmu-audiofx-section-title">Компрессор</div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Компрессор</span>
                 </div>
                 <label class="vmu-toggle">
-                  <input type="checkbox" id="vmu-fx-limiter-enable" ${settings.audioFxLimiterEnabled ? 'checked' : ''}>
+                  <input type="checkbox" id="vmu-fx-comp-enable" ${settings.audioFxCompEnabled ? 'checked' : ''}>
                   <span class="vmu-toggle-track"></span>
                 </label>
               </div>
@@ -836,25 +884,8 @@
               </div>
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">True Peak</span>
-                  <span class="vmu-setting-hint">Учитывать межсэмпловые пики при детекции</span>
-                </div>
-                <label class="vmu-toggle">
-                  <input type="checkbox" id="vmu-fx-truepeak" ${settings.audioFxTruePeak ? 'checked' : ''}>
-                  <span class="vmu-toggle-track"></span>
-                </label>
-              </div>
-              <div class="vmu-setting-row">
-                <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Oversampling</span>
-                  <span class="vmu-setting-hint">Кратность передискретизации для True Peak</span>
-                </div>
-                ${buildDropdownHtml('vmu-fx-oversampling-dd', AUDIOFX_OVERSAMPLE_LABELS, settings.audioFxOversampling)}
-              </div>
-              <div class="vmu-setting-row">
-                <div class="vmu-setting-info">
                   <span class="vmu-setting-label">Auto Gain</span>
-                  <span class="vmu-setting-hint">Компенсирует громкость лимитера для честного A/B — приближение, не точный LUFS-матчинг</span>
+                  <span class="vmu-setting-hint">Компенсирует громкость компрессора для честного A/B — приближение, не точный LUFS-матчинг</span>
                 </div>
                 <span class="vmu-slider-value" id="vmu-fx-autogain-val" style="margin-right:8px">0.0 дБ</span>
                 <label class="vmu-toggle">
@@ -873,6 +904,41 @@
               ${limiterRow('vmu-fx-threshold', 'Threshold', -60, 0, 1, settings.audioFxThreshold, ' дБ')}
               ${limiterRow('vmu-fx-ratio', 'Ratio', 1, 20, 0.5, settings.audioFxRatio, ':1')}
               ${limiterRow('vmu-fx-knee', 'Knee', 0, 40, 1, settings.audioFxKnee, ' дБ')}
+              ${limiterRow('vmu-fx-attack', 'Attack', 0, 100, 1, settings.audioFxAttack, ' мс')}
+              ${limiterRow('vmu-fx-release', 'Release', 0, 1000, 5, settings.audioFxRelease, ' мс')}
+              <div class="vmu-audiofx-section-title">Лимитер</div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Лимитер</span>
+                  <span class="vmu-setting-hint">Brick-wall с собственной огибающей; атака фиксирована lookahead-ом (5 мс)</span>
+                </div>
+                <label class="vmu-toggle">
+                  <input type="checkbox" id="vmu-fx-limiter-enable" ${settings.audioFxLimiterEnabled ? 'checked' : ''}>
+                  <span class="vmu-toggle-track"></span>
+                </label>
+              </div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">True Peak</span>
+                  <span class="vmu-setting-hint">Лимитировать по межсэмпловым пикам, а не только по сэмплам</span>
+                </div>
+                <label class="vmu-toggle">
+                  <input type="checkbox" id="vmu-fx-truepeak" ${settings.audioFxTruePeak ? 'checked' : ''}>
+                  <span class="vmu-toggle-track"></span>
+                </label>
+              </div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Oversampling</span>
+                  <span class="vmu-setting-hint">Кратность передискретизации для True Peak</span>
+                </div>
+                ${buildDropdownHtml('vmu-fx-oversampling-dd', AUDIOFX_OVERSAMPLE_LABELS, settings.audioFxOversampling)}
+              </div>
+              <div class="vmu-audiofx-meter-row">
+                <span class="vmu-audiofx-meter-label">Gain Reduction</span>
+                <div class="vmu-audiofx-meter"><div class="vmu-audiofx-meter-fill" id="vmu-fx-limmeter-fill"></div></div>
+                <span class="vmu-audiofx-meter-val" id="vmu-fx-limmeter-val">0.0 дБ</span>
+              </div>
               ${limiterRow('vmu-fx-ceiling', 'Ceiling', -20, 0, 0.1, settings.audioFxCeiling, ' дБ')}
               <div class="vmu-setting-row vmu-slider-row" id="vmu-fx-ceilingr-row" style="${settings.audioFxProcessingMode === 1 ? '' : 'display:none'}">
                 <div class="vmu-setting-info">
@@ -885,10 +951,7 @@
                   <button type="button" id="vmu-fx-ceilingr-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
                 </div>
               </div>
-              ${limiterRow('vmu-fx-input', 'Input', -24, 24, 0.5, settings.audioFxInputGain, ' дБ')}
-              ${limiterRow('vmu-fx-output', 'Output', -24, 24, 0.5, settings.audioFxOutputGain, ' дБ')}
-              ${limiterRow('vmu-fx-attack', 'Attack', 0, 100, 1, settings.audioFxAttack, ' мс')}
-              ${limiterRow('vmu-fx-release', 'Release', 0, 1000, 5, settings.audioFxRelease, ' мс')}
+              ${limiterRow('vmu-fx-limrelease', 'Release', 1, 1000, 1, settings.audioFxLimRelease, ' мс')}
             </div>
           </div>
           <div class="vmu-audiofx-tabpage${isTab('eq')}" data-vmu-fxtab-page="eq"${pageDisplay('eq')}>
@@ -954,6 +1017,7 @@
   function refreshAllAudioFxControls() {
     const setChecked = (id, val) => { const el = document.getElementById(id); if (el) el.checked = !!val; };
     setChecked('vmu-fx-limiter-enable', settings.audioFxLimiterEnabled);
+    setChecked('vmu-fx-comp-enable', settings.audioFxCompEnabled);
     setChecked('vmu-fx-eq-enable', settings.audioFxEqEnabled);
     setChecked('vmu-fx-autorelease', settings.audioFxAutoRelease);
     setChecked('vmu-fx-truepeak', settings.audioFxTruePeak);
@@ -961,6 +1025,7 @@
 
     syncCustomDropdown('vmu-fx-style-dd', AUDIOFX_STYLE_NAMES, settings.audioFxStyle);
     syncCustomDropdown('vmu-fx-oversampling-dd', AUDIOFX_OVERSAMPLE_LABELS, settings.audioFxOversampling);
+    syncCustomDropdown('vmu-fx-chain-dd', AUDIOFX_CHAIN_ORDER_LABELS, settings.audioFxChainOrder);
 
     const procSwitch = document.getElementById('vmu-fx-procmode');
     if (procSwitch) {
@@ -990,6 +1055,7 @@
       ['vmu-fx-output', 'audioFxOutputGain', v => v + ' дБ'],
       ['vmu-fx-attack', 'audioFxAttack', v => v + ' мс'],
       ['vmu-fx-release', 'audioFxRelease', v => v + ' мс'],
+      ['vmu-fx-limrelease', 'audioFxLimRelease', v => v + ' мс'],
     ];
     for (const [id, key, fmt] of sliderFields) {
       const slider = document.getElementById(id);
@@ -1077,7 +1143,9 @@
       const presets = loadAudioFxPresets();
       const entry = presets[name];
       if (!entry) return;
-      Object.assign(settings, presetSettingsOf(entry));
+      // Copy before normalizing so presets saved pre-stage-split don't get
+      // mutated in storage, just read through with the new fields filled in.
+      Object.assign(settings, normalizeFxSnapshot(Object.assign({}, presetSettingsOf(entry))));
       settings.audioFxCurrentPreset = name;
       saveSettings();
       refreshAllAudioFxControls();
@@ -1280,6 +1348,14 @@
         postAudioFxState();
       });
     }
+    const compEnableToggle = document.getElementById('vmu-fx-comp-enable');
+    if (compEnableToggle) {
+      compEnableToggle.addEventListener('change', () => {
+        settings.audioFxCompEnabled = compEnableToggle.checked;
+        saveSettings();
+        postAudioFxState();
+      });
+    }
     const eqEnableToggle = document.getElementById('vmu-fx-eq-enable');
     if (eqEnableToggle) {
       eqEnableToggle.addEventListener('change', () => {
@@ -1315,6 +1391,12 @@
 
     initCustomDropdown('vmu-fx-oversampling-dd', idx => {
       settings.audioFxOversampling = idx;
+      saveSettings();
+      postAudioFxState();
+    });
+
+    initCustomDropdown('vmu-fx-chain-dd', idx => {
+      settings.audioFxChainOrder = idx;
       saveSettings();
       postAudioFxState();
     });
@@ -1389,6 +1471,7 @@
     limiterField('vmu-fx-output', 'audioFxOutputGain', v => v + ' дБ');
     limiterField('vmu-fx-attack', 'audioFxAttack', v => v + ' мс');
     limiterField('vmu-fx-release', 'audioFxRelease', v => v + ' мс');
+    limiterField('vmu-fx-limrelease', 'audioFxLimRelease', v => v + ' мс');
 
     // Meter painting itself is handled by the module-level rAF loop
     // (startMeterLoop/paintMeters) — see the "audio FX metering" block above,

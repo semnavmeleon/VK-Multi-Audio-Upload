@@ -1,48 +1,111 @@
-// True lookahead brick-wall limiter, running off the main thread via AudioWorklet.
-// Unlike DynamicsCompressorNode (a soft compressor with no output guarantee), this:
-//  - detects peaks on the live signal but applies gain to a delayed copy (lookahead),
-//    so the gain has already ramped down before the loud transient reaches the output
-//    instead of reacting after the fact;
-//  - stereo-links the gain reduction (driven by the loudest channel) to avoid image shift;
-//  - hard-clamps the final output to `ceiling` regardless of envelope lag, guaranteeing
-//    no sample ever exceeds it — the actual "brick wall" a real limiter promises.
+// Three-stage audio FX chain in a single AudioWorklet node, running off the
+// main thread: 10-band peaking EQ → program compressor → true lookahead
+// brick-wall limiter, in any of six stage orders (`chainOrder` param).
 //
-// STYLE_PRESETS parameterize a family of limiting characters (Transparent/Dynamic/
-// Punchy/Allround/Modern/Bus/Safe), each a tuple of:
+// Historically this node was "compressor with a hard clamp pretending to be a
+// limiter": one envelope driven by threshold/ratio, and the ceiling enforced
+// only by clipping whatever the envelope missed. Split apart because that
+// design (a) hard-clipped audibly whenever the compressor was set slow/gentle,
+// (b) fused the two stages so nothing could ever be inserted between or
+// reordered around them. Now:
+//
+//  - EQ: RBJ-cookbook peaking biquads (the same formula BiquadFilterNode is
+//    specced to implement, Q=1.41) — moved inside the worklet from native
+//    BiquadFilterNodes so the chain order can put the EQ anywhere, including
+//    between the two dynamics stages. Band gains smooth over ~40ms before
+//    coefficient redesign, so slider drags don't zipper.
+//  - Compressor: the original envelope compressor unchanged in character —
+//    threshold/ratio/knee/styles/auto-release/auto-gain, Linked/Unlinked/M-S.
+//    Detection and gain application now happen on the same sample (the 5ms
+//    lookahead was moved wholesale into the limiter stage, where it earns its
+//    latency) and the compressor has no ceiling duty at all.
+//  - Limiter: a real brick-wall stage with its own envelope — infinite-ratio
+//    detection against `ceiling`, attack time constant hard-tied to the 5ms
+//    lookahead (τ = lookahead·0.25, so the envelope is ~98% converged by the
+//    time the transient exits the delay line — no user attack knob to
+//    mis-set), release from `limRelease`. With truePeakMode on, the detector
+//    runs on the polyphase-FIR inter-sample peak estimate, so the envelope
+//    targets true peaks rather than sample peaks. The envelope also
+//    pre-compensates for `outputGain` applied after the chain, so "ceiling"
+//    keeps meaning the level at the node's output. A final sample-domain
+//    safety clamp still guarantees the hard ceiling — but it now only trims
+//    the residual fractions of a dB the envelope misses, instead of doing all
+//    the limiting.
+//
+// STYLE_PRESETS parameterize a family of compression characters (Transparent/
+// Dynamic/Punchy/Allround/Modern/Bus/Safe), each a tuple of:
 //  - kneeShape: knee curve exponent. The knee region uses
 //      halfKnee * (x/knee)^kneeShape * (1 - 1/ratio),  x = over + halfKnee
-//    which — unlike a naive Math.pow(x,p)/(p*knee^(p-1)) generalization — is
-//    engineered to always equal the original quadratic formula's value at both
-//    knee boundaries (x=0 and x=knee) for ANY kneeShape, and reduces to exactly
-//    today's (x*x)/(2*knee) formula at kneeShape=2. This is what makes Allround
-//    (kneeShape 2, detectorMix 1, releaseFastWeight 0) byte-identical to the
-//    pre-style-system behavior — required, since this limiter already ships.
+//    which is engineered to always equal the original quadratic formula's
+//    value at both knee boundaries (x=0 and x=knee) for ANY kneeShape, and
+//    reduces to exactly the (x*x)/(2*knee) formula at kneeShape=2.
 //  - detectorMix: blend between the instantaneous peak and a cheap leaky-RMS
-//    estimate (1.0 = pure peak, today's exact detector).
+//    estimate (1.0 = pure peak).
 //  - attackMult: multiplier on the user's attack-time slider.
 //  - releaseFastWeight: how much a fast (0.15x user release time) release
-//    segment blends into the release coefficient (0 = pure user-set release,
-//    today's exact behavior) — gives Punchy/Dynamic's snappier recovery.
+//    segment blends into the release coefficient (0 = pure user-set release)
+//    — gives Punchy/Dynamic's snappier recovery.
 const STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
 const STYLE_PRESETS = [
   { kneeShape: 3.0, detectorMix: 0.4, attackMult: 1.0, releaseFastWeight: 0.3 }, // Transparent
   { kneeShape: 2.5, detectorMix: 0.5, attackMult: 1.0, releaseFastWeight: 0.6 }, // Dynamic
   { kneeShape: 2.0, detectorMix: 0.6, attackMult: 1.2, releaseFastWeight: 0.7 }, // Punchy
-  { kneeShape: 2.0, detectorMix: 1.0, attackMult: 1.0, releaseFastWeight: 0.0 }, // Allround (= today exactly)
+  { kneeShape: 2.0, detectorMix: 1.0, attackMult: 1.0, releaseFastWeight: 0.0 }, // Allround
   { kneeShape: 1.6, detectorMix: 0.85, attackMult: 0.8, releaseFastWeight: 0.2 }, // Modern
   { kneeShape: 1.3, detectorMix: 0.95, attackMult: 1.0, releaseFastWeight: 0.1 }, // Bus
   { kneeShape: 1.0, detectorMix: 1.0, attackMult: 1.0, releaseFastWeight: 0.0 }, // Safe
 ];
 const FAST_RELEASE_RATIO = 0.15; // fixed fast-segment time vs. user release, blended per-style by releaseFastWeight
 
-// Adaptive/auto release: maps real-time crest factor (peak/RMS in dB) to a
-// release-time multiplier — dense/low-crest material releases slower (avoids
-// pumping on material that's loud throughout), percussive/high-crest material
-// releases faster (recovers between hits). Supersedes the style's fixed
-// releaseFastWeight blend when enabled (autoRelease=0 uses the style blend).
+// Adaptive/auto release (compressor stage): maps real-time crest factor
+// (peak/RMS in dB) to a release-time multiplier — dense/low-crest material
+// releases slower (avoids pumping on material that's loud throughout),
+// percussive/high-crest material releases faster (recovers between hits).
+// Supersedes the style's fixed releaseFastWeight blend when enabled.
 const CREST_LOW_DB = 4, CREST_HIGH_DB = 18;
 const RELEASE_MULT_AT_LOW_CREST = 1.75; // slower
 const RELEASE_MULT_AT_HIGH_CREST = 0.5; // faster
+
+// ── Chain order ─────────────────────────────────────────────────────────────
+// Index into CHAIN_ORDERS comes from the `chainOrder` param; content.js's
+// AUDIOFX_CHAIN_ORDER_LABELS must describe these permutations in the same
+// order. Keep in sync.
+const ST_EQ = 0, ST_COMP = 1, ST_LIM = 2;
+const CHAIN_ORDERS = [
+  [ST_EQ, ST_COMP, ST_LIM],
+  [ST_EQ, ST_LIM, ST_COMP],
+  [ST_COMP, ST_EQ, ST_LIM],
+  [ST_COMP, ST_LIM, ST_EQ],
+  [ST_LIM, ST_EQ, ST_COMP],
+  [ST_LIM, ST_COMP, ST_EQ],
+];
+
+// Limiter attack time constant as a fraction of the lookahead: τ = D·0.25
+// means the one-pole envelope has covered 1-e⁻⁴ ≈ 98.2% of the required
+// reduction by the time the detected transient exits the delay line. The
+// remaining ~2% (≈0.15dB on a 10dB hit) is what the final safety clamp eats.
+const LIM_ATTACK_FRACTION = 0.25;
+
+// ── EQ ──────────────────────────────────────────────────────────────────────
+const EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+const EQ_Q = 1.41;
+const EQ_GAIN_SMOOTH_SEC = 0.04;
+// RBJ cookbook peaking EQ — bit-matches what BiquadFilterNode type='peaking'
+// is specced to compute, so moving the EQ in here from native nodes did not
+// change its curve.
+function designBiquadPeaking(f0, gainDb, Q, fs) {
+  const A = Math.pow(10, gainDb / 40);
+  const w0 = 2 * Math.PI * f0 / fs;
+  const cosw0 = Math.cos(w0), sinw0 = Math.sin(w0);
+  const alpha = sinw0 / (2 * Q);
+  const b0 = 1 + alpha * A;
+  const b1 = -2 * cosw0;
+  const b2 = 1 - alpha * A;
+  const a0 = 1 + alpha / A;
+  const a1 = -2 * cosw0;
+  const a2 = 1 - alpha / A;
+  return { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 };
+}
 
 // True Peak: a plain per-sample peak detector misses inter-sample overs (the
 // analog waveform reconstructed by a DAC can peak *between* two samples that
@@ -193,35 +256,49 @@ function gatedLRA(zHistory) {
 class VmuLimiterProcessor extends AudioWorkletProcessor {
   static get parameterDescriptors() {
     return [
+      // ── Compressor stage ──
+      { name: 'compEnabled', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
       { name: 'threshold', defaultValue: -3, minValue: -60, maxValue: 0, automationRate: 'k-rate' },
       { name: 'ratio', defaultValue: 4, minValue: 1, maxValue: 20, automationRate: 'k-rate' },
       { name: 'attack', defaultValue: 3, minValue: 0, maxValue: 100, automationRate: 'k-rate' }, // ms
       { name: 'release', defaultValue: 250, minValue: 0, maxValue: 1000, automationRate: 'k-rate' }, // ms
       { name: 'knee', defaultValue: 0, minValue: 0, maxValue: 40, automationRate: 'k-rate' }, // dB
+      { name: 'style', defaultValue: 3, minValue: 0, maxValue: 6, automationRate: 'k-rate' }, // index into STYLE_PRESETS, default Allround
+      { name: 'autoRelease', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
+      { name: 'autoGain', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
+      // ── Limiter stage ── (`enabled` keeps its historical name — it has
+      // always been the "Лимитер" toggle's param — but now gates only the
+      // limiter stage, not the whole node.)
+      { name: 'enabled', defaultValue: 1, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
       { name: 'ceiling', defaultValue: -0.3, minValue: -20, maxValue: 0, automationRate: 'k-rate' }, // dB
       // Right-channel ceiling override — only honored in Unlinked mode
       // (processingMode===1); `ceiling` above always remains the left/shared
       // ceiling. Defaults equal to `ceiling`'s default so leaving it untouched
       // is a no-op.
       { name: 'ceilingR', defaultValue: -0.3, minValue: -20, maxValue: 0, automationRate: 'k-rate' }, // dB
-      { name: 'inputGain', defaultValue: 0, minValue: -24, maxValue: 24, automationRate: 'k-rate' }, // dB
-      { name: 'outputGain', defaultValue: 0, minValue: -24, maxValue: 24, automationRate: 'k-rate' }, // dB
-      { name: 'enabled', defaultValue: 1, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
-      { name: 'style', defaultValue: 3, minValue: 0, maxValue: 6, automationRate: 'k-rate' }, // index into STYLE_PRESETS, default Allround
-      { name: 'autoRelease', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
+      { name: 'limRelease', defaultValue: 50, minValue: 1, maxValue: 1000, automationRate: 'k-rate' }, // ms
       { name: 'truePeakMode', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
       // Index into OVERSAMPLE_FACTORS ([2,4,8,16]) — which polyphase FIR bank
       // true-peak detection uses. Only consulted when truePeakMode is on.
       { name: 'oversampling', defaultValue: 1, minValue: 0, maxValue: 3, automationRate: 'k-rate' },
+      // ── EQ stage ──
+      { name: 'eqEnabled', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
+      ...EQ_FREQS.map((_, i) => (
+        { name: 'band' + i, defaultValue: 0, minValue: -12, maxValue: 12, automationRate: 'k-rate' }
+      )),
+      // ── Global ──
+      // Index into CHAIN_ORDERS — which permutation of EQ/Comp/Lim runs.
+      { name: 'chainOrder', defaultValue: 0, minValue: 0, maxValue: 5, automationRate: 'k-rate' },
+      { name: 'inputGain', defaultValue: 0, minValue: -24, maxValue: 24, automationRate: 'k-rate' }, // dB
+      { name: 'outputGain', defaultValue: 0, minValue: -24, maxValue: 24, automationRate: 'k-rate' }, // dB
       // Gates the K-weighting/LUFS accumulation entirely — content.js only
       // sets this to 1 while the Метринг tab is actually the open tab, so
       // users who never look at it pay zero extra per-sample cost.
       { name: 'meteringActive', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
-      { name: 'autoGain', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
-      // 0 = Stereo Linked (default, today's exact behavior), 1 = Unlinked
-      // (independent per-channel gain), 2 = Mid/Side (independent gain on
-      // the encoded mid/side signal). Silently falls back to 0 unless
-      // channelCount === 2.
+      // 0 = Stereo Linked (default), 1 = Unlinked (independent per-channel
+      // gain), 2 = Mid/Side (independent gain on the encoded mid/side
+      // signal). Applies to both dynamics stages; silently falls back to 0
+      // unless channelCount === 2.
       { name: 'processingMode', defaultValue: 0, minValue: 0, maxValue: 2, automationRate: 'k-rate' },
     ];
   }
@@ -232,10 +309,43 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     this._bufLen = this._lookaheadSamples + 32; // small headroom
     this._delayBuf = null;
     this._writeIdx = 0;
-    this._envDb = 0; // current smoothed gain reduction, in dB (0 = no reduction)
-    this._rmsSq = 0; // leaky-integrator mean-square estimate, shared/stereo-linked like the peak detector
     this._rmsCoeff = 1 - Math.exp(-1 / (sampleRate * 0.002)); // ~2ms leaky-RMS window, fixed internal constant
     this._reportCounter = 0;
+
+    // Compressor stage state — linked (single) and per-lane (Unlinked/M-S)
+    // copies. envDb values are current smoothed gain reduction in dB
+    // (0 = no reduction).
+    this._cEnvDb = 0;
+    this._cRmsSq = 0;
+    this._cEnvDbLane = new Float64Array(2);
+    this._cRmsSqLane = new Float64Array(2);
+
+    // Auto Gain: a cheap approximation of loudness-matched bypass A/B —
+    // rather than an independent dual-path LUFS comparison, track a slow
+    // (~1.5s) running average of the compressor envelope's own applied
+    // reduction and feed back the negative of it as makeup gain, so toggling
+    // the compressor doesn't just make the track louder (which biases any
+    // A/B towards "on" regardless of whether the character is actually
+    // preferred). An approximation, not a literal loudness match.
+    this._autoGainCoeff = 1 - Math.exp(-1 / (sampleRate * 1.5));
+    this._agTrimDb = 0;
+    this._agTrimDbLane = new Float64Array(2);
+
+    // Limiter stage envelope — its attack is fixed (tied to the lookahead,
+    // see LIM_ATTACK_FRACTION), only its release is user-set.
+    this._lEnvDb = 0;
+    this._lEnvDbLane = new Float64Array(2);
+
+    // EQ stage: current (smoothed) gain per band, designed coefficients
+    // (null = band at 0dB, stage skips it), and DF1 state allocated per
+    // channel count in _ensureBuffers.
+    this._eqGainCur = new Float64Array(EQ_FREQS.length);
+    this._eqCoeffs = new Array(EQ_FREQS.length).fill(null);
+    this._eqState = null;
+
+    this._frame = null; // per-sample scratch, one slot per channel
+    this._laneVals = new Float64Array(2); // per-sample scratch for Unlinked/M-S lanes
+
     // Max-since-last-report accumulators. Must persist across process() calls
     // (each call only covers one ~128-frame render quantum, but a report is
     // only sent every 8 calls) — previously declared as locals inside
@@ -244,32 +354,13 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     // value only ever reflected the last ~3ms before a report instead of the
     // full ~21ms since the previous one. That's what made the meters read as
     // randomly jumping between reports instead of tracking the real peak.
-    this._maxReductionSinceReport = 0;
+    this._maxCompReductionSinceReport = 0;
+    this._maxLimReductionSinceReport = 0;
     this._maxTruePeakSinceReport = 0;
     this._maxRawPeakSinceReport = 0;
 
-    // Auto Gain (Phase 4): a cheap approximation of loudness-matched bypass
-    // A/B — rather than an independent dual-path LUFS comparison, track a
-    // slow (~1.5s) running average of the envelope's own applied reduction
-    // and feed back the negative of it as makeup gain, so toggling `enabled`
-    // doesn't just make the track louder (which biases any A/B towards
-    // "on" regardless of whether the limiter's character is actually
-    // preferred). This is an approximation, not a literal loudness match.
-    this._autoGainCoeff = 1 - Math.exp(-1 / (sampleRate * 1.5));
-    this._autoGainTrimDb = 0;
-
-    // Unlinked/Mid-Side (Phase 5) — per-lane copies of the envelope/RMS/
-    // auto-gain state above, used only when processingMode != 0 (and only
-    // meaningful for exactly 2 channels; anything else silently falls back
-    // to Stereo Linked). Kept as a completely separate code path from the
-    // Stereo Linked loop below rather than a unified generalization, so the
-    // default (already-shipped) behavior can never regress from this change.
-    this._envDbLane = new Float64Array(2);
-    this._rmsSqLane = new Float64Array(2);
-    this._autoGainTrimDbLane = new Float64Array(2);
-
-    // LUFS/LRA metering (Phase 3) — sampleRate is fixed for the worklet's
-    // lifetime, so the K-weighting coefficients are designed once and cached.
+    // LUFS/LRA metering — sampleRate is fixed for the worklet's lifetime, so
+    // the K-weighting coefficients are designed once and cached.
     this._kw = designKWeighting(sampleRate);
     this._kw1x1 = null; this._kw1x2 = null; this._kw1y1 = null; this._kw1y2 = null; // stage 1 (shelf) state, per channel
     this._kw2x1 = null; this._kw2x2 = null; this._kw2y1 = null; this._kw2y2 = null; // stage 2 (highpass) state, per channel
@@ -304,6 +395,8 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     if (this._delayBuf && this._delayBuf.length === channelCount) return;
     this._delayBuf = Array.from({ length: channelCount }, () => new Float32Array(this._bufLen));
     this._writeIdx = 0;
+    this._frame = new Float64Array(channelCount);
+    this._eqState = new Float64Array(EQ_FREQS.length * channelCount * 4); // x1,x2,y1,y2 per band per channel
     this._kw1x1 = new Float64Array(channelCount); this._kw1x2 = new Float64Array(channelCount);
     this._kw1y1 = new Float64Array(channelCount); this._kw1y2 = new Float64Array(channelCount);
     this._kw2x1 = new Float64Array(channelCount); this._kw2x2 = new Float64Array(channelCount);
@@ -317,37 +410,54 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     const channelCount = Math.min(input.length, output.length);
     this._ensureBuffers(channelCount);
 
+    const compEnabled = parameters.compEnabled[0] >= 0.5;
     const threshold = parameters.threshold[0];
     const ratio = Math.max(1, parameters.ratio[0]);
     const attackMs = parameters.attack[0];
     const releaseMs = parameters.release[0];
     const knee = Math.max(0, parameters.knee[0]);
-    const ceilingDb = parameters.ceiling[0];
-    const ceilingRDb = parameters.ceilingR[0];
-    const inputGainDb = parameters.inputGain[0];
-    const outputGainDb = parameters.outputGain[0];
-    const enabled = parameters.enabled[0] >= 0.5;
     const styleIdx = Math.max(0, Math.min(STYLE_PRESETS.length - 1, Math.round(parameters.style[0])));
     const style = STYLE_PRESETS[styleIdx];
     const autoRelease = parameters.autoRelease[0] >= 0.5;
+    const autoGain = parameters.autoGain[0] >= 0.5;
+
+    const limEnabled = parameters.enabled[0] >= 0.5;
+    const ceilingDb = parameters.ceiling[0];
+    const ceilingRDb = parameters.ceilingR[0];
+    const limReleaseMs = Math.max(1, parameters.limRelease[0]);
     const truePeakMode = parameters.truePeakMode[0] >= 0.5;
     const oversampleIdx = Math.max(0, Math.min(OVERSAMPLE_FACTORS.length - 1, Math.round(parameters.oversampling[0])));
     const polyphaseBank = POLYPHASE_BANKS[oversampleIdx];
+
+    const eqEnabled = parameters.eqEnabled[0] >= 0.5;
+    const order = CHAIN_ORDERS[Math.max(0, Math.min(CHAIN_ORDERS.length - 1, Math.round(parameters.chainOrder[0])))];
+    const inputGainDb = parameters.inputGain[0];
+    const outputGainDb = parameters.outputGain[0];
     const meteringActive = parameters.meteringActive[0] >= 0.5;
-    const autoGain = parameters.autoGain[0] >= 0.5;
     const processingMode = channelCount === 2 ? Math.max(0, Math.min(2, Math.round(parameters.processingMode[0]))) : 0;
 
-    const inputGainLin = enabled ? Math.pow(10, inputGainDb / 20) : 1;
-    const outputGainLin = enabled ? Math.pow(10, outputGainDb / 20) : 1;
+    // Input/Output trim live on the dynamics panel and have always bypassed
+    // together with it — now "it" is either dynamics stage.
+    const gainsActive = compEnabled || limEnabled;
+    const inputGainLin = gainsActive ? Math.pow(10, inputGainDb / 20) : 1;
+    const outputGainLin = gainsActive ? Math.pow(10, outputGainDb / 20) : 1;
     const ceilingLin = Math.pow(10, ceilingDb / 20);
-    // Only meaningfully different from ceilingLin in Unlinked mode; the
-    // Stereo Linked and M/S paths never read this.
+    // Only meaningfully different from ceilingLin in Unlinked mode.
     const ceilingRLin = Math.pow(10, ceilingRDb / 20);
+    // The limiter envelope pre-compensates for the output gain applied after
+    // the chain, so `ceiling` keeps meaning the level at the node's output
+    // (as it always has), not at the limiter stage's own output. Only exact
+    // when the limiter is the last stage — with EQ/comp deliberately ordered
+    // after it, overshoot lands on the safety clamp, which is the user's
+    // explicit trade to make.
+    const appliedOutputGainDb = gainsActive ? outputGainDb : 0;
+    const limTargetDb = ceilingDb - appliedOutputGainDb;
+    const limTargetRDb = ceilingRDb - appliedOutputGainDb;
     const halfKnee = knee / 2;
 
-    // One-pole smoothing coefficients from attack/release time constants.
-    // attackMult/releaseFastWeight are style character knobs layered on top of
-    // the user's own attack/release sliders, not a replacement for them.
+    // Compressor one-pole smoothing coefficients from attack/release time
+    // constants. attackMult/releaseFastWeight are style character knobs
+    // layered on top of the user's own attack/release sliders.
     const effectiveAttackMs = attackMs * style.attackMult;
     const attackCoeff = effectiveAttackMs > 0 ? 1 - Math.exp(-1 / (sampleRate * (effectiveAttackMs / 1000))) : 1;
     const releaseCoeffAt = mult => {
@@ -363,23 +473,225 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     const releaseCoeffAutoLow = releaseCoeffAt(RELEASE_MULT_AT_LOW_CREST);
     const releaseCoeffAutoHigh = releaseCoeffAt(RELEASE_MULT_AT_HIGH_CREST);
 
+    // Limiter envelope coefficients — attack fixed to converge inside the
+    // lookahead window (see LIM_ATTACK_FRACTION), release user-set.
+    const limAttackCoeff = 1 - Math.exp(-1 / (this._lookaheadSamples * LIM_ATTACK_FRACTION));
+    const limReleaseCoeff = 1 - Math.exp(-1 / (sampleRate * (limReleaseMs / 1000)));
+
     const frames = input[0].length;
+
+    // EQ per-block prep: smooth each band's gain toward its target (0 when
+    // the EQ is bypassed, so disabling fades to identity instead of
+    // clicking), redesign that band's coefficients only when the gain
+    // actually moved. null coefficients mark a band at 0dB — the per-sample
+    // loop skips those entirely.
+    const eqSmooth = 1 - Math.exp(-frames / (sampleRate * EQ_GAIN_SMOOTH_SEC));
+    const eqCoeffs = this._eqCoeffs;
+    for (let b = 0; b < EQ_FREQS.length; b++) {
+      const p = parameters['band' + b];
+      const target = eqEnabled && p ? Math.max(-12, Math.min(12, p[0])) : 0;
+      let cur = this._eqGainCur[b];
+      if (cur !== target) {
+        cur += (target - cur) * eqSmooth;
+        if (Math.abs(target - cur) < 0.01) cur = target;
+        this._eqGainCur[b] = cur;
+        eqCoeffs[b] = Math.abs(cur) > 0.01 ? designBiquadPeaking(EQ_FREQS[b], cur, EQ_Q, sampleRate) : null;
+      }
+    }
+
     const buf = this._delayBuf;
     const delaySamples = this._lookaheadSamples;
     const bufLen = this._bufLen;
+    const frame = this._frame;
+    const laneVals = this._laneVals;
+    const eqState = this._eqState;
+
+    // ── Stage closures — allocated once per render quantum, they process
+    // `frame` in place so the chain-order loop can run them in any order. ──
+
+    const eqStage = () => {
+      for (let b = 0; b < EQ_FREQS.length; b++) {
+        const co = eqCoeffs[b];
+        if (!co) continue;
+        for (let ch = 0; ch < channelCount; ch++) {
+          const si = (b * channelCount + ch) * 4;
+          const x = frame[ch];
+          const y = co.b0 * x + co.b1 * eqState[si] + co.b2 * eqState[si + 1]
+            - co.a1 * eqState[si + 2] - co.a2 * eqState[si + 3];
+          eqState[si + 1] = eqState[si]; eqState[si] = x;
+          eqState[si + 3] = eqState[si + 2]; eqState[si + 2] = y;
+          frame[ch] = y;
+        }
+      }
+    };
+
+    const compDesiredDb = detectedLevel => {
+      const peakDb = 20 * Math.log10(Math.max(detectedLevel, 1e-8));
+      const over = peakDb - threshold;
+      if (knee > 0 && over > -halfKnee && over < halfKnee) {
+        const x = over + halfKnee;
+        return halfKnee * Math.pow(x / knee, style.kneeShape) * (1 - 1 / ratio);
+      }
+      if (over >= halfKnee) return over * (1 - 1 / ratio);
+      return 0;
+    };
+
+    // Crest-factor → release coefficient interpolation, shared by both the
+    // linked and per-lane compressor paths.
+    const compReleaseCoeff = (rawPeak, rmsSq) => {
+      if (!autoRelease) return releaseCoeffStyled;
+      const crestDb = 20 * Math.log10(Math.max(rawPeak, 1e-8)) - 10 * Math.log10(Math.max(rmsSq, 1e-8));
+      let t = (crestDb - CREST_LOW_DB) / (CREST_HIGH_DB - CREST_LOW_DB);
+      t = Math.max(0, Math.min(1, t));
+      return releaseCoeffAutoLow + (releaseCoeffAutoHigh - releaseCoeffAutoLow) * t;
+    };
+
+    const compStage = () => {
+      if (processingMode === 0) {
+        let peak = 0;
+        for (let ch = 0; ch < channelCount; ch++) {
+          const a = Math.abs(frame[ch]);
+          if (a > peak) peak = a;
+        }
+        this._cRmsSq += (peak * peak - this._cRmsSq) * this._rmsCoeff;
+        const desired = compEnabled
+          ? compDesiredDb(style.detectorMix * peak + (1 - style.detectorMix) * Math.sqrt(this._cRmsSq))
+          : 0;
+        this._cEnvDb += (desired - this._cEnvDb) * (desired > this._cEnvDb ? attackCoeff : compReleaseCoeff(peak, this._cRmsSq));
+        if (this._cEnvDb > this._maxCompReductionSinceReport) this._maxCompReductionSinceReport = this._cEnvDb;
+        if (autoGain) this._agTrimDb += (this._cEnvDb - this._agTrimDb) * this._autoGainCoeff;
+        const g = Math.pow(10, (-this._cEnvDb + (autoGain ? this._agTrimDb : 0)) / 20);
+        for (let ch = 0; ch < channelCount; ch++) frame[ch] *= g;
+      } else {
+        // Unlinked (1) / Mid-Side (2) — independent envelope per lane.
+        if (processingMode === 2) {
+          laneVals[0] = (frame[0] + frame[1]) * 0.5; // mid
+          laneVals[1] = (frame[0] - frame[1]) * 0.5; // side
+        } else {
+          laneVals[0] = frame[0]; laneVals[1] = frame[1];
+        }
+        let maxRed = 0;
+        for (let lane = 0; lane < 2; lane++) {
+          const pk = Math.abs(laneVals[lane]);
+          this._cRmsSqLane[lane] += (pk * pk - this._cRmsSqLane[lane]) * this._rmsCoeff;
+          const desired = compEnabled
+            ? compDesiredDb(style.detectorMix * pk + (1 - style.detectorMix) * Math.sqrt(this._cRmsSqLane[lane]))
+            : 0;
+          const env = this._cEnvDbLane[lane]
+            + (desired - this._cEnvDbLane[lane]) * (desired > this._cEnvDbLane[lane] ? attackCoeff : compReleaseCoeff(pk, this._cRmsSqLane[lane]));
+          this._cEnvDbLane[lane] = env;
+          if (env > maxRed) maxRed = env;
+          if (autoGain) this._agTrimDbLane[lane] += (env - this._agTrimDbLane[lane]) * this._autoGainCoeff;
+          laneVals[lane] *= Math.pow(10, (-env + (autoGain ? this._agTrimDbLane[lane] : 0)) / 20);
+        }
+        if (maxRed > this._maxCompReductionSinceReport) this._maxCompReductionSinceReport = maxRed;
+        if (processingMode === 2) {
+          frame[0] = laneVals[0] + laneVals[1]; // M/S decode
+          frame[1] = laneVals[0] - laneVals[1];
+        } else {
+          frame[0] = laneVals[0]; frame[1] = laneVals[1];
+        }
+      }
+    };
+
+    const limStage = () => {
+      // The stage always routes through its delay line, even bypassed — so
+      // the node's latency is constant and toggling the limiter never causes
+      // a 5ms splice click; a bypassed stage just converges to unity gain.
+      if (processingMode === 0) {
+        let rawPeak = 0;
+        for (let ch = 0; ch < channelCount; ch++) {
+          buf[ch][this._writeIdx] = frame[ch];
+          const a = Math.abs(frame[ch]);
+          if (a > rawPeak) rawPeak = a;
+        }
+        let truePeakEstimate = 0;
+        if (truePeakMode) {
+          // Window ends at writeIdx (the sample just written above), so the
+          // interpolation gap sits between offsets -4 and -3 relative to
+          // writeIdx — 3 samples of lag, all already-written data, no extra
+          // lookahead needed beyond what polyphaseMaxAbs's window requires.
+          for (let ch = 0; ch < channelCount; ch++) {
+            const v = polyphaseMaxAbs(buf[ch], bufLen, this._writeIdx, polyphaseBank);
+            if (v > truePeakEstimate) truePeakEstimate = v;
+          }
+          if (truePeakEstimate > this._maxTruePeakSinceReport) this._maxTruePeakSinceReport = truePeakEstimate;
+        }
+        const det = truePeakMode ? Math.max(rawPeak, truePeakEstimate) : rawPeak;
+        const desired = limEnabled ? Math.max(0, 20 * Math.log10(Math.max(det, 1e-8)) - limTargetDb) : 0;
+        this._lEnvDb += (desired - this._lEnvDb) * (desired > this._lEnvDb ? limAttackCoeff : limReleaseCoeff);
+        if (this._lEnvDb > this._maxLimReductionSinceReport) this._maxLimReductionSinceReport = this._lEnvDb;
+        const g = Math.pow(10, -this._lEnvDb / 20);
+        const readIdx = (this._writeIdx - delaySamples + bufLen) % bufLen;
+        for (let ch = 0; ch < channelCount; ch++) frame[ch] = buf[ch][readIdx] * g;
+      } else {
+        // Unlinked (1) / Mid-Side (2). Note: True Peak detection reads the
+        // lane-domain ring buffer, so in M/S mode it estimates inter-sample
+        // peaks of the encoded mid/side signal rather than the decoded L/R
+        // output — a known, documented imprecision for that combination.
+        if (processingMode === 2) {
+          laneVals[0] = (frame[0] + frame[1]) * 0.5; // mid
+          laneVals[1] = (frame[0] - frame[1]) * 0.5; // side
+        } else {
+          laneVals[0] = frame[0]; laneVals[1] = frame[1];
+        }
+        buf[0][this._writeIdx] = laneVals[0];
+        buf[1][this._writeIdx] = laneVals[1];
+        let truePeakEstimate = 0;
+        if (truePeakMode) {
+          for (let ch = 0; ch < 2; ch++) {
+            const v = polyphaseMaxAbs(buf[ch], bufLen, this._writeIdx, polyphaseBank);
+            if (v > truePeakEstimate) truePeakEstimate = v;
+          }
+          if (truePeakEstimate > this._maxTruePeakSinceReport) this._maxTruePeakSinceReport = truePeakEstimate;
+        }
+        const readIdx = (this._writeIdx - delaySamples + bufLen) % bufLen;
+        let maxRed = 0;
+        for (let lane = 0; lane < 2; lane++) {
+          const pk = Math.abs(laneVals[lane]);
+          const det = truePeakMode ? Math.max(pk, truePeakEstimate) : pk;
+          // Separate right-channel ceiling only makes sense in Unlinked mode,
+          // where lane1 already *is* R; in M/S mode a per-lane ceiling
+          // wouldn't map to a per-ear ceiling — both lanes use the shared
+          // target there.
+          const targetDb = (processingMode === 1 && lane === 1) ? limTargetRDb : limTargetDb;
+          const desired = limEnabled ? Math.max(0, 20 * Math.log10(Math.max(det, 1e-8)) - targetDb) : 0;
+          const env = this._lEnvDbLane[lane]
+            + (desired - this._lEnvDbLane[lane]) * (desired > this._lEnvDbLane[lane] ? limAttackCoeff : limReleaseCoeff);
+          this._lEnvDbLane[lane] = env;
+          if (env > maxRed) maxRed = env;
+          laneVals[lane] = buf[lane][readIdx] * Math.pow(10, -env / 20);
+        }
+        if (maxRed > this._maxLimReductionSinceReport) this._maxLimReductionSinceReport = maxRed;
+        if (processingMode === 2) {
+          frame[0] = laneVals[0] + laneVals[1]; // M/S decode
+          frame[1] = laneVals[0] - laneVals[1];
+        } else {
+          frame[0] = laneVals[0]; frame[1] = laneVals[1];
+        }
+      }
+      this._writeIdx = (this._writeIdx + 1) % bufLen;
+    };
 
     for (let n = 0; n < frames; n++) {
-      // LUFS/LRA metering — reads input[ch][n] directly, independent of
-      // processingMode/the ring buffer's contents, so it's shared verbatim
-      // between the Stereo Linked and Unlinked/M-S paths below. K-weights
-      // the same pre-limiting signal already fed to the detector (not the
-      // limited output; matches Phase 4's need for a pre-processing loudness
-      // reference). Fully skipped when meteringActive is off.
+      let inPeak = 0;
+      for (let ch = 0; ch < channelCount; ch++) {
+        const s = input[ch][n] * inputGainLin;
+        frame[ch] = s;
+        const a = Math.abs(s);
+        if (a > inPeak) inPeak = a;
+      }
+      if (inPeak > this._maxRawPeakSinceReport) this._maxRawPeakSinceReport = inPeak;
+
+      // LUFS/LRA metering — K-weights the node's own input (post input gain,
+      // pre any stage), independent of chain order and processing mode, as a
+      // pre-processing loudness reference. Fully skipped when meteringActive
+      // is off.
       if (meteringActive) {
         const kw1 = this._kw.stage1, kw2 = this._kw.stage2;
         let sumSqK = 0;
         for (let ch = 0; ch < channelCount; ch++) {
-          const x = input[ch][n] * inputGainLin;
+          const x = frame[ch];
           const y1 = kw1.b0 * x + kw1.b1 * this._kw1x1[ch] + kw1.b2 * this._kw1x2[ch]
             - kw1.a1 * this._kw1y1[ch] - kw1.a2 * this._kw1y2[ch];
           this._kw1x2[ch] = this._kw1x1[ch]; this._kw1x1[ch] = x;
@@ -421,191 +733,50 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
         }
       }
 
-      if (processingMode === 0) {
-        // ── Stereo Linked (default) — byte-identical to the pre-Phase-5 code. ──
-        let rawPeak = 0;
-        for (let ch = 0; ch < channelCount; ch++) {
-          const s = input[ch][n] * inputGainLin;
-          buf[ch][this._writeIdx] = s;
-          const a = Math.abs(s);
-          if (a > rawPeak) rawPeak = a;
+      // The chain itself — stages mutate `frame` in the configured order.
+      for (let s = 0; s < order.length; s++) {
+        const st = order[s];
+        if (st === ST_EQ) eqStage();
+        else if (st === ST_COMP) compStage();
+        else limStage();
+      }
+
+      for (let ch = 0; ch < channelCount; ch++) {
+        let v = frame[ch] * outputGainLin;
+        if (limEnabled) {
+          // Safety clamp — the limiter envelope does the actual limiting now;
+          // this only catches its convergence residue (and whatever the user
+          // deliberately routes after the limiter stage).
+          const c = (processingMode === 1 && ch === 1) ? ceilingRLin : ceilingLin;
+          if (v > c) v = c;
+          else if (v < -c) v = -c;
         }
-        if (rawPeak > this._maxRawPeakSinceReport) this._maxRawPeakSinceReport = rawPeak;
-
-        let truePeakEstimate = 0;
-        if (truePeakMode) {
-          // Window ends at writeIdx (the sample just written above), so the
-          // interpolation gap sits between offsets -4 and -3 relative to
-          // writeIdx — 3 samples of lag, all already-written data, no extra
-          // lookahead needed beyond what polyphaseMaxAbs's window requires.
-          for (let ch = 0; ch < channelCount; ch++) {
-            const v = polyphaseMaxAbs(buf[ch], bufLen, this._writeIdx, polyphaseBank);
-            if (v > truePeakEstimate) truePeakEstimate = v;
-          }
-          if (truePeakEstimate > this._maxTruePeakSinceReport) this._maxTruePeakSinceReport = truePeakEstimate;
-        }
-        const effectivePeak = truePeakMode ? Math.max(rawPeak, truePeakEstimate) : rawPeak;
-
-        this._rmsSq += (rawPeak * rawPeak - this._rmsSq) * this._rmsCoeff;
-
-        let desiredReductionDb = 0;
-        if (enabled) {
-          const detectedLevel = style.detectorMix * effectivePeak + (1 - style.detectorMix) * Math.sqrt(this._rmsSq);
-          const peakDb = 20 * Math.log10(Math.max(detectedLevel, 1e-8));
-          const over = peakDb - threshold;
-          if (knee > 0 && over > -halfKnee && over < halfKnee) {
-            const x = over + halfKnee;
-            desiredReductionDb = halfKnee * Math.pow(x / knee, style.kneeShape) * (1 - 1 / ratio);
-          } else if (over >= halfKnee) {
-            desiredReductionDb = over * (1 - 1 / ratio);
-          }
-        }
-
-        let releaseCoeff = releaseCoeffStyled;
-        if (autoRelease) {
-          const crestDb = 20 * Math.log10(Math.max(rawPeak, 1e-8)) - 10 * Math.log10(Math.max(this._rmsSq, 1e-8));
-          let t = (crestDb - CREST_LOW_DB) / (CREST_HIGH_DB - CREST_LOW_DB);
-          t = Math.max(0, Math.min(1, t));
-          releaseCoeff = releaseCoeffAutoLow + (releaseCoeffAutoHigh - releaseCoeffAutoLow) * t;
-        }
-
-        this._envDb += (desiredReductionDb - this._envDb) * (desiredReductionDb > this._envDb ? attackCoeff : releaseCoeff);
-        if (this._envDb > this._maxReductionSinceReport) this._maxReductionSinceReport = this._envDb;
-
-        if (autoGain) {
-          this._autoGainTrimDb += (this._envDb - this._autoGainTrimDb) * this._autoGainCoeff;
-        }
-        const autoGainLin = autoGain ? Math.pow(10, this._autoGainTrimDb / 20) : 1;
-
-        const gainLin = Math.pow(10, -this._envDb / 20) * outputGainLin * autoGainLin;
-        const readIdx = (this._writeIdx - delaySamples + bufLen) % bufLen;
-
-        for (let ch = 0; ch < channelCount; ch++) {
-          let s = buf[ch][readIdx] * gainLin;
-          if (enabled) {
-            if (s > ceilingLin) s = ceilingLin;
-            else if (s < -ceilingLin) s = -ceilingLin;
-          }
-          output[ch][n] = s;
-        }
-
-        this._writeIdx = (this._writeIdx + 1) % bufLen;
-      } else {
-        // ── Unlinked (1) / Mid-Side (2) — independent gain per lane. ──
-        // Note: True Peak detection (if also enabled) reads this same ring
-        // buffer, so in M/S mode it estimates inter-sample peaks of the
-        // encoded mid/side signal rather than the decoded L/R output — a
-        // known, documented imprecision for that specific combination, not
-        // fixed here to keep this already-invasive phase bounded in scope.
-        const ch0in = input[0][n] * inputGainLin;
-        const ch1in = input[1][n] * inputGainLin;
-        let lane0in, lane1in;
-        if (processingMode === 2) {
-          lane0in = (ch0in + ch1in) * 0.5; // mid
-          lane1in = (ch0in - ch1in) * 0.5; // side
-        } else {
-          lane0in = ch0in; lane1in = ch1in; // unlinked: raw L/R, no encoding
-        }
-        buf[0][this._writeIdx] = lane0in;
-        buf[1][this._writeIdx] = lane1in;
-
-        const rawPeakLanes = Math.max(Math.abs(lane0in), Math.abs(lane1in));
-        if (rawPeakLanes > this._maxRawPeakSinceReport) this._maxRawPeakSinceReport = rawPeakLanes;
-
-        let truePeakEstimate = 0;
-        if (truePeakMode) {
-          for (let ch = 0; ch < 2; ch++) {
-            const v = polyphaseMaxAbs(buf[ch], bufLen, this._writeIdx, polyphaseBank);
-            if (v > truePeakEstimate) truePeakEstimate = v;
-          }
-          if (truePeakEstimate > this._maxTruePeakSinceReport) this._maxTruePeakSinceReport = truePeakEstimate;
-        }
-
-        const laneIn = [lane0in, lane1in];
-        const laneGains = [1, 1];
-        let maxLaneReduction = 0;
-        for (let lane = 0; lane < 2; lane++) {
-          const rawPeakLane = Math.abs(laneIn[lane]);
-          this._rmsSqLane[lane] += (rawPeakLane * rawPeakLane - this._rmsSqLane[lane]) * this._rmsCoeff;
-          const effectivePeakLane = truePeakMode ? Math.max(rawPeakLane, truePeakEstimate) : rawPeakLane;
-
-          let desiredReductionDb = 0;
-          if (enabled) {
-            const detectedLevel = style.detectorMix * effectivePeakLane + (1 - style.detectorMix) * Math.sqrt(this._rmsSqLane[lane]);
-            const peakDb = 20 * Math.log10(Math.max(detectedLevel, 1e-8));
-            const over = peakDb - threshold;
-            if (knee > 0 && over > -halfKnee && over < halfKnee) {
-              const x = over + halfKnee;
-              desiredReductionDb = halfKnee * Math.pow(x / knee, style.kneeShape) * (1 - 1 / ratio);
-            } else if (over >= halfKnee) {
-              desiredReductionDb = over * (1 - 1 / ratio);
-            }
-          }
-
-          let releaseCoeff = releaseCoeffStyled;
-          if (autoRelease) {
-            const crestDb = 20 * Math.log10(Math.max(rawPeakLane, 1e-8)) - 10 * Math.log10(Math.max(this._rmsSqLane[lane], 1e-8));
-            let t = (crestDb - CREST_LOW_DB) / (CREST_HIGH_DB - CREST_LOW_DB);
-            t = Math.max(0, Math.min(1, t));
-            releaseCoeff = releaseCoeffAutoLow + (releaseCoeffAutoHigh - releaseCoeffAutoLow) * t;
-          }
-
-          const envDbLane = this._envDbLane[lane] + (desiredReductionDb - this._envDbLane[lane]) * (desiredReductionDb > this._envDbLane[lane] ? attackCoeff : releaseCoeff);
-          this._envDbLane[lane] = envDbLane;
-          if (envDbLane > maxLaneReduction) maxLaneReduction = envDbLane;
-
-          if (autoGain) {
-            this._autoGainTrimDbLane[lane] += (envDbLane - this._autoGainTrimDbLane[lane]) * this._autoGainCoeff;
-          }
-          const autoGainLaneLin = autoGain ? Math.pow(10, this._autoGainTrimDbLane[lane] / 20) : 1;
-          laneGains[lane] = Math.pow(10, -envDbLane / 20) * outputGainLin * autoGainLaneLin;
-        }
-        if (maxLaneReduction > this._maxReductionSinceReport) this._maxReductionSinceReport = maxLaneReduction;
-
-        const readIdx = (this._writeIdx - delaySamples + bufLen) % bufLen;
-        const lane0out = buf[0][readIdx] * laneGains[0];
-        const lane1out = buf[1][readIdx] * laneGains[1];
-        let outL, outR;
-        if (processingMode === 2) {
-          outL = lane0out + lane1out; // M/S decode
-          outR = lane0out - lane1out;
-        } else {
-          outL = lane0out; outR = lane1out;
-        }
-        if (enabled) {
-          // Separate right-channel ceiling only makes sense pre-decode in
-          // Unlinked mode, where lane0/lane1 already *are* L/R; in M/S mode
-          // outL/outR are a sum/difference of the encoded lanes, so a
-          // per-lane ceiling wouldn't map to a per-ear ceiling — both use
-          // the shared `ceiling` there.
-          const rCeil = processingMode === 1 ? ceilingRLin : ceilingLin;
-          if (outL > ceilingLin) outL = ceilingLin; else if (outL < -ceilingLin) outL = -ceilingLin;
-          if (outR > rCeil) outR = rCeil; else if (outR < -rCeil) outR = -rCeil;
-        }
-        output[0][n] = outL;
-        output[1][n] = outR;
-
-        this._writeIdx = (this._writeIdx + 1) % bufLen;
+        output[ch][n] = v;
       }
     }
 
     if (++this._reportCounter >= 8) {
       this._reportCounter = 0;
       const truePeakDb = truePeakMode ? 20 * Math.log10(Math.max(this._maxTruePeakSinceReport, 1e-8)) : null;
+      const agTrim = processingMode === 0
+        ? this._agTrimDb
+        : Math.max(this._agTrimDbLane[0], this._agTrimDbLane[1]);
       this.port.postMessage({
         type: 'meter',
-        reductionDb: this._maxReductionSinceReport,
+        reductionDb: this._maxCompReductionSinceReport,
+        limReductionDb: this._maxLimReductionSinceReport,
         inputPeakDb: 20 * Math.log10(Math.max(this._maxRawPeakSinceReport, 1e-8)),
         truePeakDb,
         momentaryLufs: meteringActive ? this._momentaryLufs : null,
         shortTermLufs: meteringActive ? this._shortTermLufs : null,
         integratedLufs: meteringActive ? this._integratedLufs : null,
         lra: meteringActive ? this._lra : null,
-        autoGainTrimDb: autoGain ? this._autoGainTrimDb : null,
+        autoGainTrimDb: autoGain ? agTrim : null,
       });
       // Only reset here, once the accumulated max has actually been sent —
       // these must survive across the 8 process() calls between reports.
-      this._maxReductionSinceReport = 0;
+      this._maxCompReductionSinceReport = 0;
+      this._maxLimReductionSinceReport = 0;
       this._maxTruePeakSinceReport = 0;
       this._maxRawPeakSinceReport = 0;
     }
