@@ -22,7 +22,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected.js"],
+      "resources": ["injected.js", "limiter-worklet.js"],
       "matches": ["https://vk.com/*"]
     }
   ]

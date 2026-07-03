@@ -1390,6 +1390,43 @@
   background: rgba(255,255,255,0.02);
 }
 .vmu-audiofx-title { font-size: 12px; color: #c0c2c4; font-weight: 600; flex: 1 1 auto; }
+
+.vmu-audiofx-presets-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px 0;
+}
+.vmu-audiofx-presets-row .vmu-audiofx-select { flex: 1 1 auto; min-width: 0; }
+
+/* Tab bar — same segmented-control look as .vmu-mode-switch, scaled down
+   (tighter padding) so 3 labels fit the panel's 380px width without wrap. */
+.vmu-audiofx-tabs {
+  display: flex;
+  gap: 2px;
+  margin: 8px 12px 0;
+  background: rgba(255,255,255,0.06);
+  border-radius: 8px;
+  padding: 2px;
+}
+.vmu-audiofx-tabs button {
+  flex: 1 1 0;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: #9ea1a3;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 4px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.vmu-audiofx-tabs button:hover { color: #d0d2d4; }
+.vmu-audiofx-tabs button.active {
+  background: rgba(38,136,235,0.85);
+  color: #fff;
+}
 .vmu-audiofx-body {
   flex: 1 1 auto;
   overflow-y: auto;
@@ -1407,6 +1444,58 @@
   color: #999;
   font-weight: 600;
   margin-bottom: 6px;
+}
+
+/* Style dropdown (Transparent/Dynamic/Punchy/Allround/Modern/Bus/Safe) —
+   matches the dark chrome of .vmu-slider's thumb color, no native select
+   styling. */
+.vmu-audiofx-select {
+  font-family: inherit;
+  font-size: 12px;
+  color: #d0d2d4;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.vmu-audiofx-select:hover { background: rgba(255,255,255,0.1); }
+
+/* Live gain-reduction meter, fed by VMU_AUDIOFX_METER messages from the
+   limiter worklet (~40x/sec). Scaled 0-24dB across the fill width. */
+.vmu-audiofx-meter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0 10px;
+}
+.vmu-audiofx-meter-label { font-size: 11px; color: #999; flex-shrink: 0; }
+.vmu-audiofx-meter {
+  flex: 1 1 auto;
+  height: 6px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.vmu-audiofx-meter-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #2688eb, #e6a63c 70%, #e64c4c 92%);
+  transition: width .05s linear;
+}
+/* True-peak variant — same widget, but the danger zone (near 0 dBTP, the
+   streaming-safe ceiling most mastering engineers care about) starts much
+   further along the bar than gain-reduction's 0-24dB range does. */
+.vmu-audiofx-meter-fill-tp {
+  background: linear-gradient(90deg, #2688eb, #2688eb 80%, #e6a63c 92%, #e64c4c 98%);
+}
+.vmu-audiofx-meter-val {
+  font-size: 11px;
+  color: #999;
+  font-variant-numeric: tabular-nums;
+  min-width: 46px;
+  text-align: right;
+  flex-shrink: 0;
 }
 
 /* 10-band graphic EQ: vertical range inputs in a row, gain labelled by
@@ -1464,3 +1553,284 @@
   color: #666;
   font-variant-numeric: tabular-nums;
 }
+
+/* ── Audio FX: preset browser (search/category/tags) + A/B switch ─────────── */
+.vmu-fx-preset-toggle-btn {
+  display: flex;
+  align-items: center;
+  text-align: left;
+  overflow: hidden;
+}
+.vmu-fx-preset-toggle-btn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vmu-fx-ab-switch {
+  display: flex;
+  gap: 2px;
+  background: rgba(255,255,255,0.06);
+  border-radius: 6px;
+  padding: 2px;
+  flex-shrink: 0;
+}
+.vmu-fx-ab-switch button {
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  width: 20px;
+  color: #9ea1a3;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 3px 0;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.vmu-fx-ab-switch button:hover { color: #d0d2d4; }
+.vmu-fx-ab-switch button.active { background: rgba(38,136,235,0.85); color: #fff; }
+
+.vmu-fx-preset-browser {
+  margin: 8px 12px 0;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  padding: 8px;
+}
+.vmu-fx-preset-search {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 12px;
+  color: #d0d2d4;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  padding: 5px 8px;
+  margin-bottom: 6px;
+}
+.vmu-fx-preset-search::placeholder { color: #666; }
+.vmu-fx-preset-cats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.vmu-fx-preset-cat {
+  font-family: inherit;
+  font-size: 10.5px;
+  color: #9ea1a3;
+  background: rgba(255,255,255,0.06);
+  border: none;
+  border-radius: 10px;
+  padding: 3px 9px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.vmu-fx-preset-cat:hover { color: #d0d2d4; }
+.vmu-fx-preset-cat.active { background: rgba(38,136,235,0.85); color: #fff; }
+.vmu-fx-preset-list {
+  max-height: 180px;
+  overflow-y: auto;
+}
+.vmu-fx-preset-list::-webkit-scrollbar { width: 4px; }
+.vmu-fx-preset-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 2px; }
+.vmu-fx-preset-item {
+  padding: 6px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.vmu-fx-preset-item:hover { background: rgba(255,255,255,0.05); }
+.vmu-fx-preset-item.active { background: rgba(38,136,235,0.16); }
+.vmu-fx-preset-item-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.vmu-fx-preset-item-name {
+  font-size: 12px;
+  color: #d0d2d4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.vmu-fx-preset-item-cat {
+  font-size: 10px;
+  color: #777;
+  flex-shrink: 0;
+}
+.vmu-fx-preset-item-del {
+  font-family: inherit;
+  font-size: 11px;
+  color: #777;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.vmu-fx-preset-item-del:hover { background: rgba(230,76,76,0.2); color: #e64c4c; }
+.vmu-fx-preset-item-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 3px;
+}
+.vmu-fx-preset-tag {
+  font-size: 9.5px;
+  color: #888;
+  background: rgba(255,255,255,0.05);
+  border-radius: 8px;
+  padding: 1px 6px;
+}
+.vmu-fx-preset-empty {
+  font-size: 11px;
+  color: #666;
+  text-align: center;
+  padding: 10px 0;
+}
+
+.vmu-fx-preset-saveform {
+  margin: 8px 12px 0;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.vmu-fx-preset-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 12px;
+  color: #d0d2d4;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  padding: 5px 8px;
+}
+.vmu-fx-preset-input::placeholder { color: #666; }
+.vmu-fx-preset-saveform-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.vmu-fx-preset-btn-primary, .vmu-fx-preset-btn-secondary {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  border: none;
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.vmu-fx-preset-btn-primary { background: rgba(38,136,235,0.85); color: #fff; }
+.vmu-fx-preset-btn-primary:hover { background: rgba(38,136,235,1); }
+.vmu-fx-preset-btn-secondary { background: rgba(255,255,255,0.06); color: #9ea1a3; }
+.vmu-fx-preset-btn-secondary:hover { background: rgba(255,255,255,0.1); color: #d0d2d4; }
+
+/* ── Audio FX: transfer-curve / history canvases ───────────────────────────── */
+.vmu-audiofx-canvas-wrap {
+  margin: 4px 0 10px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.vmu-audiofx-canvas {
+  display: block;
+  width: 100%;
+  height: 120px;
+}
+.vmu-audiofx-canvas-history { height: 80px; }
+.vmu-fx-history-legend {
+  display: flex;
+  gap: 12px;
+  font-size: 10.5px;
+  color: #999;
+  margin: -4px 0 10px;
+}
+.vmu-fx-history-legend span { display: flex; align-items: center; gap: 4px; }
+.vmu-fx-legend-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+/* ── Audio FX: custom cascading dropdown (Style / Oversampling) ─────────────
+   Replaces the native <select> — its popup is unstyleable OS chrome — with a
+   button + absolutely-positioned option list that matches the panel's own
+   dark popover look (same opaque rgb(41,41,41)/shadow recipe as
+   .vmu-audiofx-panel), selected row highlighted solid blue, others dimmed. */
+.vmu-fx-dd { position: relative; }
+.vmu-fx-dd-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  font-family: inherit;
+  font-size: 12px;
+  color: #d0d2d4;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.vmu-fx-dd-btn:hover { background: rgba(255,255,255,0.1); }
+.vmu-fx-dd-btn span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vmu-fx-dd-chevron {
+  flex-shrink: 0;
+  color: #9ea1a3;
+  transition: transform .12s;
+}
+.vmu-fx-dd-open .vmu-fx-dd-chevron { transform: rotate(180deg); }
+.vmu-fx-dd-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 140px;
+  background: rgb(41, 41, 41);
+  border-radius: 10px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.35);
+  padding: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  z-index: 10;
+}
+.vmu-fx-dd-list::-webkit-scrollbar { width: 4px; }
+.vmu-fx-dd-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 2px; }
+.vmu-fx-dd-item {
+  display: block;
+  width: 100%;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  color: #7a7d80;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 10px;
+  cursor: pointer;
+  transition: background .1s, color .1s;
+}
+.vmu-fx-dd-item:hover { background: rgba(255,255,255,0.06); color: #d0d2d4; }
+.vmu-fx-dd-item.active {
+  background: rgba(38,136,235,0.85);
+  color: #fff;
+}
+.vmu-fx-dd-item.active:hover { background: rgba(38,136,235,1); }

@@ -31,6 +31,9 @@
     <circle cx="8" cy="5.5" r="1.6" fill="currentColor"/>
     <circle cx="13" cy="12.5" r="1.6" fill="currentColor"/>
   </svg>`;
+  const ICON_DD_CHEVRON = `<svg class="vmu-fx-dd-chevron" width="10" height="10" viewBox="0 0 10 10" fill="none">
+    <path d="M2 3.5l3 3 3-3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
   const STATUS_ICON = {
     pending: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="#555" stroke-width="1.3"/><rect x="5" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/><rect x="7.6" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/></svg>`,
     uploading: `<svg class="vmu-spin" width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="rgba(38,136,235,0.2)" stroke-width="1.5"/><path d="M7 1.5A5.5 5.5 0 0112.5 7" stroke="#2688eb" stroke-width="1.5" stroke-linecap="round"/></svg>`,
@@ -127,8 +130,27 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, audioFxEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, audioFxEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxActiveTab: 'limiter', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
+  // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
+  // transfer-curve visualization runs in this (page) realm and can't import
+  // the worklet module, so the knee formula's shape constants are duplicated
+  // here. Keep in sync if STYLE_PRESETS changes.
+  const AUDIOFX_STYLE_KNEE_SHAPES = [3.0, 2.5, 2.0, 2.0, 1.6, 1.3, 1.0];
   const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+  const AUDIOFX_OVERSAMPLE_LABELS = ['2x', '4x', '8x', '16x'];
+  // Single source of truth for "what counts as an audio-FX sound parameter" —
+  // saveSettings()'s whitelist and preset snapshots both iterate this list,
+  // so a new limiter/EQ field only ever needs adding here once. (Deliberately
+  // excludes audioFxActiveTab/audioFxCurrentPreset/audioFxAB(Active) — those
+  // are UI/meta navigation state, not sound parameters, so presets don't
+  // touch them.)
+  const AUDIOFX_FIELD_KEYS = [
+    'audioFxEnabled', 'audioFxThreshold', 'audioFxRatio', 'audioFxInputGain', 'audioFxOutputGain',
+    'audioFxAttack', 'audioFxRelease', 'audioFxKnee', 'audioFxCeiling', 'audioFxCeilingR', 'audioFxStyle',
+    'audioFxAutoRelease', 'audioFxTruePeak', 'audioFxOversampling', 'audioFxAutoGain', 'audioFxProcessingMode', 'audioFxBands',
+  ];
+  const AUDIOFX_PRESETS_KEY = 'vmu_audiofx_presets_v1';
 
   function loadSettings() {
     try {
@@ -140,7 +162,7 @@
 
   function saveSettings() {
     try {
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      const out = {
         autoPlaylist: settings.autoPlaylist,
         coverDataUrl: settings.coverDataUrl,
         autoMeta: settings.autoMeta,
@@ -152,17 +174,45 @@
         optimizeBigPlaylists: settings.optimizeBigPlaylists,
         hideScrollToTop: settings.hideScrollToTop,
         pinTabsBar: settings.pinTabsBar,
-        audioFxEnabled: settings.audioFxEnabled,
-        audioFxThreshold: settings.audioFxThreshold,
-        audioFxRatio: settings.audioFxRatio,
-        audioFxInputGain: settings.audioFxInputGain,
-        audioFxOutputGain: settings.audioFxOutputGain,
-        audioFxAttack: settings.audioFxAttack,
-        audioFxRelease: settings.audioFxRelease,
-        audioFxBands: settings.audioFxBands,
-      }));
+        audioFxActiveTab: settings.audioFxActiveTab,
+        audioFxCurrentPreset: settings.audioFxCurrentPreset,
+        audioFxAB: settings.audioFxAB,
+        audioFxABActive: settings.audioFxABActive,
+      };
+      for (const key of AUDIOFX_FIELD_KEYS) out[key] = settings[key];
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(out));
     } catch {}
   }
+
+  function loadAudioFxPresets() {
+    try {
+      const s = localStorage.getItem(AUDIOFX_PRESETS_KEY);
+      return s ? JSON.parse(s) : {};
+    } catch { return {}; }
+  }
+  function saveAudioFxPresets(presets) {
+    try { localStorage.setItem(AUDIOFX_PRESETS_KEY, JSON.stringify(presets)); } catch {}
+  }
+  function snapshotAudioFxSettings() {
+    const snap = {};
+    // audioFxBands is the one array-valued field — copy it, not just the
+    // reference. Without this, A/B slots (and presets) captured while
+    // sharing the live settings.audioFxBands array would alias each other:
+    // editing EQ bands on slot B would silently mutate slot A's stored snapshot
+    // too, since both would still point at the same underlying array.
+    for (const key of AUDIOFX_FIELD_KEYS) {
+      const v = settings[key];
+      snap[key] = Array.isArray(v) ? v.slice() : v;
+    }
+    return snap;
+  }
+  // Presets originally stored the flat settings snapshot directly under the
+  // name key; richer presets (category/tags) wrap it as {settings, category,
+  // tags} instead. These three accessors read through either shape so
+  // presets saved before this change keep working untouched.
+  function presetSettingsOf(entry) { return entry && entry.settings ? entry.settings : entry; }
+  function presetCategoryOf(entry) { return (entry && entry.category) || 'Без категории'; }
+  function presetTagsOf(entry) { return (entry && Array.isArray(entry.tags)) ? entry.tags : []; }
 
   loadSettings();
 
@@ -176,10 +226,284 @@
       outputGain: settings.audioFxOutputGain,
       attack: settings.audioFxAttack,
       release: settings.audioFxRelease,
+      knee: settings.audioFxKnee,
+      ceiling: settings.audioFxCeiling,
+      ceilingR: settings.audioFxCeilingR,
+      style: settings.audioFxStyle,
+      autoRelease: settings.audioFxAutoRelease,
+      truePeak: settings.audioFxTruePeak,
+      oversampling: settings.audioFxOversampling,
+      autoGain: settings.audioFxAutoGain,
+      processingMode: settings.audioFxProcessingMode,
       bands: settings.audioFxBands,
     }, '*');
   }
+  // The limiter's DSP lives in a separate AudioWorklet module — injected.js
+  // runs in page context and has no chrome.runtime access to resolve its
+  // extension URL, so content.js (which does) hands it over once up front.
+  window.postMessage({ type: 'VMU_AUDIOFX_WORKLET_URL', url: chrome.runtime.getURL('limiter-worklet.js') }, '*');
   postAudioFxState();
+
+  // ─── audio FX metering: rAF-painted, decoupled from message arrival ───────
+  // VMU_AUDIOFX_METER messages arrive off the audio thread at a fixed rate
+  // (~47x/sec) but aren't perfectly paced on the main thread — writing to the
+  // DOM straight from the message handler meant a burst of queued messages
+  // painted several times in a row, then nothing until the next burst, which
+  // read as "jumping and lagging" rather than smooth motion. The handler now
+  // only stores the latest raw values (cheap); a single requestAnimationFrame
+  // loop, running only while the panel is open, does all the painting once
+  // per displayed frame. It also adds real peak-hold ballistics for True Peak
+  // and input level, which the worklet reports as instantaneous per-report-
+  // block maxima with no smoothing at the source (unlike gain reduction,
+  // which is already envelope-smoothed inside the worklet).
+  const meterRaw = {
+    reductionDb: 0, inputPeakDb: null, truePeakDb: null,
+    momentaryLufs: null, shortTermLufs: null, integratedLufs: null, lra: null,
+    autoGainTrimDb: null,
+  };
+  const PEAK_HOLD_MS = 1500;
+  const PEAK_DECAY_DB_PER_SEC = 20;
+  const meterDisp = {
+    truePeakDb: -60, truePeakHoldUntil: 0,
+    inputPeakDb: -60, inputPeakHoldUntil: 0,
+  };
+  const HISTORY_SECONDS = 15;
+  const meterHistory = []; // ring of {t, inputDb, reductionDb, truePeakDb}, trimmed to HISTORY_SECONDS
+  let meterLoopRunning = false;
+  let lastMeterFrameTs = 0;
+
+  window.addEventListener('message', e => {
+    if (e.source !== window || !e.data || e.data.type !== 'VMU_AUDIOFX_METER') return;
+    meterRaw.reductionDb = Number(e.data.reductionDb) || 0;
+    meterRaw.inputPeakDb = typeof e.data.inputPeakDb === 'number' ? e.data.inputPeakDb : null;
+    meterRaw.truePeakDb = typeof e.data.truePeakDb === 'number' ? e.data.truePeakDb : null;
+    meterRaw.momentaryLufs = e.data.momentaryLufs;
+    meterRaw.shortTermLufs = e.data.shortTermLufs;
+    meterRaw.integratedLufs = e.data.integratedLufs;
+    meterRaw.lra = e.data.lra;
+    meterRaw.autoGainTrimDb = e.data.autoGainTrimDb;
+  });
+
+  // Standard peak-meter ballistic: jump up instantly to a new higher peak,
+  // hold there for PEAK_HOLD_MS, then decay at a fixed dB/sec.
+  function applyPeakHold(disp, dbKey, holdKey, targetDb, nowMs, dtSec) {
+    if (typeof targetDb !== 'number' || !isFinite(targetDb)) return;
+    if (targetDb >= disp[dbKey]) {
+      disp[dbKey] = targetDb;
+      disp[holdKey] = nowMs + PEAK_HOLD_MS;
+    } else if (nowMs >= disp[holdKey]) {
+      disp[dbKey] = Math.max(targetDb, disp[dbKey] - PEAK_DECAY_DB_PER_SEC * dtSec);
+    }
+  }
+
+  // Mirrors the worklet's knee formula (see limiter-worklet.js's STYLE_PRESETS
+  // comment) so the transfer-curve canvas can plot it without any DSP state —
+  // pure function of the current settings, evaluated at whatever input dB the
+  // caller asks for.
+  function limiterCurveOutputDb(inputDb) {
+    const threshold = settings.audioFxThreshold;
+    const ratio = Math.max(1, settings.audioFxRatio);
+    const knee = Math.max(0, settings.audioFxKnee);
+    const halfKnee = knee / 2;
+    const styleIdx = Math.max(0, Math.min(AUDIOFX_STYLE_KNEE_SHAPES.length - 1, settings.audioFxStyle));
+    const kneeShape = AUDIOFX_STYLE_KNEE_SHAPES[styleIdx];
+    const over = inputDb - threshold;
+    let reductionDb = 0;
+    if (knee > 0 && over > -halfKnee && over < halfKnee) {
+      const x = over + halfKnee;
+      reductionDb = halfKnee * Math.pow(x / knee, kneeShape) * (1 - 1 / ratio);
+    } else if (over >= halfKnee) {
+      reductionDb = over * (1 - 1 / ratio);
+    }
+    return Math.min(inputDb - reductionDb, settings.audioFxCeiling);
+  }
+
+  // Resizes the canvas' backing buffer to match its CSS size at the current
+  // devicePixelRatio (only when it actually changed) and returns a context
+  // pre-scaled so all drawing below can keep using CSS-pixel coordinates.
+  function sizeCanvasForDisplay(canvas) {
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+    if (!cssW || !cssH) return null;
+    const pxW = Math.round(cssW * dpr), pxH = Math.round(cssH * dpr);
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, w: cssW, h: cssH };
+  }
+
+  function drawTransferCurve() {
+    if (settings.audioFxActiveTab !== 'limiter') return;
+    const canvas = document.getElementById('vmu-fx-curve');
+    if (!canvas) return;
+    const sized = sizeCanvasForDisplay(canvas);
+    if (!sized) return;
+    const { ctx, w: W, h: H } = sized;
+    ctx.clearRect(0, 0, W, H);
+
+    const dbMin = -60, dbMax = 6;
+    const xOf = db => (db - dbMin) / (dbMax - dbMin) * W;
+    const yOf = db => H - (Math.max(dbMin, Math.min(dbMax, db)) - dbMin) / (dbMax - dbMin) * H;
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let db = dbMin; db <= dbMax; db += 12) {
+      ctx.beginPath(); ctx.moveTo(xOf(db) + 0.5, 0); ctx.lineTo(xOf(db) + 0.5, H); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, yOf(db) + 0.5); ctx.lineTo(W, yOf(db) + 0.5); ctx.stroke();
+    }
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+    ctx.beginPath(); ctx.moveTo(xOf(dbMin), yOf(dbMin)); ctx.lineTo(xOf(dbMax), yOf(dbMax)); ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(230,76,76,0.55)';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(0, yOf(settings.audioFxCeiling)); ctx.lineTo(W, yOf(settings.audioFxCeiling)); ctx.stroke();
+    ctx.strokeStyle = 'rgba(230,166,60,0.55)';
+    ctx.beginPath(); ctx.moveTo(xOf(settings.audioFxThreshold), 0); ctx.lineTo(xOf(settings.audioFxThreshold), H); ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.strokeStyle = '#2688eb';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    const STEPS = 160;
+    for (let i = 0; i <= STEPS; i++) {
+      const inDb = dbMin + (dbMax - dbMin) * i / STEPS;
+      const x = xOf(inDb), y = yOf(limiterCurveOutputDb(inDb));
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Live operating point: measured input peak vs. measured reduction —
+    // the actual current point on the curve, not the theoretical one.
+    if (typeof meterRaw.inputPeakDb === 'number' && settings.audioFxEnabled) {
+      const inDb = meterDisp.inputPeakDb;
+      const outDb = Math.min(inDb - meterRaw.reductionDb, settings.audioFxCeiling);
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(xOf(inDb), yOf(outDb), 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawHistoryGraph() {
+    if (settings.audioFxActiveTab !== 'metering') return;
+    const canvas = document.getElementById('vmu-fx-history');
+    if (!canvas || !meterHistory.length) return;
+    const sized = sizeCanvasForDisplay(canvas);
+    if (!sized) return;
+    const { ctx, w: W, h: H } = sized;
+    ctx.clearRect(0, 0, W, H);
+
+    const now = meterHistory[meterHistory.length - 1].t;
+    const t0 = now - HISTORY_SECONDS * 1000;
+    const xOf = t => (t - t0) / (HISTORY_SECONDS * 1000) * W;
+    const dbMin = -60, dbMax = 0;
+    const yOf = db => H - (Math.max(dbMin, Math.min(dbMax, db)) - dbMin) / (dbMax - dbMin) * H;
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    for (let db = dbMin; db <= dbMax; db += 12) {
+      ctx.beginPath(); ctx.moveTo(0, yOf(db) + 0.5); ctx.lineTo(W, yOf(db) + 0.5); ctx.stroke();
+    }
+
+    // Gain reduction — filled band from 0dB down to -reductionDb.
+    ctx.fillStyle = 'rgba(230,76,76,0.32)';
+    ctx.beginPath();
+    ctx.moveTo(xOf(meterHistory[0].t), yOf(0));
+    for (const p of meterHistory) ctx.lineTo(xOf(p.t), yOf(-p.reductionDb));
+    ctx.lineTo(xOf(meterHistory[meterHistory.length - 1].t), yOf(0));
+    ctx.closePath();
+    ctx.fill();
+
+    // Input level line.
+    ctx.strokeStyle = 'rgba(150,180,255,0.85)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    let started = false;
+    for (const p of meterHistory) {
+      if (typeof p.inputDb !== 'number') continue;
+      const x = xOf(p.t), y = yOf(p.inputDb);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // True peak — sparse dots (only populated while the True Peak toggle is on).
+    ctx.fillStyle = '#e6a63c';
+    for (const p of meterHistory) {
+      if (typeof p.truePeakDb !== 'number') continue;
+      ctx.fillRect(xOf(p.t) - 0.5, yOf(p.truePeakDb) - 0.5, 1, 1);
+    }
+
+    // Playhead — the current instant, always pinned to the right edge.
+    ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+    ctx.beginPath(); ctx.moveTo(W - 1, 0); ctx.lineTo(W - 1, H); ctx.stroke();
+  }
+
+  function paintMeters(nowMs) {
+    const dtSec = lastMeterFrameTs ? Math.min(0.25, (nowMs - lastMeterFrameTs) / 1000) : 0;
+    lastMeterFrameTs = nowMs;
+
+    applyPeakHold(meterDisp, 'truePeakDb', 'truePeakHoldUntil', meterRaw.truePeakDb, nowMs, dtSec);
+    applyPeakHold(meterDisp, 'inputPeakDb', 'inputPeakHoldUntil', meterRaw.inputPeakDb, nowMs, dtSec);
+
+    const db = meterRaw.reductionDb;
+    const fill = document.getElementById('vmu-fx-meter-fill');
+    const val = document.getElementById('vmu-fx-meter-val');
+    if (fill) fill.style.width = Math.max(0, Math.min(100, (db / 24) * 100)) + '%';
+    if (val) val.textContent = '-' + db.toFixed(1) + ' дБ';
+
+    const tpFill = document.getElementById('vmu-fx-tp-fill');
+    const tpVal = document.getElementById('vmu-fx-tp-val');
+    if (meterRaw.truePeakDb !== null) {
+      const tp = meterDisp.truePeakDb;
+      if (tpFill) tpFill.style.width = Math.max(0, Math.min(100, ((tp + 60) / 60) * 100)) + '%';
+      if (tpVal) tpVal.textContent = tp.toFixed(1) + ' дБTP';
+    } else {
+      if (tpFill) tpFill.style.width = '0%';
+      if (tpVal) tpVal.textContent = '— дБTP';
+    }
+
+    const fmtLufs = v => typeof v === 'number' ? v.toFixed(1) + ' LUFS' : '—';
+    const mEl = document.getElementById('vmu-fx-lufs-m');
+    const sEl = document.getElementById('vmu-fx-lufs-s');
+    const iEl = document.getElementById('vmu-fx-lufs-i');
+    const lraEl = document.getElementById('vmu-fx-lra');
+    if (mEl) mEl.textContent = fmtLufs(meterRaw.momentaryLufs);
+    if (sEl) sEl.textContent = fmtLufs(meterRaw.shortTermLufs);
+    if (iEl) iEl.textContent = fmtLufs(meterRaw.integratedLufs);
+    if (lraEl) lraEl.textContent = typeof meterRaw.lra === 'number' ? meterRaw.lra.toFixed(1) + ' LU' : '—';
+
+    const agVal = document.getElementById('vmu-fx-autogain-val');
+    if (agVal) {
+      const ag = meterRaw.autoGainTrimDb;
+      agVal.textContent = typeof ag === 'number' ? (ag >= 0 ? '+' : '') + ag.toFixed(1) + ' дБ' : '0.0 дБ';
+    }
+
+    meterHistory.push({ t: nowMs, inputDb: meterRaw.inputPeakDb, reductionDb: db, truePeakDb: meterRaw.truePeakDb });
+    const cutoff = nowMs - HISTORY_SECONDS * 1000;
+    while (meterHistory.length && meterHistory[0].t < cutoff) meterHistory.shift();
+
+    drawTransferCurve();
+    drawHistoryGraph();
+  }
+
+  function meterTick(ts) {
+    if (!meterLoopRunning) return;
+    paintMeters(ts);
+    requestAnimationFrame(meterTick);
+  }
+  function startMeterLoop() {
+    if (meterLoopRunning) return;
+    meterLoopRunning = true;
+    lastMeterFrameTs = 0;
+    requestAnimationFrame(meterTick);
+  }
+  function stopMeterLoop() {
+    meterLoopRunning = false;
+  }
 
   // ─── layout customizations (pin sidebar, horizontal offset) ──────────────
   // Drive layout tweaks through a single <style id="vmu-layout-style"> tag so
@@ -330,6 +654,68 @@
     return hz >= 1000 ? (hz / 1000) + 'k' : String(hz);
   }
 
+  // Custom cascading dropdown — replaces native <select> for Style/Oversampling
+  // so the option list can actually be themed (a native <select>'s popup is
+  // OS-chrome and can't be styled to match the panel's dark UI). Markup is a
+  // button (current label + chevron) followed by an absolutely-positioned
+  // option list, toggled via a couple of data-vmu-dd-* hooks so the same
+  // wiring works for any dropdown built with this markup.
+  function buildDropdownHtml(containerId, options, selectedIdx) {
+    return `
+      <div class="vmu-fx-dd" id="${containerId}">
+        <button type="button" class="vmu-fx-dd-btn" data-vmu-dd-btn>
+          <span data-vmu-dd-label>${escHtml(options[selectedIdx] ?? options[0])}</span>
+          ${ICON_DD_CHEVRON}
+        </button>
+        <div class="vmu-fx-dd-list" data-vmu-dd-list style="display:none">
+          ${options.map((label, i) => `<button type="button" class="vmu-fx-dd-item${i === selectedIdx ? ' active' : ''}" data-value="${i}">${escHtml(label)}</button>`).join('')}
+        </div>
+      </div>`;
+  }
+  // Wires open/close + selection for one dropdown built by buildDropdownHtml.
+  // onSelect(idx) fires when the user picks an option; the caller owns
+  // updating settings/posting state, this only owns the widget's own UI.
+  function initCustomDropdown(containerId, onSelect) {
+    const root = document.getElementById(containerId);
+    if (!root) return;
+    const btn = root.querySelector('[data-vmu-dd-btn]');
+    const label = root.querySelector('[data-vmu-dd-label]');
+    const list = root.querySelector('[data-vmu-dd-list]');
+    if (!btn || !list) return;
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const opening = list.style.display === 'none';
+      document.querySelectorAll('.vmu-fx-dd-list').forEach(l => {
+        l.style.display = 'none';
+        l.closest('.vmu-fx-dd')?.classList.remove('vmu-fx-dd-open');
+      });
+      if (opening) {
+        list.style.display = '';
+        root.classList.add('vmu-fx-dd-open');
+      }
+    });
+    list.addEventListener('click', e => {
+      const item = e.target.closest('.vmu-fx-dd-item');
+      if (!item) return;
+      const idx = parseInt(item.dataset.value, 10) || 0;
+      list.querySelectorAll('.vmu-fx-dd-item').forEach(el => el.classList.toggle('active', el === item));
+      if (label) label.textContent = item.textContent;
+      list.style.display = 'none';
+      root.classList.remove('vmu-fx-dd-open');
+      onSelect(idx);
+    });
+  }
+  // Updates a dropdown's displayed label/active option from outside — used
+  // by refreshAllAudioFxControls after a preset/A-B load changes the value
+  // from something other than the user clicking the dropdown itself.
+  function syncCustomDropdown(containerId, options, idx) {
+    const root = document.getElementById(containerId);
+    if (!root) return;
+    root.querySelectorAll('.vmu-fx-dd-item').forEach((el, i) => el.classList.toggle('active', i === idx));
+    const label = root.querySelector('[data-vmu-dd-label]');
+    if (label && options[idx] !== undefined) label.textContent = options[idx];
+  }
+
   function buildAudioFxPanel() {
     const limiterRow = (id, label, min, max, step, value, unit) => `
       <div class="vmu-setting-row vmu-slider-row">
@@ -349,6 +735,10 @@
         <span class="vmu-eq-band-freq">${formatFreqLabel(AUDIOFX_FREQS[i])}</span>
       </div>`).join('');
 
+    const tab = settings.audioFxActiveTab || 'limiter';
+    const isTab = t => tab === t ? ' active' : '';
+    const pageDisplay = t => tab === t ? '' : ' style="display:none"';
+
     return `
       <div id="vmu-audiofx-panel" class="vmu-audiofx-panel">
         <div class="vmu-audiofx-head">
@@ -359,25 +749,215 @@
           </label>
           <button type="button" id="vmu-audiofx-close" class="vmu-check-close" title="Закрыть">${ICON_CLOSE}</button>
         </div>
-        <div class="vmu-audiofx-body">
-          <div class="vmu-audiofx-section">
-            <div class="vmu-audiofx-section-title">Лимитер</div>
-            ${limiterRow('vmu-fx-threshold', 'Threshold', -60, 0, 1, settings.audioFxThreshold, ' дБ')}
-            ${limiterRow('vmu-fx-ratio', 'Ratio', 1, 20, 0.5, settings.audioFxRatio, ':1')}
-            ${limiterRow('vmu-fx-input', 'Input', -24, 24, 0.5, settings.audioFxInputGain, ' дБ')}
-            ${limiterRow('vmu-fx-output', 'Output', -24, 24, 0.5, settings.audioFxOutputGain, ' дБ')}
-            ${limiterRow('vmu-fx-attack', 'Attack', 0, 100, 1, settings.audioFxAttack, ' мс')}
-            ${limiterRow('vmu-fx-release', 'Release', 0, 1000, 5, settings.audioFxRelease, ' мс')}
+        <div class="vmu-audiofx-presets-row">
+          <button type="button" id="vmu-fx-preset-toggle" class="vmu-audiofx-select vmu-fx-preset-toggle-btn">
+            <span id="vmu-fx-preset-current">${settings.audioFxCurrentPreset ? escHtml(settings.audioFxCurrentPreset) : '— пресет —'}</span>
+          </button>
+          <button type="button" id="vmu-fx-preset-save" class="vmu-slider-reset" title="Сохранить текущие настройки как пресет">＋</button>
+          <div class="vmu-fx-ab-switch" id="vmu-fx-ab-switch" title="Быстрое A/B-сравнение двух наборов настроек">
+            <button type="button" data-vmu-ab="A" class="${settings.audioFxABActive === 'A' ? 'active' : ''}">A</button>
+            <button type="button" data-vmu-ab="B" class="${settings.audioFxABActive === 'B' ? 'active' : ''}">B</button>
           </div>
-          <div class="vmu-audiofx-section">
-            <div class="vmu-audiofx-section-title">
-              Эквалайзер
-              <button type="button" id="vmu-fx-eq-reset" class="vmu-slider-reset" title="Сбросить все полосы">↺</button>
+        </div>
+        <div id="vmu-fx-preset-browser" class="vmu-fx-preset-browser" style="display:none">
+          <input type="text" id="vmu-fx-preset-search" class="vmu-fx-preset-search" placeholder="Поиск по названию или тегу...">
+          <div id="vmu-fx-preset-cats" class="vmu-fx-preset-cats"></div>
+          <div id="vmu-fx-preset-list" class="vmu-fx-preset-list"></div>
+        </div>
+        <div id="vmu-fx-preset-saveform" class="vmu-fx-preset-saveform" style="display:none">
+          <input type="text" id="vmu-fx-preset-name" class="vmu-fx-preset-input" placeholder="Название пресета">
+          <input type="text" id="vmu-fx-preset-category" class="vmu-fx-preset-input" placeholder="Категория" list="vmu-fx-preset-cat-list">
+          <datalist id="vmu-fx-preset-cat-list"></datalist>
+          <input type="text" id="vmu-fx-preset-tags" class="vmu-fx-preset-input" placeholder="Теги через запятую">
+          <div class="vmu-fx-preset-saveform-actions">
+            <button type="button" id="vmu-fx-preset-save-confirm" class="vmu-fx-preset-btn-primary">Сохранить</button>
+            <button type="button" id="vmu-fx-preset-save-cancel" class="vmu-fx-preset-btn-secondary">Отмена</button>
+          </div>
+        </div>
+        <div class="vmu-audiofx-tabs" id="vmu-audiofx-tabs" role="tablist">
+          <button type="button" data-vmu-fxtab="limiter" class="${isTab('limiter')}">Лимитер</button>
+          <button type="button" data-vmu-fxtab="eq" class="${isTab('eq')}">EQ</button>
+          <button type="button" data-vmu-fxtab="metering" class="${isTab('metering')}">Метринг</button>
+        </div>
+        <div class="vmu-audiofx-body">
+          <div class="vmu-audiofx-tabpage${isTab('limiter')}" data-vmu-fxtab-page="limiter"${pageDisplay('limiter')}>
+            <div class="vmu-audiofx-section">
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Style</span>
+                </div>
+                ${buildDropdownHtml('vmu-fx-style-dd', AUDIOFX_STYLE_NAMES, settings.audioFxStyle)}
+              </div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Обработка стерео</span>
+                </div>
+                <div class="vmu-mode-switch" id="vmu-fx-procmode" role="tablist">
+                  <button type="button" data-vmu-procmode="0" class="${settings.audioFxProcessingMode === 0 ? 'active' : ''}">Linked</button>
+                  <button type="button" data-vmu-procmode="1" class="${settings.audioFxProcessingMode === 1 ? 'active' : ''}">Unlinked</button>
+                  <button type="button" data-vmu-procmode="2" class="${settings.audioFxProcessingMode === 2 ? 'active' : ''}">M-S</button>
+                </div>
+              </div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Auto Release</span>
+                  <span class="vmu-setting-hint">Скорость восстановления подстраивается под материал</span>
+                </div>
+                <label class="vmu-toggle">
+                  <input type="checkbox" id="vmu-fx-autorelease" ${settings.audioFxAutoRelease ? 'checked' : ''}>
+                  <span class="vmu-toggle-track"></span>
+                </label>
+              </div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">True Peak</span>
+                  <span class="vmu-setting-hint">Учитывать межсэмпловые пики при детекции</span>
+                </div>
+                <label class="vmu-toggle">
+                  <input type="checkbox" id="vmu-fx-truepeak" ${settings.audioFxTruePeak ? 'checked' : ''}>
+                  <span class="vmu-toggle-track"></span>
+                </label>
+              </div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Oversampling</span>
+                  <span class="vmu-setting-hint">Кратность передискретизации для True Peak</span>
+                </div>
+                ${buildDropdownHtml('vmu-fx-oversampling-dd', AUDIOFX_OVERSAMPLE_LABELS, settings.audioFxOversampling)}
+              </div>
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Auto Gain</span>
+                  <span class="vmu-setting-hint">Компенсирует громкость лимитера для честного A/B — приближение, не точный LUFS-матчинг</span>
+                </div>
+                <span class="vmu-slider-value" id="vmu-fx-autogain-val" style="margin-right:8px">0.0 дБ</span>
+                <label class="vmu-toggle">
+                  <input type="checkbox" id="vmu-fx-autogain" ${settings.audioFxAutoGain ? 'checked' : ''}>
+                  <span class="vmu-toggle-track"></span>
+                </label>
+              </div>
+              <div class="vmu-audiofx-canvas-wrap">
+                <canvas id="vmu-fx-curve" class="vmu-audiofx-canvas"></canvas>
+              </div>
+              <div class="vmu-audiofx-meter-row">
+                <span class="vmu-audiofx-meter-label">Gain Reduction</span>
+                <div class="vmu-audiofx-meter"><div class="vmu-audiofx-meter-fill" id="vmu-fx-meter-fill"></div></div>
+                <span class="vmu-audiofx-meter-val" id="vmu-fx-meter-val">0.0 дБ</span>
+              </div>
+              ${limiterRow('vmu-fx-threshold', 'Threshold', -60, 0, 1, settings.audioFxThreshold, ' дБ')}
+              ${limiterRow('vmu-fx-ratio', 'Ratio', 1, 20, 0.5, settings.audioFxRatio, ':1')}
+              ${limiterRow('vmu-fx-knee', 'Knee', 0, 40, 1, settings.audioFxKnee, ' дБ')}
+              ${limiterRow('vmu-fx-ceiling', 'Ceiling', -20, 0, 0.1, settings.audioFxCeiling, ' дБ')}
+              <div class="vmu-setting-row vmu-slider-row" id="vmu-fx-ceilingr-row" style="${settings.audioFxProcessingMode === 1 ? '' : 'display:none'}">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Ceiling R</span>
+                  <span class="vmu-setting-hint">Отдельный потолок правого канала (только Unlinked)</span>
+                </div>
+                <div class="vmu-slider-wrap">
+                  <input type="range" id="vmu-fx-ceilingr" class="vmu-slider" min="-20" max="0" step="0.1" value="${settings.audioFxCeilingR}">
+                  <span class="vmu-slider-value" id="vmu-fx-ceilingr-val">${Math.round(settings.audioFxCeilingR * 10) / 10} дБ</span>
+                  <button type="button" id="vmu-fx-ceilingr-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
+                </div>
+              </div>
+              ${limiterRow('vmu-fx-input', 'Input', -24, 24, 0.5, settings.audioFxInputGain, ' дБ')}
+              ${limiterRow('vmu-fx-output', 'Output', -24, 24, 0.5, settings.audioFxOutputGain, ' дБ')}
+              ${limiterRow('vmu-fx-attack', 'Attack', 0, 100, 1, settings.audioFxAttack, ' мс')}
+              ${limiterRow('vmu-fx-release', 'Release', 0, 1000, 5, settings.audioFxRelease, ' мс')}
             </div>
-            <div class="vmu-eq-bands">${bands}</div>
+          </div>
+          <div class="vmu-audiofx-tabpage${isTab('eq')}" data-vmu-fxtab-page="eq"${pageDisplay('eq')}>
+            <div class="vmu-audiofx-section">
+              <div class="vmu-audiofx-section-title">
+                Полосы
+                <button type="button" id="vmu-fx-eq-reset" class="vmu-slider-reset" title="Сбросить все полосы">↺</button>
+              </div>
+              <div class="vmu-eq-bands">${bands}</div>
+            </div>
+          </div>
+          <div class="vmu-audiofx-tabpage${isTab('metering')}" data-vmu-fxtab-page="metering"${pageDisplay('metering')}>
+            <div class="vmu-audiofx-section">
+              <div class="vmu-audiofx-section-title">
+                Метринг
+                <button type="button" id="vmu-fx-lufs-reset" class="vmu-slider-reset" title="Сбросить накопленные значения">↺</button>
+              </div>
+              <div class="vmu-audiofx-canvas-wrap">
+                <canvas id="vmu-fx-history" class="vmu-audiofx-canvas vmu-audiofx-canvas-history"></canvas>
+              </div>
+              <div class="vmu-fx-history-legend">
+                <span><i class="vmu-fx-legend-dot" style="background:rgba(150,180,255,0.85)"></i>Input</span>
+                <span><i class="vmu-fx-legend-dot" style="background:rgba(230,76,76,0.6)"></i>Gain Reduction</span>
+                <span><i class="vmu-fx-legend-dot" style="background:#e6a63c"></i>True Peak</span>
+              </div>
+              <div class="vmu-audiofx-meter-row">
+                <span class="vmu-audiofx-meter-label">True Peak</span>
+                <div class="vmu-audiofx-meter"><div class="vmu-audiofx-meter-fill vmu-audiofx-meter-fill-tp" id="vmu-fx-tp-fill"></div></div>
+                <span class="vmu-audiofx-meter-val" id="vmu-fx-tp-val">— дБTP</span>
+              </div>
+              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Momentary</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-m">—</span></div>
+              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Short-term</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-s">—</span></div>
+              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Integrated</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-i">—</span></div>
+              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">LRA</span></div><span class="vmu-slider-value" id="vmu-fx-lra">—</span></div>
+              <span class="vmu-setting-hint">Требует включённого True Peak для показаний true-peak метра.</span>
+            </div>
           </div>
         </div>
       </div>`;
+  }
+
+  // Re-syncs every control's displayed value from `settings` — needed after
+  // loading a preset, since that changes many fields at once from a
+  // non-user-input source (nothing else in the panel does that; every other
+  // update flows through a single control's own change handler).
+  function refreshAllAudioFxControls() {
+    const setChecked = (id, val) => { const el = document.getElementById(id); if (el) el.checked = !!val; };
+    setChecked('vmu-fx-enable', settings.audioFxEnabled);
+    setChecked('vmu-fx-autorelease', settings.audioFxAutoRelease);
+    setChecked('vmu-fx-truepeak', settings.audioFxTruePeak);
+    setChecked('vmu-fx-autogain', settings.audioFxAutoGain);
+
+    syncCustomDropdown('vmu-fx-style-dd', AUDIOFX_STYLE_NAMES, settings.audioFxStyle);
+    syncCustomDropdown('vmu-fx-oversampling-dd', AUDIOFX_OVERSAMPLE_LABELS, settings.audioFxOversampling);
+
+    const procSwitch = document.getElementById('vmu-fx-procmode');
+    if (procSwitch) {
+      procSwitch.querySelectorAll('button').forEach(b => {
+        b.classList.toggle('active', parseInt(b.dataset.vmuProcmode, 10) === settings.audioFxProcessingMode);
+      });
+    }
+    const ceilingRRow = document.getElementById('vmu-fx-ceilingr-row');
+    if (ceilingRRow) ceilingRRow.style.display = settings.audioFxProcessingMode === 1 ? '' : 'none';
+
+    const abSwitch = document.getElementById('vmu-fx-ab-switch');
+    if (abSwitch) {
+      abSwitch.querySelectorAll('button').forEach(b => {
+        b.classList.toggle('active', b.dataset.vmuAb === settings.audioFxABActive);
+      });
+    }
+    const presetCurrent = document.getElementById('vmu-fx-preset-current');
+    if (presetCurrent) presetCurrent.textContent = settings.audioFxCurrentPreset || '— пресет —';
+
+    const sliderFields = [
+      ['vmu-fx-threshold', 'audioFxThreshold', v => v + ' дБ'],
+      ['vmu-fx-ratio', 'audioFxRatio', v => v + ':1'],
+      ['vmu-fx-knee', 'audioFxKnee', v => v + ' дБ'],
+      ['vmu-fx-ceiling', 'audioFxCeiling', v => (Math.round(v * 10) / 10) + ' дБ'],
+      ['vmu-fx-ceilingr', 'audioFxCeilingR', v => (Math.round(v * 10) / 10) + ' дБ'],
+      ['vmu-fx-input', 'audioFxInputGain', v => v + ' дБ'],
+      ['vmu-fx-output', 'audioFxOutputGain', v => v + ' дБ'],
+      ['vmu-fx-attack', 'audioFxAttack', v => v + ' мс'],
+      ['vmu-fx-release', 'audioFxRelease', v => v + ' мс'],
+    ];
+    for (const [id, key, fmt] of sliderFields) {
+      const slider = document.getElementById(id);
+      const val = document.getElementById(id + '-val');
+      if (slider) slider.value = String(settings[key]);
+      if (val) val.textContent = fmt(settings[key]);
+    }
+
+    settings.audioFxBands.forEach((g, i) => {
+      const slider = document.getElementById(`vmu-fx-band-${i}`);
+      if (slider) slider.value = String(g);
+    });
   }
 
   // VK renders the whole player toolbar (transport, EQ anchor, share...) twice
@@ -412,8 +992,9 @@
   function toggleAudioFxPanel() {
     const panel = document.getElementById('vmu-audiofx-panel');
     if (!panel) return;
-    panel.classList.toggle('vmu-audiofx-panel-open');
+    const open = panel.classList.toggle('vmu-audiofx-panel-open');
     positionAudioFxUI();
+    if (open) startMeterLoop(); else stopMeterLoop();
   }
 
   // Inserts the FX toggle button directly into VK's native player toolbar,
@@ -442,10 +1023,280 @@
   }
 
   function attachAudioFxHandlers() {
+    // ─── rich preset browser: search + category filter + tags ─────────────
+    let presetFilterCategory = 'Все';
+    let presetFilterSearch = '';
+
+    function applyPreset(name) {
+      const presets = loadAudioFxPresets();
+      const entry = presets[name];
+      if (!entry) return;
+      Object.assign(settings, presetSettingsOf(entry));
+      settings.audioFxCurrentPreset = name;
+      saveSettings();
+      refreshAllAudioFxControls();
+      postAudioFxState();
+      renderPresetList();
+    }
+
+    function deletePreset(name) {
+      const presets = loadAudioFxPresets();
+      delete presets[name];
+      saveAudioFxPresets(presets);
+      if (settings.audioFxCurrentPreset === name) {
+        settings.audioFxCurrentPreset = null;
+        saveSettings();
+        const cur = document.getElementById('vmu-fx-preset-current');
+        if (cur) cur.textContent = '— пресет —';
+      }
+      renderPresetList();
+    }
+
+    function renderPresetList() {
+      const listEl = document.getElementById('vmu-fx-preset-list');
+      const catsEl = document.getElementById('vmu-fx-preset-cats');
+      const catList = document.getElementById('vmu-fx-preset-cat-list');
+      if (!listEl || !catsEl) return;
+      const presets = loadAudioFxPresets();
+      const names = Object.keys(presets).sort((a, b) => a.localeCompare(b));
+      const categories = Array.from(new Set(names.map(n => presetCategoryOf(presets[n])))).sort((a, b) => a.localeCompare(b));
+
+      catsEl.innerHTML = ['Все', ...categories].map(c =>
+        `<button type="button" class="vmu-fx-preset-cat${c === presetFilterCategory ? ' active' : ''}" data-cat="${escHtml(c)}">${escHtml(c)}</button>`
+      ).join('');
+      if (catList) catList.innerHTML = categories.map(c => `<option value="${escHtml(c)}">`).join('');
+
+      const q = presetFilterSearch.trim().toLowerCase();
+      const filtered = names.filter(n => {
+        const entry = presets[n];
+        if (presetFilterCategory !== 'Все' && presetCategoryOf(entry) !== presetFilterCategory) return false;
+        if (!q) return true;
+        const haystack = (n + ' ' + presetTagsOf(entry).join(' ')).toLowerCase();
+        return haystack.includes(q);
+      });
+
+      listEl.innerHTML = filtered.length ? filtered.map(n => {
+        const entry = presets[n];
+        const tags = presetTagsOf(entry);
+        return `<div class="vmu-fx-preset-item${n === settings.audioFxCurrentPreset ? ' active' : ''}" data-preset="${escHtml(n)}">
+          <div class="vmu-fx-preset-item-main">
+            <span class="vmu-fx-preset-item-name">${escHtml(n)}</span>
+            <span class="vmu-fx-preset-item-cat">${escHtml(presetCategoryOf(entry))}</span>
+            <button type="button" class="vmu-fx-preset-item-del" data-preset-del="${escHtml(n)}" title="Удалить">✕</button>
+          </div>
+          ${tags.length ? `<div class="vmu-fx-preset-item-tags">${tags.map(t => `<span class="vmu-fx-preset-tag">${escHtml(t)}</span>`).join('')}</div>` : ''}
+        </div>`;
+      }).join('') : `<div class="vmu-fx-preset-empty">Ничего не найдено</div>`;
+    }
+
+    const presetToggle = document.getElementById('vmu-fx-preset-toggle');
+    const presetBrowser = document.getElementById('vmu-fx-preset-browser');
+    const presetSaveForm = document.getElementById('vmu-fx-preset-saveform');
+    if (presetToggle && presetBrowser) {
+      presetToggle.addEventListener('click', () => {
+        const opening = presetBrowser.style.display === 'none';
+        presetBrowser.style.display = opening ? '' : 'none';
+        if (presetSaveForm) presetSaveForm.style.display = 'none';
+        if (opening) renderPresetList();
+      });
+    }
+
+    const presetSearch = document.getElementById('vmu-fx-preset-search');
+    if (presetSearch) {
+      presetSearch.addEventListener('input', () => {
+        presetFilterSearch = presetSearch.value;
+        renderPresetList();
+      });
+    }
+
+    const presetCats = document.getElementById('vmu-fx-preset-cats');
+    if (presetCats) {
+      presetCats.addEventListener('click', e => {
+        const btn = e.target.closest('button[data-cat]');
+        if (!btn) return;
+        presetFilterCategory = btn.dataset.cat;
+        renderPresetList();
+      });
+    }
+
+    const presetList = document.getElementById('vmu-fx-preset-list');
+    if (presetList) {
+      presetList.addEventListener('click', e => {
+        const delBtn = e.target.closest('button[data-preset-del]');
+        if (delBtn) { deletePreset(delBtn.dataset.presetDel); return; }
+        const item = e.target.closest('[data-preset]');
+        if (item) applyPreset(item.dataset.preset);
+      });
+    }
+
+    const presetSaveBtn = document.getElementById('vmu-fx-preset-save');
+    if (presetSaveBtn && presetSaveForm) {
+      presetSaveBtn.addEventListener('click', () => {
+        if (presetBrowser) presetBrowser.style.display = 'none';
+        presetSaveForm.style.display = presetSaveForm.style.display === 'none' ? '' : 'none';
+        const nameInput = document.getElementById('vmu-fx-preset-name');
+        if (presetSaveForm.style.display !== 'none' && nameInput) nameInput.focus();
+        renderPresetList(); // populates the category datalist even while the browser stays hidden
+      });
+    }
+    const presetSaveCancel = document.getElementById('vmu-fx-preset-save-cancel');
+    if (presetSaveCancel && presetSaveForm) {
+      presetSaveCancel.addEventListener('click', () => { presetSaveForm.style.display = 'none'; });
+    }
+    const presetSaveConfirm = document.getElementById('vmu-fx-preset-save-confirm');
+    if (presetSaveConfirm && presetSaveForm) {
+      presetSaveConfirm.addEventListener('click', () => {
+        const name = (document.getElementById('vmu-fx-preset-name')?.value || '').trim();
+        if (!name) return;
+        const category = (document.getElementById('vmu-fx-preset-category')?.value || '').trim() || 'Без категории';
+        const tags = (document.getElementById('vmu-fx-preset-tags')?.value || '')
+          .split(',').map(t => t.trim()).filter(Boolean);
+        const presets = loadAudioFxPresets();
+        presets[name] = { settings: snapshotAudioFxSettings(), category, tags };
+        saveAudioFxPresets(presets);
+        settings.audioFxCurrentPreset = name;
+        saveSettings();
+        const cur = document.getElementById('vmu-fx-preset-current');
+        if (cur) cur.textContent = name;
+        presetSaveForm.style.display = 'none';
+        ['vmu-fx-preset-name', 'vmu-fx-preset-category', 'vmu-fx-preset-tags'].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.value = '';
+        });
+      });
+    }
+
+    // ─── A/B snapshot compare ───────────────────────────────────────────────
+    // Switching slots saves the live settings into whichever slot was active
+    // (so in-progress edits aren't lost), seeds the target slot with a copy
+    // of the current settings the first time it's ever switched to (so B
+    // starts identical to A and diverges from there), then loads it live.
+    function switchABSlot(target) {
+      if (target === settings.audioFxABActive) return;
+      settings.audioFxAB[settings.audioFxABActive] = snapshotAudioFxSettings();
+      if (!settings.audioFxAB[target]) settings.audioFxAB[target] = snapshotAudioFxSettings();
+      Object.assign(settings, settings.audioFxAB[target]);
+      settings.audioFxABActive = target;
+      saveSettings();
+      refreshAllAudioFxControls();
+      postAudioFxState();
+    }
+    const abSwitch = document.getElementById('vmu-fx-ab-switch');
+    if (abSwitch) {
+      abSwitch.addEventListener('click', e => {
+        const btn = e.target.closest('button[data-vmu-ab]');
+        if (!btn) return;
+        switchABSlot(btn.dataset.vmuAb);
+      });
+    }
+
+    const fxTabs = document.getElementById('vmu-audiofx-tabs');
+    if (fxTabs) {
+      fxTabs.addEventListener('click', e => {
+        const btn = e.target.closest('button[data-vmu-fxtab]');
+        if (!btn) return;
+        const tabName = btn.dataset.vmuFxtab;
+        if (tabName === settings.audioFxActiveTab) return;
+        settings.audioFxActiveTab = tabName;
+        saveSettings();
+        fxTabs.querySelectorAll('button').forEach(b => {
+          b.classList.toggle('active', b.dataset.vmuFxtab === tabName);
+        });
+        document.querySelectorAll('[data-vmu-fxtab-page]').forEach(page => {
+          const active = page.dataset.vmuFxtabPage === tabName;
+          page.classList.toggle('active', active);
+          page.style.display = active ? '' : 'none';
+        });
+        // Gates the worklet's K-weighting/LUFS accumulation — only costs CPU
+        // while this tab is actually the one open.
+        window.postMessage({ type: 'VMU_AUDIOFX_METERING_ACTIVE', active: tabName === 'metering' }, '*');
+      });
+    }
+    // Panel can reopen directly on a persisted "metering" tab (see
+    // buildAudioFxPanel's audioFxActiveTab) — tell the worklet right away
+    // instead of waiting for a tab click that may never come.
+    if (settings.audioFxActiveTab === 'metering') {
+      window.postMessage({ type: 'VMU_AUDIOFX_METERING_ACTIVE', active: true }, '*');
+    }
+
+    const lufsResetBtn = document.getElementById('vmu-fx-lufs-reset');
+    if (lufsResetBtn) {
+      lufsResetBtn.addEventListener('click', () => {
+        window.postMessage({ type: 'VMU_AUDIOFX_RESET_LUFS' }, '*');
+      });
+    }
+
     const enableToggle = document.getElementById('vmu-fx-enable');
     if (enableToggle) {
       enableToggle.addEventListener('change', () => {
         settings.audioFxEnabled = enableToggle.checked;
+        saveSettings();
+        postAudioFxState();
+      });
+    }
+
+    initCustomDropdown('vmu-fx-style-dd', idx => {
+      settings.audioFxStyle = idx;
+      saveSettings();
+      postAudioFxState();
+    });
+
+    const autoReleaseToggle = document.getElementById('vmu-fx-autorelease');
+    if (autoReleaseToggle) {
+      autoReleaseToggle.addEventListener('change', () => {
+        settings.audioFxAutoRelease = autoReleaseToggle.checked;
+        saveSettings();
+        postAudioFxState();
+      });
+    }
+
+    const truePeakToggle = document.getElementById('vmu-fx-truepeak');
+    if (truePeakToggle) {
+      truePeakToggle.addEventListener('change', () => {
+        settings.audioFxTruePeak = truePeakToggle.checked;
+        saveSettings();
+        postAudioFxState();
+      });
+    }
+
+    initCustomDropdown('vmu-fx-oversampling-dd', idx => {
+      settings.audioFxOversampling = idx;
+      saveSettings();
+      postAudioFxState();
+    });
+
+    // Any custom dropdown left open closes on an outside click, matching
+    // native <select> behavior.
+    document.addEventListener('click', e => {
+      if (e.target.closest('.vmu-fx-dd')) return;
+      document.querySelectorAll('.vmu-fx-dd-list').forEach(l => {
+        l.style.display = 'none';
+        l.closest('.vmu-fx-dd')?.classList.remove('vmu-fx-dd-open');
+      });
+    });
+
+    const procModeSwitch = document.getElementById('vmu-fx-procmode');
+    if (procModeSwitch) {
+      procModeSwitch.addEventListener('click', e => {
+        const btn = e.target.closest('button[data-vmu-procmode]');
+        if (!btn) return;
+        const mode = parseInt(btn.dataset.vmuProcmode, 10) || 0;
+        if (mode === settings.audioFxProcessingMode) return;
+        settings.audioFxProcessingMode = mode;
+        saveSettings();
+        procModeSwitch.querySelectorAll('button').forEach(b => {
+          b.classList.toggle('active', parseInt(b.dataset.vmuProcmode, 10) === mode);
+        });
+        const ceilingRRow = document.getElementById('vmu-fx-ceilingr-row');
+        if (ceilingRRow) ceilingRRow.style.display = mode === 1 ? '' : 'none';
+        postAudioFxState();
+      });
+    }
+
+    const autoGainToggle = document.getElementById('vmu-fx-autogain');
+    if (autoGainToggle) {
+      autoGainToggle.addEventListener('change', () => {
+        settings.audioFxAutoGain = autoGainToggle.checked;
         saveSettings();
         postAudioFxState();
       });
@@ -477,10 +1328,17 @@
     };
     limiterField('vmu-fx-threshold', 'audioFxThreshold', v => v + ' дБ');
     limiterField('vmu-fx-ratio', 'audioFxRatio', v => v + ':1');
+    limiterField('vmu-fx-knee', 'audioFxKnee', v => v + ' дБ');
+    limiterField('vmu-fx-ceiling', 'audioFxCeiling', v => (Math.round(v * 10) / 10) + ' дБ');
+    limiterField('vmu-fx-ceilingr', 'audioFxCeilingR', v => (Math.round(v * 10) / 10) + ' дБ');
     limiterField('vmu-fx-input', 'audioFxInputGain', v => v + ' дБ');
     limiterField('vmu-fx-output', 'audioFxOutputGain', v => v + ' дБ');
     limiterField('vmu-fx-attack', 'audioFxAttack', v => v + ' мс');
     limiterField('vmu-fx-release', 'audioFxRelease', v => v + ' мс');
+
+    // Meter painting itself is handled by the module-level rAF loop
+    // (startMeterLoop/paintMeters) — see the "audio FX metering" block above,
+    // started/stopped alongside the panel's open/close state below.
 
     settings.audioFxBands.forEach((_, i) => {
       const slider = document.getElementById(`vmu-fx-band-${i}`);
@@ -509,6 +1367,7 @@
     if (closeBtn) {
       closeBtn.addEventListener('click', () => {
         document.getElementById('vmu-audiofx-panel').classList.remove('vmu-audiofx-panel-open');
+        stopMeterLoop();
       });
     }
 
@@ -521,6 +1380,7 @@
       if (!panel || !panel.classList.contains('vmu-audiofx-panel-open')) return;
       if (panel.contains(e.target) || e.target.closest('.vmu-audiofx-btn')) return;
       panel.classList.remove('vmu-audiofx-panel-open');
+      stopMeterLoop();
     });
   }
 
