@@ -236,6 +236,17 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     this._rmsSq = 0; // leaky-integrator mean-square estimate, shared/stereo-linked like the peak detector
     this._rmsCoeff = 1 - Math.exp(-1 / (sampleRate * 0.002)); // ~2ms leaky-RMS window, fixed internal constant
     this._reportCounter = 0;
+    // Max-since-last-report accumulators. Must persist across process() calls
+    // (each call only covers one ~128-frame render quantum, but a report is
+    // only sent every 8 calls) — previously declared as locals inside
+    // process(), which reset them to 0 every single call and silently
+    // discarded 7 out of every 8 blocks' worth of peak data, so the reported
+    // value only ever reflected the last ~3ms before a report instead of the
+    // full ~21ms since the previous one. That's what made the meters read as
+    // randomly jumping between reports instead of tracking the real peak.
+    this._maxReductionSinceReport = 0;
+    this._maxTruePeakSinceReport = 0;
+    this._maxRawPeakSinceReport = 0;
 
     // Auto Gain (Phase 4): a cheap approximation of loudness-matched bypass
     // A/B — rather than an independent dual-path LUFS comparison, track a
@@ -357,10 +368,6 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     const delaySamples = this._lookaheadSamples;
     const bufLen = this._bufLen;
 
-    let maxReductionThisBlock = 0;
-    let maxTruePeakThisBlock = 0;
-    let maxRawPeakThisBlock = 0;
-
     for (let n = 0; n < frames; n++) {
       // LUFS/LRA metering — reads input[ch][n] directly, independent of
       // processingMode/the ring buffer's contents, so it's shared verbatim
@@ -423,7 +430,7 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
           const a = Math.abs(s);
           if (a > rawPeak) rawPeak = a;
         }
-        if (rawPeak > maxRawPeakThisBlock) maxRawPeakThisBlock = rawPeak;
+        if (rawPeak > this._maxRawPeakSinceReport) this._maxRawPeakSinceReport = rawPeak;
 
         let truePeakEstimate = 0;
         if (truePeakMode) {
@@ -435,7 +442,7 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
             const v = polyphaseMaxAbs(buf[ch], bufLen, this._writeIdx, polyphaseBank);
             if (v > truePeakEstimate) truePeakEstimate = v;
           }
-          if (truePeakEstimate > maxTruePeakThisBlock) maxTruePeakThisBlock = truePeakEstimate;
+          if (truePeakEstimate > this._maxTruePeakSinceReport) this._maxTruePeakSinceReport = truePeakEstimate;
         }
         const effectivePeak = truePeakMode ? Math.max(rawPeak, truePeakEstimate) : rawPeak;
 
@@ -463,7 +470,7 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
         }
 
         this._envDb += (desiredReductionDb - this._envDb) * (desiredReductionDb > this._envDb ? attackCoeff : releaseCoeff);
-        if (this._envDb > maxReductionThisBlock) maxReductionThisBlock = this._envDb;
+        if (this._envDb > this._maxReductionSinceReport) this._maxReductionSinceReport = this._envDb;
 
         if (autoGain) {
           this._autoGainTrimDb += (this._envDb - this._autoGainTrimDb) * this._autoGainCoeff;
@@ -503,7 +510,7 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
         buf[1][this._writeIdx] = lane1in;
 
         const rawPeakLanes = Math.max(Math.abs(lane0in), Math.abs(lane1in));
-        if (rawPeakLanes > maxRawPeakThisBlock) maxRawPeakThisBlock = rawPeakLanes;
+        if (rawPeakLanes > this._maxRawPeakSinceReport) this._maxRawPeakSinceReport = rawPeakLanes;
 
         let truePeakEstimate = 0;
         if (truePeakMode) {
@@ -511,7 +518,7 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
             const v = polyphaseMaxAbs(buf[ch], bufLen, this._writeIdx, polyphaseBank);
             if (v > truePeakEstimate) truePeakEstimate = v;
           }
-          if (truePeakEstimate > maxTruePeakThisBlock) maxTruePeakThisBlock = truePeakEstimate;
+          if (truePeakEstimate > this._maxTruePeakSinceReport) this._maxTruePeakSinceReport = truePeakEstimate;
         }
 
         const laneIn = [lane0in, lane1in];
@@ -553,7 +560,7 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
           const autoGainLaneLin = autoGain ? Math.pow(10, this._autoGainTrimDbLane[lane] / 20) : 1;
           laneGains[lane] = Math.pow(10, -envDbLane / 20) * outputGainLin * autoGainLaneLin;
         }
-        if (maxLaneReduction > maxReductionThisBlock) maxReductionThisBlock = maxLaneReduction;
+        if (maxLaneReduction > this._maxReductionSinceReport) this._maxReductionSinceReport = maxLaneReduction;
 
         const readIdx = (this._writeIdx - delaySamples + bufLen) % bufLen;
         const lane0out = buf[0][readIdx] * laneGains[0];
@@ -584,11 +591,11 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
 
     if (++this._reportCounter >= 8) {
       this._reportCounter = 0;
-      const truePeakDb = truePeakMode ? 20 * Math.log10(Math.max(maxTruePeakThisBlock, 1e-8)) : null;
+      const truePeakDb = truePeakMode ? 20 * Math.log10(Math.max(this._maxTruePeakSinceReport, 1e-8)) : null;
       this.port.postMessage({
         type: 'meter',
-        reductionDb: maxReductionThisBlock,
-        inputPeakDb: 20 * Math.log10(Math.max(maxRawPeakThisBlock, 1e-8)),
+        reductionDb: this._maxReductionSinceReport,
+        inputPeakDb: 20 * Math.log10(Math.max(this._maxRawPeakSinceReport, 1e-8)),
         truePeakDb,
         momentaryLufs: meteringActive ? this._momentaryLufs : null,
         shortTermLufs: meteringActive ? this._shortTermLufs : null,
@@ -596,6 +603,11 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
         lra: meteringActive ? this._lra : null,
         autoGainTrimDb: autoGain ? this._autoGainTrimDb : null,
       });
+      // Only reset here, once the accumulated max has actually been sent —
+      // these must survive across the 8 process() calls between reports.
+      this._maxReductionSinceReport = 0;
+      this._maxTruePeakSinceReport = 0;
+      this._maxRawPeakSinceReport = 0;
     }
 
     return true;
