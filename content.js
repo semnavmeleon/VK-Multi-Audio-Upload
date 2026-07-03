@@ -25,6 +25,12 @@
     <path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/>
     <path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.892 3.433-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.892-1.64-.901-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.42 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.42-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.47l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"/>
   </svg>`;
+  const ICON_AUDIOFX = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+    <path d="M3 2v6M3 11v3M8 2v2M8 7v7M13 2v9M13 14v0" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+    <circle cx="3" cy="9" r="1.6" fill="currentColor"/>
+    <circle cx="8" cy="5.5" r="1.6" fill="currentColor"/>
+    <circle cx="13" cy="12.5" r="1.6" fill="currentColor"/>
+  </svg>`;
   const STATUS_ICON = {
     pending: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="#555" stroke-width="1.3"/><rect x="5" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/><rect x="7.6" y="4.5" width="1.4" height="5" rx="0.5" fill="#555"/></svg>`,
     uploading: `<svg class="vmu-spin" width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="rgba(38,136,235,0.2)" stroke-width="1.5"/><path d="M7 1.5A5.5 5.5 0 0112.5 7" stroke="#2688eb" stroke-width="1.5" stroke-linecap="round"/></svg>`,
@@ -121,7 +127,8 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, audioFxEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
+  const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
   function loadSettings() {
     try {
@@ -145,11 +152,34 @@
         optimizeBigPlaylists: settings.optimizeBigPlaylists,
         hideScrollToTop: settings.hideScrollToTop,
         pinTabsBar: settings.pinTabsBar,
+        audioFxEnabled: settings.audioFxEnabled,
+        audioFxThreshold: settings.audioFxThreshold,
+        audioFxRatio: settings.audioFxRatio,
+        audioFxInputGain: settings.audioFxInputGain,
+        audioFxOutputGain: settings.audioFxOutputGain,
+        audioFxAttack: settings.audioFxAttack,
+        audioFxRelease: settings.audioFxRelease,
+        audioFxBands: settings.audioFxBands,
       }));
     } catch {}
   }
 
   loadSettings();
+
+  function postAudioFxState() {
+    window.postMessage({
+      type: 'VMU_AUDIOFX_SET',
+      enabled: settings.audioFxEnabled,
+      threshold: settings.audioFxThreshold,
+      ratio: settings.audioFxRatio,
+      inputGain: settings.audioFxInputGain,
+      outputGain: settings.audioFxOutputGain,
+      attack: settings.audioFxAttack,
+      release: settings.audioFxRelease,
+      bands: settings.audioFxBands,
+    }, '*');
+  }
+  postAudioFxState();
 
   // ─── layout customizations (pin sidebar, horizontal offset) ──────────────
   // Drive layout tweaks through a single <style id="vmu-layout-style"> tag so
@@ -257,6 +287,7 @@
     positionCheckPanel();
   }
   applyLayoutCustomizations();
+  ensureAudioFxUI();
 
   // Keeps the check-mode result panel clear of VK's content column. The
   // column can be shifted horizontally via the "Смещение контента" slider
@@ -288,6 +319,222 @@
     panel.classList.toggle('vmu-check-panel-left', needsFlip);
     panel.style.left = needsFlip ? margin + 'px' : '';
   }
+
+  // ─── audio FX: live limiter + 10-band EQ on the currently playing track ────
+  // Lives as its own floating panel (not the upload-dialog settings panel)
+  // since it needs to be reachable while just listening to music, with no
+  // upload dialog open. Toggled by a small button anchored next to VK's
+  // persistent mini-player (AudioPage_PlayerBlock — same "pick the actually
+  // visible one of the two DOM copies" logic as applyTabsBarPin below).
+  function formatFreqLabel(hz) {
+    return hz >= 1000 ? (hz / 1000) + 'k' : String(hz);
+  }
+
+  function buildAudioFxPanel() {
+    const limiterRow = (id, label, min, max, step, value, unit) => `
+      <div class="vmu-setting-row vmu-slider-row">
+        <div class="vmu-setting-info">
+          <span class="vmu-setting-label">${label}</span>
+        </div>
+        <div class="vmu-slider-wrap">
+          <input type="range" id="${id}" class="vmu-slider" min="${min}" max="${max}" step="${step}" value="${value}">
+          <span class="vmu-slider-value" id="${id}-val">${value}${unit}</span>
+          <button type="button" id="${id}-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
+        </div>
+      </div>`;
+
+    const bands = settings.audioFxBands.map((g, i) => `
+      <div class="vmu-eq-band">
+        <input type="range" id="vmu-fx-band-${i}" class="vmu-eq-band-slider" min="-12" max="12" step="0.5" value="${g}" orient="vertical">
+        <span class="vmu-eq-band-freq">${formatFreqLabel(AUDIOFX_FREQS[i])}</span>
+      </div>`).join('');
+
+    return `
+      <div id="vmu-audiofx-panel" class="vmu-audiofx-panel">
+        <div class="vmu-audiofx-head">
+          <span class="vmu-audiofx-title">Эквалайзер</span>
+          <label class="vmu-toggle">
+            <input type="checkbox" id="vmu-fx-enable" ${settings.audioFxEnabled ? 'checked' : ''}>
+            <span class="vmu-toggle-track"></span>
+          </label>
+          <button type="button" id="vmu-audiofx-close" class="vmu-check-close" title="Закрыть">${ICON_CLOSE}</button>
+        </div>
+        <div class="vmu-audiofx-body">
+          <div class="vmu-audiofx-section">
+            <div class="vmu-audiofx-section-title">Лимитер</div>
+            ${limiterRow('vmu-fx-threshold', 'Threshold', -60, 0, 1, settings.audioFxThreshold, ' дБ')}
+            ${limiterRow('vmu-fx-ratio', 'Ratio', 1, 20, 0.5, settings.audioFxRatio, ':1')}
+            ${limiterRow('vmu-fx-input', 'Input', -24, 24, 0.5, settings.audioFxInputGain, ' дБ')}
+            ${limiterRow('vmu-fx-output', 'Output', -24, 24, 0.5, settings.audioFxOutputGain, ' дБ')}
+            ${limiterRow('vmu-fx-attack', 'Attack', 0, 100, 1, settings.audioFxAttack, ' мс')}
+            ${limiterRow('vmu-fx-release', 'Release', 0, 1000, 5, settings.audioFxRelease, ' мс')}
+          </div>
+          <div class="vmu-audiofx-section">
+            <div class="vmu-audiofx-section-title">
+              Эквалайзер
+              <button type="button" id="vmu-fx-eq-reset" class="vmu-slider-reset" title="Сбросить все полосы">↺</button>
+            </div>
+            <div class="vmu-eq-bands">${bands}</div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // VK renders the whole player toolbar (transport, EQ anchor, share...) twice
+  // — once in-flow (scrolls away) and once as the fixed/pinned copy that
+  // takes over once the page scrolls a bit past it, same duplication
+  // documented above for AudioPage_PlayerBlock. Only one copy is ever
+  // actually on screen at a time, so pick whichever of our injected buttons
+  // currently has a real, in-viewport position to anchor the dropdown to.
+  function getVisibleAudioFxBtn() {
+    const btns = document.querySelectorAll('.vmu-audiofx-btn');
+    for (const b of btns) {
+      const r = b.getBoundingClientRect();
+      if (r.width > 0 && r.top >= 0 && r.top < window.innerHeight) return b;
+    }
+    return btns[0] || null;
+  }
+
+  function positionAudioFxUI() {
+    const panel = document.getElementById('vmu-audiofx-panel');
+    const btn = getVisibleAudioFxBtn();
+    if (!btn || !panel || !panel.classList.contains('vmu-audiofx-panel-open')) return;
+    const margin = 12;
+    const r = btn.getBoundingClientRect();
+    // Anchor under the button's own live position rather than guessing from
+    // AudioPage_PlayerBlock — the button lives inline in VK's toolbar (see
+    // injectAudioFxIntoPlayerBar), so its rect is the source of truth.
+    const right = Math.max(margin, window.innerWidth - r.right);
+    panel.style.top = (r.bottom + 8) + 'px';
+    panel.style.right = right + 'px';
+  }
+
+  function toggleAudioFxPanel() {
+    const panel = document.getElementById('vmu-audiofx-panel');
+    if (!panel) return;
+    panel.classList.toggle('vmu-audiofx-panel-open');
+    positionAudioFxUI();
+  }
+
+  // Inserts the FX toggle button directly into VK's native player toolbar,
+  // immediately left of "Транслировать аудиозаписи" (data-testid
+  // ToggleCurrentTargets) — into EVERY copy of the toolbar VK renders (the
+  // in-flow one and the fixed one that takes over on scroll), not just the
+  // first match, so the button stays reachable however the page is
+  // scrolled. Reuses VK's own button classes so it matches size/hover/
+  // spacing without custom CSS; only inserted where missing, same
+  // idempotent-on-rerender idiom as injectGearIntoNativeHeader.
+  function injectAudioFxIntoPlayerBar() {
+    document.querySelectorAll('[data-testid="ToggleCurrentTargets"]').forEach(anchor => {
+      if (!anchor.parentElement) return;
+      const prev = anchor.previousElementSibling;
+      if (prev && prev.classList.contains('vmu-audiofx-btn')) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = anchor.className + ' vmu-audiofx-btn';
+      btn.setAttribute('data-vmu-tip', 'Эквалайзер');
+      btn.innerHTML = ICON_AUDIOFX;
+      btn.addEventListener('mouseenter', () => showDlTooltip(btn));
+      btn.addEventListener('mouseleave', hideDlTooltip);
+      btn.addEventListener('click', () => { hideDlTooltip(); toggleAudioFxPanel(); });
+      anchor.parentElement.insertBefore(btn, anchor);
+    });
+  }
+
+  function attachAudioFxHandlers() {
+    const enableToggle = document.getElementById('vmu-fx-enable');
+    if (enableToggle) {
+      enableToggle.addEventListener('change', () => {
+        settings.audioFxEnabled = enableToggle.checked;
+        saveSettings();
+        postAudioFxState();
+      });
+    }
+
+    const limiterField = (id, key, fmt) => {
+      const slider = document.getElementById(id);
+      const val = document.getElementById(id + '-val');
+      const reset = document.getElementById(id + '-reset');
+      const defaultValue = settings[key];
+      if (slider) {
+        slider.addEventListener('input', () => {
+          const v = parseFloat(slider.value) || 0;
+          settings[key] = v;
+          if (val) val.textContent = fmt(v);
+          postAudioFxState();
+        });
+        slider.addEventListener('change', saveSettings);
+      }
+      if (reset && slider) {
+        reset.addEventListener('click', () => {
+          settings[key] = defaultValue;
+          slider.value = String(defaultValue);
+          if (val) val.textContent = fmt(defaultValue);
+          saveSettings();
+          postAudioFxState();
+        });
+      }
+    };
+    limiterField('vmu-fx-threshold', 'audioFxThreshold', v => v + ' дБ');
+    limiterField('vmu-fx-ratio', 'audioFxRatio', v => v + ':1');
+    limiterField('vmu-fx-input', 'audioFxInputGain', v => v + ' дБ');
+    limiterField('vmu-fx-output', 'audioFxOutputGain', v => v + ' дБ');
+    limiterField('vmu-fx-attack', 'audioFxAttack', v => v + ' мс');
+    limiterField('vmu-fx-release', 'audioFxRelease', v => v + ' мс');
+
+    settings.audioFxBands.forEach((_, i) => {
+      const slider = document.getElementById(`vmu-fx-band-${i}`);
+      if (!slider) return;
+      slider.addEventListener('input', () => {
+        settings.audioFxBands[i] = parseFloat(slider.value) || 0;
+        postAudioFxState();
+      });
+      slider.addEventListener('change', saveSettings);
+    });
+
+    const eqReset = document.getElementById('vmu-fx-eq-reset');
+    if (eqReset) {
+      eqReset.addEventListener('click', () => {
+        settings.audioFxBands = settings.audioFxBands.map(() => 0);
+        settings.audioFxBands.forEach((_, i) => {
+          const slider = document.getElementById(`vmu-fx-band-${i}`);
+          if (slider) slider.value = '0';
+        });
+        saveSettings();
+        postAudioFxState();
+      });
+    }
+
+    const closeBtn = document.getElementById('vmu-audiofx-close');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        document.getElementById('vmu-audiofx-panel').classList.remove('vmu-audiofx-panel-open');
+      });
+    }
+
+    // Click-outside-to-close. Clicks on the toggle button itself are excluded
+    // here — its own click handler already opens/closes the panel, and this
+    // listener firing on top of that (it bubbles to document after) would
+    // otherwise immediately re-close a panel that button click just opened.
+    document.addEventListener('click', e => {
+      const panel = document.getElementById('vmu-audiofx-panel');
+      if (!panel || !panel.classList.contains('vmu-audiofx-panel-open')) return;
+      if (panel.contains(e.target) || e.target.closest('.vmu-audiofx-btn')) return;
+      panel.classList.remove('vmu-audiofx-panel-open');
+    });
+  }
+
+  function ensureAudioFxUI() {
+    injectAudioFxIntoPlayerBar();
+    if (!document.getElementById('vmu-audiofx-panel')) {
+      const wrap = document.createElement('div');
+      wrap.innerHTML = buildAudioFxPanel();
+      document.body.appendChild(wrap.firstElementChild);
+      attachAudioFxHandlers();
+    }
+    positionAudioFxUI();
+  }
+  window.addEventListener('resize', positionAudioFxUI);
 
   // ─── audio catalog header: split + pin ─────────────────────────────────────
   // VK renders the tabs/search header and whatever follows it (recently-played,
@@ -3679,7 +3926,8 @@
     // legacy audio rows and top-bar icons). Buttons inside the new vkui
     // playlist modal get the vkui-style tooltip via .vmu-tooltip-new.
     const isNewVk = btn.classList.contains('vmu-single-dl-vkit')
-      || btn.classList.contains('vmu-single-dl-after');
+      || btn.classList.contains('vmu-single-dl-after')
+      || btn.classList.contains('vmu-audiofx-btn');
     el.classList.toggle('vmu-tooltip-new', isNewVk);
     // Reset placement modifier before measuring so layout reflects the
     // default-above tail height.
@@ -3911,6 +4159,9 @@
 
     // Keep the audio catalog header split/pin in sync with VK's re-renders
     applyAudioCatalogLayout();
+
+    // Restore the audio FX button/panel if VK re-rendered over them
+    ensureAudioFxUI();
   }
 
   // Coalesce mutation storms (scrolling a 1000-row playlist fires hundreds of

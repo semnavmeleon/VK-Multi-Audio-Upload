@@ -2434,4 +2434,151 @@
     };
     document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', start) : start();
   })();
+
+  // ── Audio FX: 10-band graphic EQ + limiter on VK's <audio> playback ──────────
+  // createMediaElementSource() can only ever be called once per <audio> element
+  // (throws InvalidStateError on a second call) and permanently reroutes that
+  // element's output through the Web Audio graph — so the graph is only built
+  // the first time the feature is turned on, and "disabling" it afterwards
+  // means driving the same nodes to neutral (unity gain, 0dB EQ, ratio 1)
+  // rather than tearing anything down.
+  (function () {
+    const EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+    const dbToGain = db => Math.pow(10, (Number(db) || 0) / 20);
+
+    let ctx = null;
+    let enabled = false;
+    const fx = { threshold: -3, ratio: 4, inputGain: 0, outputGain: 0, attack: 3, release: 250, bands: EQ_FREQS.map(() => 0) };
+    const graphs = new WeakMap(); // audioEl -> { input, bands, comp, output }
+    const attachedEls = new Set();
+
+    function ensureCtx() {
+      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      return ctx;
+    }
+
+    function applyToGraph(g) {
+      // Attack/release only shape how fast the limiter reacts — with no
+      // "neutral" value the way gain/threshold/ratio have, so they're applied
+      // unconditionally (harmless when disabled, since ratio=1 already makes
+      // the compressor a no-op regardless of timing).
+      g.comp.attack.value = (Number(fx.attack) || 0) / 1000;
+      g.comp.release.value = (Number(fx.release) || 0) / 1000;
+      if (enabled) {
+        g.input.gain.value = dbToGain(fx.inputGain);
+        g.output.gain.value = dbToGain(fx.outputGain);
+        g.comp.threshold.value = fx.threshold;
+        g.comp.ratio.value = fx.ratio;
+        g.bands.forEach((b, i) => { b.gain.value = fx.bands[i] || 0; });
+      } else {
+        g.input.gain.value = 1;
+        g.output.gain.value = 1;
+        g.comp.threshold.value = 0;
+        g.comp.ratio.value = 1;
+        g.bands.forEach(b => { b.gain.value = 0; });
+      }
+    }
+
+    function applyToAll() {
+      for (const el of attachedEls) {
+        const g = graphs.get(el);
+        if (g) applyToGraph(g);
+      }
+    }
+
+    function buildGraph(el) {
+      const c = ensureCtx();
+      const source = c.createMediaElementSource(el);
+      const input = c.createGain();
+      const bands = EQ_FREQS.map(freq => {
+        const f = c.createBiquadFilter();
+        f.type = 'peaking';
+        f.frequency.value = freq;
+        f.Q.value = 1.41;
+        return f;
+      });
+      const comp = c.createDynamicsCompressor();
+      comp.knee.value = 0;
+      const output = c.createGain();
+
+      source.connect(input);
+      let node = input;
+      for (const band of bands) { node.connect(band); node = band; }
+      node.connect(comp);
+      comp.connect(output);
+      output.connect(c.destination);
+
+      return { input, bands, comp, output };
+    }
+
+    function attachFx(el) {
+      if (!el || el.__vmuFxAttached) return;
+      el.__vmuFxAttached = true;
+      try {
+        const g = buildGraph(el);
+        graphs.set(el, g);
+        attachedEls.add(el);
+        applyToGraph(g);
+      } catch (err) {
+        trace('[audiofx] attach failed', err && err.message);
+      }
+    }
+
+    // VK never appends its <audio> element to the document — confirmed live:
+    // playback runs off a blob: URL on a detached HTMLAudioElement
+    // (el.isConnected === false), a new one per track. A MutationObserver on
+    // the DOM tree (the usual way to catch <audio> insertion) therefore never
+    // fires. Patching play() catches the element regardless of DOM presence —
+    // it's called every time a track starts, and again on resume for the
+    // same (already-attached) element, where attachFx() is just a no-op.
+    let lastAudioEl = null;
+    const origPlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function (...args) {
+      lastAudioEl = this;
+      if (enabled) attachFx(this);
+      return origPlay.apply(this, args);
+    };
+
+    window.addEventListener('message', e => {
+      if (e.source !== window || !e.data || e.data.type !== 'VMU_AUDIOFX_SET') return;
+      const wasEnabled = enabled;
+      enabled = !!e.data.enabled;
+      fx.threshold = Number(e.data.threshold) || 0;
+      fx.ratio = Math.max(1, Number(e.data.ratio) || 1);
+      fx.inputGain = Number(e.data.inputGain) || 0;
+      fx.outputGain = Number(e.data.outputGain) || 0;
+      fx.attack = Math.max(0, Number(e.data.attack) || 0);
+      fx.release = Math.max(0, Number(e.data.release) || 0);
+      if (Array.isArray(e.data.bands)) fx.bands = e.data.bands.map(v => Number(v) || 0);
+
+      // Attach to whatever's already playing right away, instead of waiting
+      // for the next play()/track change, so toggling the switch takes effect
+      // immediately on the current track.
+      if (enabled && !wasEnabled && lastAudioEl) attachFx(lastAudioEl);
+      applyToAll();
+    });
+
+    // Debug accessor — reads live AudioParam values straight off the graph
+    // (rather than the `fx` settings mirror) so it also surfaces
+    // .reduction, the compressor's actual real-time gain reduction in dB.
+    // Non-zero reduction while a track plays is the ground-truth signal that
+    // the limiter is doing something, not just that its parameters got set.
+    window.__vmuAudioFxDebug = () => [...attachedEls].map(el => {
+      const g = graphs.get(el);
+      if (!g) return null;
+      return {
+        enabled,
+        inputGain: g.input.gain.value,
+        outputGain: g.output.gain.value,
+        threshold: g.comp.threshold.value,
+        ratio: g.comp.ratio.value,
+        attack: g.comp.attack.value,
+        release: g.comp.release.value,
+        reductionDb: g.comp.reduction,
+        bands: g.bands.map(b => b.gain.value),
+        ctxState: ctx && ctx.state,
+      };
+    });
+  })();
 })();

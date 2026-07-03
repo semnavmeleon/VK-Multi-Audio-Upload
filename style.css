@@ -993,7 +993,16 @@
 .vmu-tabs-pinned {
   position: fixed !important;
   box-sizing: border-box;
-  z-index: 100;
+  /* Confirmed live: at 100 this outranks VK's own native popovers (e.g. the
+     "Транслировать" dropdown, hosted at z-index 1100 but nested inside a
+     lower-priority stacking context than this element's ancestor chain),
+     so VK's own dropdown ends up rendering underneath this pinned bar
+     wherever the two overlap on screen. Binary-searched the real threshold
+     live: VK's own competing wrapper sits at z-index 3, so anything >= 4
+     here beats it (bad) and <= 3 loses to it (correct) — 2 keeps a small
+     safety margin while still beating ordinary scrolled-under page content,
+     which has no elevated z-index of its own. */
+  z-index: 2;
 }
 
 /* The multimedia player card (AudioPage_PlayerBlock's card wrapper) draws its
@@ -1328,4 +1337,130 @@
 [class*="vkitInternalModalBox"]:has(input[accept*="audio"]),
 [class*="vkitInternalModalBox"]:has([data-testid="UploadAudio_SelectFileButton"]) {
   width: 500px !important;
+}
+
+/* ── Audio FX: toggle button (inline in VK's native player bar) + panel ───── */
+/* Sizing/hover/background all come from the native VK button classes we copy
+   onto this element (see injectAudioFxIntoPlayerBar) — only the icon glyph
+   itself is ours, so it needs to inherit that button's icon color instead of
+   rendering with the SVG's own default currentColor black. */
+.vmu-audiofx-btn svg { display: block; }
+
+/* Chrome/radius/shadow match VK's own dropdown popovers (vkuiPopover),
+   sampled live from the account menu: opaque rgb(41,41,41) background
+   (VK's popovers never use a translucent card — that was our own earlier
+   guess, not what VK actually does), 12px radius, a two-layer shadow (a
+   tight 2px "outline" plus a soft 16px spread), no border. */
+.vmu-audiofx-panel {
+  position: fixed;
+  top: 116px;
+  right: 24px;
+  width: 380px;
+  max-height: calc(100vh - 160px);
+  display: none;
+  flex-direction: column;
+  background: rgb(41, 41, 41);
+  border-radius: 12px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+  font-size: 13px;
+  color: #d0d2d4;
+  /* Deliberately below VK's own overlay system (its full-screen popout
+     wrapper sits at z-index 1100 — confirmed live on the account menu),
+     so if VK ever needs to render a tooltip/popover over the same screen
+     region while this panel is open, VK's own UI always wins instead of
+     our opaque panel painting over it. */
+  z-index: 500;
+  overflow: hidden;
+}
+.vmu-audiofx-panel-open {
+  display: flex;
+  animation: vmuAudioFxIn .14s ease-out;
+}
+@keyframes vmuAudioFxIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.vmu-audiofx-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  background: rgba(255,255,255,0.02);
+}
+.vmu-audiofx-title { font-size: 12px; color: #c0c2c4; font-weight: 600; flex: 1 1 auto; }
+.vmu-audiofx-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 4px 0 10px;
+}
+.vmu-audiofx-body::-webkit-scrollbar { width: 4px; }
+.vmu-audiofx-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 2px; }
+.vmu-audiofx-section { padding: 10px 16px; }
+.vmu-audiofx-section + .vmu-audiofx-section { border-top: 1px solid rgba(255,255,255,0.06); }
+.vmu-audiofx-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #999;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+/* 10-band graphic EQ: vertical range inputs in a row, gain labelled by
+   frequency underneath (standard ISO 10-band layout). */
+.vmu-eq-bands {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  padding-top: 4px;
+}
+.vmu-eq-band {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.vmu-eq-band-slider {
+  -webkit-appearance: slider-vertical;
+  appearance: slider-vertical;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 18px;
+  height: 90px;
+  background: transparent;
+  cursor: pointer;
+}
+.vmu-eq-band-slider::-webkit-slider-runnable-track {
+  width: 4px;
+  background: rgba(255,255,255,0.12);
+  border-radius: 2px;
+}
+.vmu-eq-band-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: #2688eb;
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  margin-left: -5px;
+}
+.vmu-eq-band-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: #2688eb;
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+}
+.vmu-eq-band-slider:hover::-webkit-slider-thumb { background: #3d97f0; }
+.vmu-eq-band-freq {
+  font-size: 10px;
+  color: #666;
+  font-variant-numeric: tabular-nums;
 }
