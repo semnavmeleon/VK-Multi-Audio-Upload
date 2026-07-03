@@ -1499,18 +1499,64 @@
 }
 
 /* 10-band graphic EQ: vertical range inputs in a row, gain labelled by
-   frequency underneath (standard ISO 10-band layout). */
+   frequency underneath (standard ISO 10-band layout), a live dB readout
+   above each slider, and a shared dB axis + 0dB reference line for precise
+   by-eye positioning (mirrors a standard plugin EQ ruler). */
+.vmu-eq-bands-row {
+  display: flex;
+  gap: 8px;
+  padding-top: 4px;
+}
+/* +12/+6/0/-6/-12 ticks, evenly spaced by justify-content:space-between —
+   exact since the slider's linear track maps -12..+12 to 0%..100% and the
+   axis height matches the slider height 1:1. margin-top offsets past the
+   value-label row (12px) + its gap (6px) above each slider, so tick 0
+   ("0") lines up with the slider's own vertical center. */
+.vmu-eq-axis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-end;
+  width: 20px;
+  height: 90px;
+  margin-top: 18px;
+  font-size: 9px;
+  color: #666;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
 .vmu-eq-bands {
+  position: relative;
   display: flex;
   justify-content: space-between;
   gap: 4px;
-  padding-top: 4px;
+  flex: 1 1 auto;
+}
+/* 4px .vmu-eq-bands-row padding-top + 18px value-label/gap offset + 45px
+   (50% of the 90px slider height) = the slider's vertical midpoint, i.e.
+   0dB — z-index:-1 keeps it visually behind the sliders/thumbs. */
+.vmu-eq-zero-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 67px;
+  height: 1px;
+  background: rgba(255,255,255,0.18);
+  z-index: -1;
+  pointer-events: none;
 }
 .vmu-eq-band {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
+}
+.vmu-eq-band-val {
+  font-size: 10px;
+  line-height: 12px;
+  height: 12px;
+  color: #9ea1a3;
+  font-variant-numeric: tabular-nums;
 }
 .vmu-eq-band-slider {
   -webkit-appearance: slider-vertical;

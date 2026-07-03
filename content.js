@@ -130,7 +130,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, audioFxEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxActiveTab: 'limiter', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, audioFxLimiterEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxActiveTab: 'limiter', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -146,7 +146,7 @@
   // are UI/meta navigation state, not sound parameters, so presets don't
   // touch them.)
   const AUDIOFX_FIELD_KEYS = [
-    'audioFxEnabled', 'audioFxThreshold', 'audioFxRatio', 'audioFxInputGain', 'audioFxOutputGain',
+    'audioFxLimiterEnabled', 'audioFxEqEnabled', 'audioFxThreshold', 'audioFxRatio', 'audioFxInputGain', 'audioFxOutputGain',
     'audioFxAttack', 'audioFxRelease', 'audioFxKnee', 'audioFxCeiling', 'audioFxCeilingR', 'audioFxStyle',
     'audioFxAutoRelease', 'audioFxTruePeak', 'audioFxOversampling', 'audioFxAutoGain', 'audioFxProcessingMode', 'audioFxBands',
   ];
@@ -155,7 +155,19 @@
   function loadSettings() {
     try {
       const s = localStorage.getItem(SETTINGS_KEY);
-      if (s) Object.assign(settings, JSON.parse(s));
+      if (s) {
+        const parsed = JSON.parse(s);
+        Object.assign(settings, parsed);
+        // Migrates the old single audioFxEnabled master toggle (pre-split)
+        // into the two independent limiter/EQ toggles the first time a
+        // settings blob saved before the split is loaded, so existing users
+        // don't silently lose whichever one(s) they had on.
+        if (typeof parsed.audioFxEnabled === 'boolean'
+          && parsed.audioFxLimiterEnabled === undefined && parsed.audioFxEqEnabled === undefined) {
+          settings.audioFxLimiterEnabled = parsed.audioFxEnabled;
+          settings.audioFxEqEnabled = parsed.audioFxEnabled;
+        }
+      }
     } catch {}
     if (settings.workMode !== 'check') settings.workMode = 'upload';
   }
@@ -219,7 +231,8 @@
   function postAudioFxState() {
     window.postMessage({
       type: 'VMU_AUDIOFX_SET',
-      enabled: settings.audioFxEnabled,
+      limiterEnabled: settings.audioFxLimiterEnabled,
+      eqEnabled: settings.audioFxEqEnabled,
       threshold: settings.audioFxThreshold,
       ratio: settings.audioFxRatio,
       inputGain: settings.audioFxInputGain,
@@ -378,7 +391,7 @@
 
     // Live operating point: measured input peak vs. measured reduction —
     // the actual current point on the curve, not the theoretical one.
-    if (typeof meterRaw.inputPeakDb === 'number' && settings.audioFxEnabled) {
+    if (typeof meterRaw.inputPeakDb === 'number' && settings.audioFxLimiterEnabled) {
       const inDb = meterDisp.inputPeakDb;
       const outDb = Math.min(inDb - meterRaw.reductionDb, settings.audioFxCeiling);
       ctx.fillStyle = '#ffffff';
@@ -653,6 +666,9 @@
   function formatFreqLabel(hz) {
     return hz >= 1000 ? (hz / 1000) + 'k' : String(hz);
   }
+  function fmtBandDb(v) {
+    return (v > 0 ? '+' : '') + v.toFixed(1);
+  }
 
   // Custom cascading dropdown — replaces native <select> for Style/Oversampling
   // so the option list can actually be themed (a native <select>'s popup is
@@ -729,9 +745,14 @@
         </div>
       </div>`;
 
+    // step=0.1 (vs. the old 0.5) gives finer keyboard/native-drag resolution;
+    // combined with the live numeric readout and the wheel/dblclick handlers
+    // wired in attachAudioFxHandlers, dragging a 90px-tall slider by hand is
+    // no longer the only way to land on a precise value.
     const bands = settings.audioFxBands.map((g, i) => `
       <div class="vmu-eq-band">
-        <input type="range" id="vmu-fx-band-${i}" class="vmu-eq-band-slider" min="-12" max="12" step="0.5" value="${g}" orient="vertical">
+        <span class="vmu-eq-band-val" id="vmu-fx-band-${i}-val">${fmtBandDb(g)}</span>
+        <input type="range" id="vmu-fx-band-${i}" class="vmu-eq-band-slider" min="-12" max="12" step="0.1" value="${g}" title="Колесо мыши — шаг 0.5 дБ (Shift — 0.1 дБ), двойной клик — сброс полосы" orient="vertical">
         <span class="vmu-eq-band-freq">${formatFreqLabel(AUDIOFX_FREQS[i])}</span>
       </div>`).join('');
 
@@ -743,10 +764,6 @@
       <div id="vmu-audiofx-panel" class="vmu-audiofx-panel">
         <div class="vmu-audiofx-head">
           <span class="vmu-audiofx-title">Эквалайзер</span>
-          <label class="vmu-toggle">
-            <input type="checkbox" id="vmu-fx-enable" ${settings.audioFxEnabled ? 'checked' : ''}>
-            <span class="vmu-toggle-track"></span>
-          </label>
           <button type="button" id="vmu-audiofx-close" class="vmu-check-close" title="Закрыть">${ICON_CLOSE}</button>
         </div>
         <div class="vmu-audiofx-presets-row">
@@ -782,6 +799,15 @@
         <div class="vmu-audiofx-body">
           <div class="vmu-audiofx-tabpage${isTab('limiter')}" data-vmu-fxtab-page="limiter"${pageDisplay('limiter')}>
             <div class="vmu-audiofx-section">
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Лимитер</span>
+                </div>
+                <label class="vmu-toggle">
+                  <input type="checkbox" id="vmu-fx-limiter-enable" ${settings.audioFxLimiterEnabled ? 'checked' : ''}>
+                  <span class="vmu-toggle-track"></span>
+                </label>
+              </div>
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
                   <span class="vmu-setting-label">Style</span>
@@ -867,11 +893,28 @@
           </div>
           <div class="vmu-audiofx-tabpage${isTab('eq')}" data-vmu-fxtab-page="eq"${pageDisplay('eq')}>
             <div class="vmu-audiofx-section">
+              <div class="vmu-setting-row">
+                <div class="vmu-setting-info">
+                  <span class="vmu-setting-label">Эквалайзер</span>
+                </div>
+                <label class="vmu-toggle">
+                  <input type="checkbox" id="vmu-fx-eq-enable" ${settings.audioFxEqEnabled ? 'checked' : ''}>
+                  <span class="vmu-toggle-track"></span>
+                </label>
+              </div>
               <div class="vmu-audiofx-section-title">
                 Полосы
                 <button type="button" id="vmu-fx-eq-reset" class="vmu-slider-reset" title="Сбросить все полосы">↺</button>
               </div>
-              <div class="vmu-eq-bands">${bands}</div>
+              <div class="vmu-eq-bands-row">
+                <div class="vmu-eq-axis">
+                  <span>+12</span><span>+6</span><span>0</span><span>−6</span><span>−12</span>
+                </div>
+                <div class="vmu-eq-bands">
+                  <div class="vmu-eq-zero-line"></div>
+                  ${bands}
+                </div>
+              </div>
             </div>
           </div>
           <div class="vmu-audiofx-tabpage${isTab('metering')}" data-vmu-fxtab-page="metering"${pageDisplay('metering')}>
@@ -910,7 +953,8 @@
   // update flows through a single control's own change handler).
   function refreshAllAudioFxControls() {
     const setChecked = (id, val) => { const el = document.getElementById(id); if (el) el.checked = !!val; };
-    setChecked('vmu-fx-enable', settings.audioFxEnabled);
+    setChecked('vmu-fx-limiter-enable', settings.audioFxLimiterEnabled);
+    setChecked('vmu-fx-eq-enable', settings.audioFxEqEnabled);
     setChecked('vmu-fx-autorelease', settings.audioFxAutoRelease);
     setChecked('vmu-fx-truepeak', settings.audioFxTruePeak);
     setChecked('vmu-fx-autogain', settings.audioFxAutoGain);
@@ -957,6 +1001,8 @@
     settings.audioFxBands.forEach((g, i) => {
       const slider = document.getElementById(`vmu-fx-band-${i}`);
       if (slider) slider.value = String(g);
+      const val = document.getElementById(`vmu-fx-band-${i}-val`);
+      if (val) val.textContent = fmtBandDb(g);
     });
   }
 
@@ -1226,10 +1272,18 @@
       });
     }
 
-    const enableToggle = document.getElementById('vmu-fx-enable');
-    if (enableToggle) {
-      enableToggle.addEventListener('change', () => {
-        settings.audioFxEnabled = enableToggle.checked;
+    const limiterEnableToggle = document.getElementById('vmu-fx-limiter-enable');
+    if (limiterEnableToggle) {
+      limiterEnableToggle.addEventListener('change', () => {
+        settings.audioFxLimiterEnabled = limiterEnableToggle.checked;
+        saveSettings();
+        postAudioFxState();
+      });
+    }
+    const eqEnableToggle = document.getElementById('vmu-fx-eq-enable');
+    if (eqEnableToggle) {
+      eqEnableToggle.addEventListener('change', () => {
+        settings.audioFxEqEnabled = eqEnableToggle.checked;
         saveSettings();
         postAudioFxState();
       });
@@ -1343,11 +1397,34 @@
     settings.audioFxBands.forEach((_, i) => {
       const slider = document.getElementById(`vmu-fx-band-${i}`);
       if (!slider) return;
+      const valEl = document.getElementById(`vmu-fx-band-${i}-val`);
+      const setBand = (v) => {
+        v = Math.max(-12, Math.min(12, Math.round(v * 10) / 10));
+        settings.audioFxBands[i] = v;
+        slider.value = String(v);
+        if (valEl) valEl.textContent = fmtBandDb(v);
+        postAudioFxState();
+      };
       slider.addEventListener('input', () => {
         settings.audioFxBands[i] = parseFloat(slider.value) || 0;
+        if (valEl) valEl.textContent = fmtBandDb(settings.audioFxBands[i]);
         postAudioFxState();
       });
       slider.addEventListener('change', saveSettings);
+      // Precision helpers — a 90px vertical slider is too short to land on a
+      // specific tenth of a dB by hand alone: wheel nudges in fixed steps
+      // (0.5dB per notch, 0.1dB with Shift for fine trim), double-click
+      // zeroes just that one band instead of resetting the whole curve.
+      slider.addEventListener('wheel', e => {
+        e.preventDefault();
+        const step = e.shiftKey ? 0.1 : 0.5;
+        setBand(settings.audioFxBands[i] + (e.deltaY < 0 ? step : -step));
+        saveSettings();
+      }, { passive: false });
+      slider.addEventListener('dblclick', () => {
+        setBand(0);
+        saveSettings();
+      });
     });
 
     const eqReset = document.getElementById('vmu-fx-eq-reset');
@@ -1357,6 +1434,8 @@
         settings.audioFxBands.forEach((_, i) => {
           const slider = document.getElementById(`vmu-fx-band-${i}`);
           if (slider) slider.value = '0';
+          const valEl = document.getElementById(`vmu-fx-band-${i}-val`);
+          if (valEl) valEl.textContent = fmtBandDb(0);
         });
         saveSettings();
         postAudioFxState();

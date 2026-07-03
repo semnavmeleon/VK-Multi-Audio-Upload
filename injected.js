@@ -2453,7 +2453,12 @@
     const EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
     let ctx = null;
-    let enabled = false;
+    // Independent bypass switches — limiterEnabled drives the worklet's own
+    // `enabled` param (threshold/ratio/knee/ceiling/attack/release/input-
+    // output gain/auto gain all bypass together with it), eqEnabled zeroes
+    // the 10 band gains. Either can be on while the other is off.
+    let limiterEnabled = false;
+    let eqEnabled = false;
     let meteringActive = false; // transient — true only while content.js's Метринг tab is the open tab
     let workletUrl = null;
     let workletReady = null; // Promise<void>, resolves once audioWorklet.addModule() completes
@@ -2493,9 +2498,9 @@
     }
 
     function applyToGraph(g) {
-      g.bands.forEach((b, i) => { b.gain.value = enabled ? (fx.bands[i] || 0) : 0; });
+      g.bands.forEach((b, i) => { b.gain.value = eqEnabled ? (fx.bands[i] || 0) : 0; });
       const lim = g.limiter;
-      setParam(lim, 'enabled', enabled ? 1 : 0);
+      setParam(lim, 'enabled', limiterEnabled ? 1 : 0);
       setParam(lim, 'threshold', fx.threshold);
       setParam(lim, 'ratio', fx.ratio);
       setParam(lim, 'attack', fx.attack);
@@ -2585,7 +2590,7 @@
     const origPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
       lastAudioEl = this;
-      if (enabled) attachFx(this);
+      if (limiterEnabled || eqEnabled) attachFx(this);
       return origPlay.apply(this, args);
     };
 
@@ -2608,8 +2613,9 @@
         return;
       }
       if (e.data.type !== 'VMU_AUDIOFX_SET') return;
-      const wasEnabled = enabled;
-      enabled = !!e.data.enabled;
+      const wasActive = limiterEnabled || eqEnabled;
+      limiterEnabled = !!e.data.limiterEnabled;
+      eqEnabled = !!e.data.eqEnabled;
       fx.threshold = Number(e.data.threshold) || 0;
       fx.ratio = Math.max(1, Number(e.data.ratio) || 1);
       fx.inputGain = Number(e.data.inputGain) || 0;
@@ -2628,9 +2634,10 @@
       if (Array.isArray(e.data.bands)) fx.bands = e.data.bands.map(v => Number(v) || 0);
 
       // Attach to whatever's already playing right away, instead of waiting
-      // for the next play()/track change, so toggling the switch takes effect
-      // immediately on the current track.
-      if (enabled && !wasEnabled && lastAudioEl) attachFx(lastAudioEl);
+      // for the next play()/track change, so toggling either switch takes
+      // effect immediately on the current track.
+      const nowActive = limiterEnabled || eqEnabled;
+      if (nowActive && !wasActive && lastAudioEl) attachFx(lastAudioEl);
       applyToAll();
     });
 
@@ -2644,7 +2651,7 @@
       if (!g) return null;
       const val = name => g.limiter.parameters.get(name)?.value;
       return {
-        enabled,
+        limiterEnabled, eqEnabled,
         threshold: val('threshold'), ratio: val('ratio'), attack: val('attack'), release: val('release'),
         knee: val('knee'), ceiling: val('ceiling'), ceilingR: val('ceilingR'), inputGain: val('inputGain'), outputGain: val('outputGain'),
         style: val('style'), autoRelease: val('autoRelease'), truePeakMode: val('truePeakMode'), oversampling: val('oversampling'),
