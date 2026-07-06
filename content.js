@@ -130,7 +130,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'limiter', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'limiter', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -153,7 +153,7 @@
   // touch them.)
   const AUDIOFX_FIELD_KEYS = [
     'audioFxLimiterEnabled', 'audioFxCompEnabled', 'audioFxEqEnabled', 'audioFxThreshold', 'audioFxRatio', 'audioFxInputGain', 'audioFxOutputGain',
-    'audioFxAttack', 'audioFxRelease', 'audioFxKnee', 'audioFxCeiling', 'audioFxCeilingR', 'audioFxLimRelease', 'audioFxStyle',
+    'audioFxAttack', 'audioFxRelease', 'audioFxKnee', 'audioFxCeiling', 'audioFxCeilingR', 'audioFxLimRelease', 'audioFxLimGain', 'audioFxStyle',
     'audioFxAutoRelease', 'audioFxTruePeak', 'audioFxOversampling', 'audioFxAutoGain', 'audioFxProcessingMode', 'audioFxChainOrder', 'audioFxBands',
   ];
   const AUDIOFX_PRESETS_KEY = 'vmu_audiofx_presets_v1';
@@ -201,6 +201,7 @@
         optimizeBigPlaylists: settings.optimizeBigPlaylists,
         hideScrollToTop: settings.hideScrollToTop,
         pinTabsBar: settings.pinTabsBar,
+        downloadThreads: settings.downloadThreads,
         audioFxActiveTab: settings.audioFxActiveTab,
         audioFxCurrentPreset: settings.audioFxCurrentPreset,
         audioFxAB: settings.audioFxAB,
@@ -251,7 +252,59 @@
   function presetCategoryOf(entry) { return (entry && entry.category) || 'Без категории'; }
   function presetTagsOf(entry) { return (entry && Array.isArray(entry.tags)) ? entry.tags : []; }
 
+  // Captured from the literal `settings` object above, before loadSettings()
+  // overlays whatever the user has saved — the single source of truth for
+  // both the "Базовый" factory preset and the panel's "reset all" button, so
+  // neither can drift out of sync with the actual defaults declared above.
+  const AUDIOFX_DEFAULTS = snapshotAudioFxSettings();
+
   loadSettings();
+
+  // Seeds a "Базовый" preset with the factory defaults the first time the
+  // preset store doesn't have one (fresh install, or a store that predates
+  // this feature) — gives users a one-click way back to a known-good state
+  // from the preset browser itself, distinct from the panel's own
+  // reset-all button below.
+  function ensureBaseAudioFxPreset() {
+    const presets = loadAudioFxPresets();
+    if (presets['Базовый']) return;
+    presets['Базовый'] = { settings: Object.assign({}, AUDIOFX_DEFAULTS), category: 'Стандартные', tags: ['default'] };
+    saveAudioFxPresets(presets);
+  }
+  ensureBaseAudioFxPreset();
+
+  // ─── VK theme detection (light/dark) ───────────────────────────────────────
+  // VK's light theme is signalled by a `vkui--vkBase--light` class on its own
+  // React root div (a child of <body>, not <html>, confirmed live) — there's
+  // no such marker on <html> itself. Mirroring it onto <html> as
+  // `.vmu-theme-light` lets style.css key off it regardless of where a given
+  // panel is mounted (some are appended straight to document.body, others
+  // live inside VK's own dialog DOM). If VK ever renames/removes that class,
+  // detectVkLightTheme() falls back to empirically sampling the page's own
+  // background-color luminance — same conclusion, without depending on any
+  // particular class name surviving VK's next redesign.
+  function findVkBaseRoot() {
+    return document.querySelector('[class*="vkui--vkBase--"]');
+  }
+  function detectVkLightTheme() {
+    const root = findVkBaseRoot();
+    if (root) return /vkui--vkBase--light/.test(root.className);
+    const bg = getComputedStyle(document.body).backgroundColor;
+    const m = bg.match(/(\d+),\s*(\d+),\s*(\d+)/);
+    if (!m) return false;
+    const [r, g, b] = m.slice(1, 4).map(Number);
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 150;
+  }
+  function syncVmuTheme() {
+    const isLight = detectVkLightTheme();
+    document.documentElement.classList.toggle('vmu-theme-light', isLight);
+    return isLight;
+  }
+  console.log('[vmu] theme detected:', syncVmuTheme() ? 'light' : 'dark');
+  const vkBaseRootEl = findVkBaseRoot();
+  if (vkBaseRootEl) {
+    new MutationObserver(syncVmuTheme).observe(vkBaseRootEl, { attributes: true, attributeFilter: ['class'] });
+  }
 
   function postAudioFxState() {
     window.postMessage({
@@ -269,6 +322,7 @@
       ceiling: settings.audioFxCeiling,
       ceilingR: settings.audioFxCeilingR,
       limRelease: settings.audioFxLimRelease,
+      limGain: settings.audioFxLimGain,
       style: settings.audioFxStyle,
       autoRelease: settings.audioFxAutoRelease,
       truePeak: settings.audioFxTruePeak,
@@ -809,6 +863,7 @@
             <span id="vmu-fx-preset-current">${settings.audioFxCurrentPreset ? escHtml(settings.audioFxCurrentPreset) : '— пресет —'}</span>
           </button>
           <button type="button" id="vmu-fx-preset-save" class="vmu-slider-reset" title="Сохранить текущие настройки как пресет">＋</button>
+          <button type="button" id="vmu-fx-reset-all" class="vmu-slider-reset" title="Сбросить всё на дефолт">⟲</button>
           <div class="vmu-fx-ab-switch" id="vmu-fx-ab-switch" title="Быстрое A/B-сравнение двух наборов настроек">
             <button type="button" data-vmu-ab="A" class="${settings.audioFxABActive === 'A' ? 'active' : ''}">A</button>
             <button type="button" data-vmu-ab="B" class="${settings.audioFxABActive === 'B' ? 'active' : ''}">B</button>
@@ -917,6 +972,7 @@
                   <span class="vmu-toggle-track"></span>
                 </label>
               </div>
+              ${limiterRow('vmu-fx-limgain', 'Гейн', -24, 24, 0.5, settings.audioFxLimGain, ' дБ')}
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
                   <span class="vmu-setting-label">True Peak</span>
@@ -1056,6 +1112,7 @@
       ['vmu-fx-attack', 'audioFxAttack', v => v + ' мс'],
       ['vmu-fx-release', 'audioFxRelease', v => v + ' мс'],
       ['vmu-fx-limrelease', 'audioFxLimRelease', v => v + ' мс'],
+      ['vmu-fx-limgain', 'audioFxLimGain', v => v + ' дБ'],
     ];
     for (const [id, key, fmt] of sliderFields) {
       const slider = document.getElementById(id);
@@ -1164,6 +1221,27 @@
         if (cur) cur.textContent = '— пресет —';
       }
       renderPresetList();
+    }
+
+    // Resets every sound parameter (compressor/limiter/EQ/chain order/style)
+    // back to the hardcoded factory defaults — distinct from the per-slider
+    // ↺ buttons, which reset to the value each slider had when the panel was
+    // first built (i.e. whatever was loaded from localStorage on this page
+    // visit), not to true factory defaults.
+    function resetAudioFxToDefaults() {
+      for (const key of AUDIOFX_FIELD_KEYS) {
+        settings[key] = Array.isArray(AUDIOFX_DEFAULTS[key]) ? AUDIOFX_DEFAULTS[key].slice() : AUDIOFX_DEFAULTS[key];
+      }
+      settings.audioFxCurrentPreset = null;
+      saveSettings();
+      refreshAllAudioFxControls();
+      postAudioFxState();
+      const cur = document.getElementById('vmu-fx-preset-current');
+      if (cur) cur.textContent = '— пресет —';
+    }
+    const resetAllBtn = document.getElementById('vmu-fx-reset-all');
+    if (resetAllBtn) {
+      resetAllBtn.addEventListener('click', resetAudioFxToDefaults);
     }
 
     function renderPresetList() {
@@ -1472,6 +1550,7 @@
     limiterField('vmu-fx-attack', 'audioFxAttack', v => v + ' мс');
     limiterField('vmu-fx-release', 'audioFxRelease', v => v + ' мс');
     limiterField('vmu-fx-limrelease', 'audioFxLimRelease', v => v + ' мс');
+    limiterField('vmu-fx-limgain', 'audioFxLimGain', v => v + ' дБ');
 
     // Meter painting itself is handled by the module-level rAF loop
     // (startMeterLoop/paintMeters) — see the "audio FX metering" block above,
@@ -1547,6 +1626,7 @@
   }
 
   function ensureAudioFxUI() {
+    syncVmuTheme(); // cheap self-heal in case the observer's target got replaced
     injectAudioFxIntoPlayerBar();
     if (!document.getElementById('vmu-audiofx-panel')) {
       const wrap = document.createElement('div');
@@ -1922,7 +2002,13 @@
   }
 
   // Send message to injected.js and wait for response
-  function pageCall(sendType, responseType, payload, timeoutMs = 15000) {
+  // matchKey (e.g. 'trackId') correlates a response to its own request when
+  // several pageCall()s for the same responseType are in flight concurrently
+  // (parallel playlist downloads) — without it, the first handler registered
+  // resolves on the first matching-type message regardless of which request
+  // it actually answers, silently handing one track's result to another's
+  // promise. Callers that never run concurrently can omit it.
+  function pageCall(sendType, responseType, payload, timeoutMs = 15000, matchKey) {
     return new Promise((resolve, reject) => {
       const t = setTimeout(() => {
         window.removeEventListener('message', handler);
@@ -1930,6 +2016,7 @@
       }, timeoutMs);
       function handler(e) {
         if (e.source !== window || e.data?.type !== responseType) return;
+        if (matchKey && e.data[matchKey] !== payload[matchKey]) return;
         window.removeEventListener('message', handler);
         clearTimeout(t);
         const d = e.data;
@@ -2818,6 +2905,7 @@
   let settingsPanelOpen = false;
 
   function toggleSettings() {
+    syncVmuTheme(); // cheap self-heal in case the observer's target got replaced
     settingsPanelOpen = !settingsPanelOpen;
     const panel = document.getElementById('vmu-settings-panel');
     const btn = document.getElementById('vmu-settings-btn');
@@ -2830,8 +2918,8 @@
     const isCheck = settings.workMode === 'check';
     return `
       <div id="vmu-settings-panel" style="display:none">
-        <div class="vmu-settings-section vmu-mode-section">
-          <div class="vmu-setting-row">
+        <div class="vmu-settings-section" id="vmu-general-section">
+          <div class="vmu-setting-row vmu-setting-row-wide">
             <div class="vmu-setting-info">
               <span class="vmu-setting-label">Режим работы</span>
               <span class="vmu-setting-hint">Проверка — сверить имена файлов с треками на странице, без загрузки</span>
@@ -2852,61 +2940,7 @@
               <span class="vmu-toggle-track"></span>
             </label>
           </div>
-        </div>
 
-        <div class="vmu-settings-section ${isCheck ? 'vmu-row-disabled' : ''}" id="vmu-upload-only-section">
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Авто-плейлист</span>
-              <span class="vmu-setting-hint">Создать плейлист после загрузки</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-ap-toggle" ${settings.autoPlaylist ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div id="vmu-cover-row" class="vmu-setting-row ${settings.autoPlaylist ? '' : 'vmu-row-disabled'}">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Обложка</span>
-              <span class="vmu-setting-hint">Выберите базовый JPG/PNG (1000×1000)</span>
-            </div>
-            <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
-              ${hasCover ? `<div id="vmu-cover-preview" title="Нажмите для смены"></div>` : ''}
-              <label class="vmu-cover-pick-btn" title="Выбрать обложку">
-                ${hasCover ? '↺' : '+ Выбрать'}
-                <input type="file" id="vmu-cover-input" accept="image/*" style="display:none">
-              </label>
-              ${hasCover ? `<button id="vmu-cover-clear" title="Удалить обложку">✕</button>` : ''}
-            </div>
-          </div>
-        </div>
-
-        <div class="vmu-settings-section ${isCheck ? 'vmu-row-disabled' : ''}" id="vmu-meta-section">
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Авто-метаданные</span>
-              <span class="vmu-setting-hint">Заполнить исполнителя и название из имени файла, если теги пусты</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-meta-toggle" ${settings.autoMeta ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div class="vmu-setting-row ${settings.autoPlaylist && !settings.coverDataUrl ? '' : 'vmu-row-disabled'}" id="vmu-id3cover-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Обложка из ID3</span>
-              <span class="vmu-setting-hint">Использовать встроенную обложку первого трека (если нет выбранной выше)</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-id3cover-toggle" ${settings.autoCoverFromId3 ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-        </div>
-
-        <div class="vmu-settings-section">
           <div class="vmu-setting-row">
             <div class="vmu-setting-info">
               <span class="vmu-setting-label">Закрепить сайдбар</span>
@@ -2918,7 +2952,7 @@
             </label>
           </div>
 
-          <div class="vmu-setting-row vmu-slider-row">
+          <div class="vmu-setting-row vmu-slider-row vmu-setting-row-wide">
             <div class="vmu-setting-info">
               <span class="vmu-setting-label">Смещение контента</span>
               <span class="vmu-setting-hint">Сдвиг сайдбара и основной колонки по горизонтали</span>
@@ -2962,6 +2996,68 @@
               <span class="vmu-toggle-track"></span>
             </label>
           </div>
+
+          <div class="vmu-setting-row vmu-slider-row vmu-setting-row-wide">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Потоков скачивания</span>
+              <span class="vmu-setting-hint">Сколько треков плейлиста скачивать одновременно</span>
+            </div>
+            <div class="vmu-slider-wrap">
+              <input type="range" id="vmu-dl-threads" class="vmu-slider" min="1" max="10" step="1" value="${settings.downloadThreads}">
+              <span class="vmu-slider-value" id="vmu-dl-threads-val">${settings.downloadThreads}</span>
+              <button type="button" id="vmu-dl-threads-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="vmu-settings-section ${isCheck ? 'vmu-row-disabled' : ''}" id="vmu-upload-only-section">
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Авто-плейлист</span>
+              <span class="vmu-setting-hint">Создать плейлист после загрузки</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-ap-toggle" ${settings.autoPlaylist ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+
+          <div id="vmu-cover-row" class="vmu-setting-row vmu-setting-row-wide ${settings.autoPlaylist ? '' : 'vmu-row-disabled'}">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Обложка</span>
+              <span class="vmu-setting-hint">Выберите базовый JPG/PNG (1000×1000)</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+              ${hasCover ? `<div id="vmu-cover-preview" title="Нажмите для смены"></div>` : ''}
+              <label class="vmu-cover-pick-btn" title="Выбрать обложку">
+                ${hasCover ? '↺' : '+ Выбрать'}
+                <input type="file" id="vmu-cover-input" accept="image/*" style="display:none">
+              </label>
+              ${hasCover ? `<button id="vmu-cover-clear" title="Удалить обложку">✕</button>` : ''}
+            </div>
+          </div>
+
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Авто-метаданные</span>
+              <span class="vmu-setting-hint">Заполнить исполнителя и название из имени файла, если теги пусты</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-meta-toggle" ${settings.autoMeta ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+
+          <div class="vmu-setting-row ${settings.autoPlaylist && !settings.coverDataUrl ? '' : 'vmu-row-disabled'}" id="vmu-id3cover-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Обложка из ID3</span>
+              <span class="vmu-setting-hint">Использовать встроенную обложку первого трека (если нет выбранной выше)</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-id3cover-toggle" ${settings.autoCoverFromId3 ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
         </div>
 
         <div id="vmu-pl-status" style="display:none">
@@ -2986,7 +3082,6 @@
         });
         const isCheck = mode === 'check';
         document.getElementById('vmu-upload-only-section')?.classList.toggle('vmu-row-disabled', isCheck);
-        document.getElementById('vmu-meta-section')?.classList.toggle('vmu-row-disabled', isCheck);
         document.getElementById('vmu-check-scope-row')?.classList.toggle('vmu-row-disabled', !isCheck);
         // Update dropzone hint to reflect the active mode
         const dzLabel = document.querySelector('#vmu-dropzone .vmu-dz-label');
@@ -3059,6 +3154,26 @@
         saveSettings();
         applyLayoutCustomizations();
         if (settings.pinTabsBar) applyTabsBarPin();
+      });
+    }
+
+    const dlThreadsSlider = document.getElementById('vmu-dl-threads');
+    const dlThreadsVal = document.getElementById('vmu-dl-threads-val');
+    if (dlThreadsSlider) {
+      dlThreadsSlider.addEventListener('input', () => {
+        const v = Math.max(1, Math.min(10, parseInt(dlThreadsSlider.value, 10) || 1));
+        settings.downloadThreads = v;
+        if (dlThreadsVal) dlThreadsVal.textContent = String(v);
+      });
+      dlThreadsSlider.addEventListener('change', saveSettings);
+    }
+    const dlThreadsReset = document.getElementById('vmu-dl-threads-reset');
+    if (dlThreadsReset && dlThreadsSlider) {
+      dlThreadsReset.addEventListener('click', () => {
+        settings.downloadThreads = 3;
+        dlThreadsSlider.value = '3';
+        if (dlThreadsVal) dlThreadsVal.textContent = '3';
+        saveSettings();
       });
     }
 
@@ -4728,23 +4843,24 @@
         return;
       }
 
-      dlSetPhase(`Начинаем скачивание: ${total} треков`);
       dlSetProgress(0, total);
       console.log('[vmu] download queue:', total, 'tracks, first url:', queue[0]?.url?.substring(0, 100));
 
       // Phase 2 — fetch loop. In ZIP mode we accumulate Uint8Arrays + filenames
       // and build a single archive at the end. In individual mode we download
-      // each blob via chrome.downloads as it lands.
+      // each blob via chrome.downloads as it lands. Runs as a small pool of
+      // concurrent workers (settings.downloadThreads, capped 1-10) pulling
+      // from a shared cursor instead of one file at a time — each worker
+      // still paces itself with the original 120ms gap between its own
+      // downloads, so a single-thread setting behaves exactly as before.
       const zipFiles = [];
       let done = 0, errors = 0;
       const wantBuffer = (mode === 'zip');
+      const threads = Math.max(1, Math.min(10, Math.round(Number(settings.downloadThreads)) || 1));
 
-      for (let i = 0; i < queue.length; i++) {
-        if (dlCancelFlag) break;
+      let cursor = 0;
+      async function downloadQueuedTrack(i) {
         const track = queue[i];
-        dlAddRow(track, 'uploading');
-        dlSetPhase(`${i + 1}/${total} — ${track.artist ? track.artist + ' — ' : ''}${track.title}`);
-
         const meta = [track.artist, track.title].filter(s => String(s || '').trim()).join(' - ') || 'track';
         const fn = dlSanitize(`${dlPad(i + 1, total)} - ${meta}`);
         const isHls = track.url.includes('/a2/') || track.url.includes('.m3u8');
@@ -4753,14 +4869,14 @@
         try {
           if (isHls) {
             const hlsUrl = track.url.includes('.m3u8') ? track.url : track.url + '/index.m3u8';
-            const r = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id, returnBuffer: wantBuffer }, 300000);
+            const r = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id, returnBuffer: wantBuffer }, 300000, 'trackId');
             if (r?.ok) {
               ext = r.ext || 'ts';
               if (wantBuffer) { bytes = r.buffer; res = { ok: true }; }
               else { res = await sendDlMsg(r.blobUrl, fn + '.' + ext); }
             } else res = { ok: false, error: r?.error || 'HLS failed' };
           } else {
-            const r = await pageCall('VKD_FETCH_BLOB', 'VKD_FETCH_BLOB_DONE', { url: track.url, trackId: track.id, returnBuffer: wantBuffer }, 180000);
+            const r = await pageCall('VKD_FETCH_BLOB', 'VKD_FETCH_BLOB_DONE', { url: track.url, trackId: track.id, returnBuffer: wantBuffer }, 180000, 'trackId');
             if (r?.ok) {
               if (wantBuffer) { bytes = r.buffer; res = { ok: true }; }
               else { res = await sendDlMsg(r.blobUrl, fn + '.mp3'); }
@@ -4771,15 +4887,25 @@
         console.log('[vmu] dl', i + 1, res?.ok ? 'OK' : ('ERR: ' + res?.error), isHls ? 'HLS' : 'direct');
         if (res?.ok) {
           done++;
-          dlUpdateRow(track.id, 'done');
           if (wantBuffer && bytes) zipFiles.push({ name: fn + '.' + ext, data: new Uint8Array(bytes) });
         } else {
           errors++;
-          dlUpdateRow(track.id, 'error', res?.error);
         }
+        dlSetPhase(`${done + errors}/${total} — ${track.artist ? track.artist + ' — ' : ''}${track.title}`);
         dlSetProgress(done, total);
-        await sleep(120);
       }
+
+      async function downloadWorker() {
+        while (!dlCancelFlag) {
+          const i = cursor++;
+          if (i >= queue.length) return;
+          await downloadQueuedTrack(i);
+          await sleep(120);
+        }
+      }
+
+      dlSetPhase(`Начинаем скачивание: ${total} треков (потоков: ${threads})`);
+      await Promise.all(Array.from({ length: Math.min(threads, queue.length) }, downloadWorker));
 
       // ZIP mode: build the archive and trigger one download
       if (wantBuffer && zipFiles.length > 0 && !dlCancelFlag) {
@@ -4889,7 +5015,7 @@
           showProgressToast(`Скачивание ${pct}% · ${label}`, { kind: 'progress', pct });
         });
         const hlsUrl = track.url.includes('.m3u8') ? track.url : track.url + '/index.m3u8';
-        const hlsResult = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id }, 300000);
+        const hlsResult = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id }, 300000, 'trackId');
         hlsProgressHandlers.delete(track.id);
         if (hlsResult?.aborted) {
           res = { ok: false, aborted: true };
@@ -4901,7 +5027,7 @@
         }
       } else {
         showProgressToast(`Скачивание… ${label}`, { kind: 'progress' });
-        const fetchResult = await pageCall('VKD_FETCH_BLOB', 'VKD_FETCH_BLOB_DONE', { url: track.url, trackId: track.id }, 120000);
+        const fetchResult = await pageCall('VKD_FETCH_BLOB', 'VKD_FETCH_BLOB_DONE', { url: track.url, trackId: track.id }, 120000, 'trackId');
         if (fetchResult?.aborted) {
           res = { ok: false, aborted: true };
         } else if (fetchResult?.ok && fetchResult.blobUrl) {

@@ -277,6 +277,13 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
       // is a no-op.
       { name: 'ceilingR', defaultValue: -0.3, minValue: -20, maxValue: 0, automationRate: 'k-rate' }, // dB
       { name: 'limRelease', defaultValue: 50, minValue: 1, maxValue: 1000, automationRate: 'k-rate' }, // ms
+      // Drive gain applied only to the signal entering the limiter stage
+      // (written into its delay line and used for peak detection), separate
+      // from the chain-wide `inputGain`/`outputGain` pair. Since the ceiling
+      // clamp still enforces the same output level regardless, this purely
+      // trades off how much gain reduction the limiter does to get there —
+      // the classic "push it into the limiter harder" knob.
+      { name: 'limGain', defaultValue: 0, minValue: -24, maxValue: 24, automationRate: 'k-rate' }, // dB
       { name: 'truePeakMode', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
       // Index into OVERSAMPLE_FACTORS ([2,4,8,16]) — which polyphase FIR bank
       // true-peak detection uses. Only consulted when truePeakMode is on.
@@ -425,6 +432,7 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     const ceilingDb = parameters.ceiling[0];
     const ceilingRDb = parameters.ceilingR[0];
     const limReleaseMs = Math.max(1, parameters.limRelease[0]);
+    const limGainDb = parameters.limGain[0];
     const truePeakMode = parameters.truePeakMode[0] >= 0.5;
     const oversampleIdx = Math.max(0, Math.min(OVERSAMPLE_FACTORS.length - 1, Math.round(parameters.oversampling[0])));
     const polyphaseBank = POLYPHASE_BANKS[oversampleIdx];
@@ -441,6 +449,9 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     const gainsActive = compEnabled || limEnabled;
     const inputGainLin = gainsActive ? Math.pow(10, inputGainDb / 20) : 1;
     const outputGainLin = gainsActive ? Math.pow(10, outputGainDb / 20) : 1;
+    // Gated on the limiter stage itself, not `gainsActive` — a bypassed
+    // limiter must stay fully transparent regardless of this knob.
+    const limGainLin = limEnabled ? Math.pow(10, limGainDb / 20) : 1;
     const ceilingLin = Math.pow(10, ceilingDb / 20);
     // Only meaningfully different from ceilingLin in Unlinked mode.
     const ceilingRLin = Math.pow(10, ceilingRDb / 20);
@@ -595,6 +606,13 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     };
 
     const limStage = () => {
+      // Drive gain into the limiter's own delay line/detector — applied
+      // ahead of both branches below since they both read from `frame`.
+      // Because the ceiling clamp still targets the same output level, this
+      // only changes how hard the limiter has to work to get there.
+      if (limGainLin !== 1) {
+        for (let ch = 0; ch < channelCount; ch++) frame[ch] *= limGainLin;
+      }
       // The stage always routes through its delay line, even bypassed — so
       // the node's latency is constant and toggling the limiter never causes
       // a 5ms splice click; a bypassed stage just converges to unity gain.

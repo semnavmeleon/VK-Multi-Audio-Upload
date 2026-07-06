@@ -2471,7 +2471,7 @@
     let lastLimMeterDb = 0;
     const fx = {
       threshold: -3, ratio: 4, inputGain: 0, outputGain: 0, attack: 3, release: 250,
-      knee: 0, ceiling: -0.3, ceilingR: -0.3, limRelease: 50, style: 3, autoRelease: false,
+      knee: 0, ceiling: -0.3, ceilingR: -0.3, limRelease: 50, limGain: 0, style: 3, autoRelease: false,
       truePeakMode: false, autoGain: false, oversampling: 1, processingMode: 0, chainOrder: 0,
       bands: EQ_FREQS.map(() => 0),
     };
@@ -2515,6 +2515,7 @@
       setParam(lim, 'ceiling', fx.ceiling);
       setParam(lim, 'ceilingR', fx.ceilingR);
       setParam(lim, 'limRelease', fx.limRelease);
+      setParam(lim, 'limGain', fx.limGain);
       setParam(lim, 'inputGain', fx.inputGain);
       setParam(lim, 'outputGain', fx.outputGain);
       setParam(lim, 'style', fx.style);
@@ -2630,6 +2631,7 @@
       fx.ceilingR = Number(e.data.ceilingR) || 0;
       const limRel = Number(e.data.limRelease);
       fx.limRelease = isFinite(limRel) && limRel > 0 ? limRel : 50;
+      fx.limGain = Number(e.data.limGain) || 0;
       fx.style = Math.max(0, Math.min(6, Math.round(Number(e.data.style)) || 0));
       fx.autoRelease = !!e.data.autoRelease;
       fx.truePeakMode = !!e.data.truePeak;
@@ -2660,7 +2662,7 @@
         limiterEnabled, compEnabled, eqEnabled,
         chainOrder: val('chainOrder'),
         threshold: val('threshold'), ratio: val('ratio'), attack: val('attack'), release: val('release'),
-        knee: val('knee'), ceiling: val('ceiling'), ceilingR: val('ceilingR'), limRelease: val('limRelease'),
+        knee: val('knee'), ceiling: val('ceiling'), ceilingR: val('ceilingR'), limRelease: val('limRelease'), limGain: val('limGain'),
         inputGain: val('inputGain'), outputGain: val('outputGain'),
         style: val('style'), autoRelease: val('autoRelease'), truePeakMode: val('truePeakMode'), oversampling: val('oversampling'),
         meteringActive: val('meteringActive'), autoGain: val('autoGain'), processingMode: val('processingMode'),
