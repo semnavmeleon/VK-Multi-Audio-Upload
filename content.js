@@ -3031,7 +3031,7 @@
               <span class="vmu-setting-hint">Сколько треков плейлиста скачивать одновременно</span>
             </div>
             <div class="vmu-slider-wrap">
-              <input type="range" id="vmu-dl-threads" class="vmu-slider" min="1" max="10" step="1" value="${settings.downloadThreads}">
+              <input type="range" id="vmu-dl-threads" class="vmu-slider" min="1" max="25" step="1" value="${settings.downloadThreads}">
               <span class="vmu-slider-value" id="vmu-dl-threads-val">${settings.downloadThreads}</span>
               <button type="button" id="vmu-dl-threads-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
             </div>
@@ -3189,7 +3189,7 @@
     const dlThreadsVal = document.getElementById('vmu-dl-threads-val');
     if (dlThreadsSlider) {
       dlThreadsSlider.addEventListener('input', () => {
-        const v = Math.max(1, Math.min(10, parseInt(dlThreadsSlider.value, 10) || 1));
+        const v = Math.max(1, Math.min(25, parseInt(dlThreadsSlider.value, 10) || 1));
         settings.downloadThreads = v;
         if (dlThreadsVal) dlThreadsVal.textContent = String(v);
       });
@@ -4877,14 +4877,14 @@
       // Phase 2 — fetch loop. In ZIP mode we accumulate Uint8Arrays + filenames
       // and build a single archive at the end. In individual mode we download
       // each blob via chrome.downloads as it lands. Runs as a small pool of
-      // concurrent workers (settings.downloadThreads, capped 1-10) pulling
+      // concurrent workers (settings.downloadThreads, capped 1-25) pulling
       // from a shared cursor instead of one file at a time — each worker
       // still paces itself with the original 120ms gap between its own
       // downloads, so a single-thread setting behaves exactly as before.
       const zipFiles = [];
       let done = 0, errors = 0;
       const wantBuffer = (mode === 'zip');
-      const threads = Math.max(1, Math.min(10, Math.round(Number(settings.downloadThreads)) || 1));
+      const threads = Math.max(1, Math.min(25, Math.round(Number(settings.downloadThreads)) || 1));
 
       let cursor = 0;
       async function downloadQueuedTrack(i) {
@@ -4897,7 +4897,13 @@
         try {
           if (isHls) {
             const hlsUrl = track.url.includes('.m3u8') ? track.url : track.url + '/index.m3u8';
-            const r = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id, returnBuffer: wantBuffer }, 300000, 'trackId');
+            // Segment concurrency stays modest here (unlike the single-track
+            // path below) — this already runs inside one of `threads`
+            // parallel track workers, so multiplying by a full second
+            // concurrency dial per track would fan out to threads×N
+            // simultaneous connections instead of a bounded total.
+            const hlsSegConcurrency = Math.max(1, Math.min(6, settings.downloadThreads));
+            const r = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id, returnBuffer: wantBuffer, concurrency: hlsSegConcurrency }, 300000, 'trackId');
             if (r?.ok) {
               ext = r.ext || 'ts';
               if (wantBuffer) { bytes = r.buffer; res = { ok: true }; }
@@ -5043,7 +5049,11 @@
           showProgressToast(`Скачивание ${pct}% · ${label}`, { kind: 'progress', pct });
         });
         const hlsUrl = track.url.includes('.m3u8') ? track.url : track.url + '/index.m3u8';
-        const hlsResult = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id }, 300000, 'trackId');
+        // No outer track-level parallelism competing here (single track), so
+        // this goes past the general 1-10 "download threads" dial — segments
+        // are small and latency-bound, not bandwidth-bound, so a higher
+        // concurrency than that setting's own max keeps paying off.
+        const hlsResult = await pageCall('VKD_HLS_DOWNLOAD', 'VKD_HLS_DOWNLOAD_DONE', { url: hlsUrl, trackId: track.id, concurrency: 12 }, 300000, 'trackId');
         hlsProgressHandlers.delete(track.id);
         if (hlsResult?.aborted) {
           res = { ok: false, aborted: true };

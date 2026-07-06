@@ -1094,13 +1094,13 @@
       }
 
       case 'VKD_HLS_DOWNLOAD': {
-        const { url, trackId, returnBuffer } = e.data;
+        const { url, trackId, returnBuffer, concurrency } = e.data;
         const onProgress = (done, total) => {
           window.postMessage({ type: 'VKD_HLS_PROGRESS', trackId, done, total }, '*');
         };
         const cancelToken = { cancelled: false };
         __vmuSoloDlCancel.set(trackId, cancelToken);
-        downloadHlsAsBlob(url, onProgress, cancelToken).then(async result => {
+        downloadHlsAsBlob(url, onProgress, cancelToken, concurrency).then(async result => {
           __vmuSoloDlCancel.delete(trackId);
           const msg = { type: 'VKD_HLS_DOWNLOAD_DONE', ok: true, trackId, ext: result.ext };
           const transfers = [];
@@ -1223,7 +1223,7 @@
   const __vmuSoloDlCancel = new Map();
   const __VMU_SOLO_CANCELLED__ = '__SOLO_CANCELLED__';
 
-  async function downloadHlsAsBlob(m3u8Url, onProgress, cancelToken) {
+  async function downloadHlsAsBlob(m3u8Url, onProgress, cancelToken, concurrency) {
     // Fix doubled /index.m3u8 (content.js may append it when URL already has .m3u8?query)
     m3u8Url = m3u8Url.replace(/(\.m3u8[^/]*?)\/index\.m3u8$/, '$1');
     const hlsFetch = (url) => origFetch(url, { headers: { Referer: 'https://vk.com/' } });
@@ -1299,41 +1299,72 @@
       return iv;
     }
 
-    // Download and optionally decrypt segments
-    const chunks = [];
-    for (let i = 0; i < segments.length; i++) {
-      if (cancelToken?.cancelled) throw new Error(__VMU_SOLO_CANCELLED__);
-      const seg = segments[i];
-      const resp = await hlsFetch(seg.url);
-      if (!resp.ok) throw new Error(`segment ${i} failed: ${resp.status}`);
-      let data = await resp.arrayBuffer();
+    // Resolve the decryption key once, up front, instead of on segment 0 —
+    // segments now download out of order (see below), so "did segment 0
+    // fail to get a key" is no longer a meaningful signal to gate the rest.
+    if (encrypted) {
+      const firstKeyUri = segments.find(s => s.key)?.key?.uri;
+      if (firstKeyUri && !(await getKey(firstKeyUri))) {
+        console.warn('[vmu] key not available, downloading without decryption');
+        decryptionAvailable = false;
+      }
+    }
 
-      if (seg.key && decryptionAvailable) {
-        const cryptoKey = await getKey(seg.key.uri);
-        if (cryptoKey) {
-          const standardIv = seg.key.iv ? hexToIv(seg.key.iv) : seqNumToIv(seg.seqNum);
-          try {
-            data = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: standardIv }, cryptoKey, data);
-          } catch {
+    // Download (and decrypt) segments through a small pool of concurrent
+    // workers instead of one at a time — this used to be the slowest part
+    // of an HLS track download by far. Order-independent: AES-CBC here is
+    // per-segment (IV is either explicit or derived from the segment's own
+    // sequence number, never chained to the previous segment's plaintext/
+    // ciphertext), so segments can finish in any order and are written into
+    // `chunks` by index, then concatenated in original playlist order below.
+    const chunks = new Array(segments.length);
+    let doneCount = 0;
+    let nextSeg = 0;
+    // Capped higher than the general download-threads dial (max 10): each
+    // segment is small (a few seconds of audio) and the wait is dominated by
+    // round-trip latency rather than bandwidth, so more concurrent in-flight
+    // requests keeps paying off past 10 without the same memory/bandwidth
+    // cost N full parallel tracks would have.
+    const segConcurrency = Math.max(1, Math.min(16, Math.round(Number(concurrency)) || 4));
+    async function segmentWorker() {
+      while (true) {
+        if (cancelToken?.cancelled) throw new Error(__VMU_SOLO_CANCELLED__);
+        const i = nextSeg++;
+        if (i >= segments.length) return;
+        const seg = segments[i];
+        const resp = await hlsFetch(seg.url);
+        if (!resp.ok) throw new Error(`segment ${i} failed: ${resp.status}`);
+        let data = await resp.arrayBuffer();
+
+        if (seg.key && decryptionAvailable) {
+          const cryptoKey = await getKey(seg.key.uri);
+          if (cryptoKey) {
+            const standardIv = seg.key.iv ? hexToIv(seg.key.iv) : seqNumToIv(seg.seqNum);
             try {
-              const vkIv = new Uint8Array(data.slice(0, 16));
-              data = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: vkIv }, cryptoKey, data.slice(16));
-            } catch (e2) {
-              console.warn('[vmu] decrypt failed seg', i, e2.message);
+              data = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: standardIv }, cryptoKey, data);
+            } catch {
+              try {
+                const vkIv = new Uint8Array(data.slice(0, 16));
+                data = await crypto.subtle.decrypt({ name: 'AES-CBC', iv: vkIv }, cryptoKey, data.slice(16));
+              } catch (e2) {
+                console.warn('[vmu] decrypt failed seg', i, e2.message);
+              }
             }
           }
-        } else if (i === 0) {
-          console.warn('[vmu] key not available, downloading without decryption');
-          decryptionAvailable = false;
         }
-      }
 
-      chunks.push(data);
-      if (typeof onProgress === 'function') {
-        try { onProgress(i + 1, segments.length); } catch {}
+        chunks[i] = data;
+        doneCount++;
+        if (typeof onProgress === 'function') {
+          try { onProgress(doneCount, segments.length); } catch {}
+        }
+        // Lighter courtesy pause than the old sequential loop's — the
+        // concurrency cap above is now doing most of the throttling, this
+        // just avoids a dead-flat-out hammering of VK's CDN.
+        if (doneCount % 10 === 0) await pause(30);
       }
-      if (i % 5 === 4) await pause(50);
     }
+    await Promise.all(Array.from({ length: Math.min(segConcurrency, segments.length) }, segmentWorker));
 
     // Concatenate all segments
     const totalSize = chunks.reduce((s, c) => s + c.byteLength, 0);
