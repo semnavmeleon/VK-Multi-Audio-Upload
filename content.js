@@ -114,6 +114,13 @@
   const isMP3 = (f) => f.type === 'audio/mpeg' || f.name.toLowerCase().endsWith('.mp3');
   const fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
   const escHtml = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  // Small "?" badge with a native title tooltip — used throughout the audio-FX
+  // panel to explain what a control actually does. Native `title` rather than
+  // a custom CSS tooltip deliberately: it's rendered by the browser/OS, so it
+  // always has readable contrast regardless of VK's theme, and several of
+  // these icons sit inside the panel's own scrolling body where a CSS-based
+  // popover would risk being clipped by overflow:auto.
+  const helpIcon = (text) => ` <span class="vmu-help-icon" title="${escHtml(text)}">?</span>`;
 
   function waitForElement(sel, ms) {
     return new Promise(resolve => {
@@ -130,7 +137,7 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'limiter', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -367,6 +374,25 @@
   let meterLoopRunning = false;
   let lastMeterFrameTs = 0;
 
+  // Gain-reduction values arrive from the worklet as "max seen in this ~21ms
+  // report window", reset to 0 right after each send (see limiter-worklet.js'
+  // _maxCompReductionSinceReport/_maxLimReductionSinceReport). Painting that
+  // raw value straight into the meter bar/readout/history-graph is a
+  // staircase: it jumps to the new window's peak, holds flat for ~21ms, then
+  // jumps to the next one — which on fast-release settings reads as "shows a
+  // value, then resets," and is what made the history graph's shape look
+  // wrong. Smoothing here (fast rise so real transients aren't hidden, slower
+  // fall so it decays instead of stair-stepping) is shared by every surface
+  // that shows these two numbers — bars, text, the history graph, and the
+  // transfer-curve's live dot — so they can't disagree with each other.
+  const meterSmooth = { reductionDb: 0, limReductionDb: 0 };
+  function smoothMeterValue(cur, target, dtSec) {
+    if (!isFinite(target)) return cur;
+    const timeConstSec = target > cur ? 0.015 : 0.15;
+    const coeff = dtSec > 0 ? 1 - Math.exp(-dtSec / timeConstSec) : 1;
+    return cur + (target - cur) * coeff;
+  }
+
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data || e.data.type !== 'VMU_AUDIOFX_METER') return;
     meterRaw.reductionDb = Number(e.data.reductionDb) || 0;
@@ -432,7 +458,7 @@
   }
 
   function drawTransferCurve() {
-    if (settings.audioFxActiveTab !== 'limiter') return;
+    if (settings.audioFxActiveTab !== 'compressor') return;
     const canvas = document.getElementById('vmu-fx-curve');
     if (!canvas) return;
     const sized = sizeCanvasForDisplay(canvas);
@@ -477,7 +503,7 @@
     // theoretical one.
     if (typeof meterRaw.inputPeakDb === 'number' && (settings.audioFxCompEnabled || settings.audioFxLimiterEnabled)) {
       const inDb = meterDisp.inputPeakDb;
-      const outDb = Math.min(inDb - meterRaw.reductionDb - meterRaw.limReductionDb, settings.audioFxCeiling);
+      const outDb = Math.min(inDb - meterSmooth.reductionDb - meterSmooth.limReductionDb, settings.audioFxCeiling);
       ctx.fillStyle = '#ffffff';
       ctx.beginPath();
       ctx.arc(xOf(inDb), yOf(outDb), 3, 0, Math.PI * 2);
@@ -545,14 +571,16 @@
 
     applyPeakHold(meterDisp, 'truePeakDb', 'truePeakHoldUntil', meterRaw.truePeakDb, nowMs, dtSec);
     applyPeakHold(meterDisp, 'inputPeakDb', 'inputPeakHoldUntil', meterRaw.inputPeakDb, nowMs, dtSec);
+    meterSmooth.reductionDb = smoothMeterValue(meterSmooth.reductionDb, meterRaw.reductionDb, dtSec);
+    meterSmooth.limReductionDb = smoothMeterValue(meterSmooth.limReductionDb, meterRaw.limReductionDb, dtSec);
 
-    const db = meterRaw.reductionDb;
+    const db = meterSmooth.reductionDb;
     const fill = document.getElementById('vmu-fx-meter-fill');
     const val = document.getElementById('vmu-fx-meter-val');
     if (fill) fill.style.width = Math.max(0, Math.min(100, (db / 24) * 100)) + '%';
     if (val) val.textContent = '-' + db.toFixed(1) + ' дБ';
 
-    const limDb = meterRaw.limReductionDb;
+    const limDb = meterSmooth.limReductionDb;
     const limFill = document.getElementById('vmu-fx-limmeter-fill');
     const limVal = document.getElementById('vmu-fx-limmeter-val');
     if (limFill) limFill.style.width = Math.max(0, Math.min(100, (limDb / 24) * 100)) + '%';
@@ -587,7 +615,18 @@
 
     // History plots the total dynamics reduction — compressor + limiter
     // stages together, which is what "how much is being taken off" means.
-    meterHistory.push({ t: nowMs, inputDb: meterRaw.inputPeakDb, reductionDb: db + limDb, truePeakDb: meterRaw.truePeakDb });
+    // Input uses the peak-held/decaying meterDisp value, not raw
+    // meterRaw.inputPeakDb — the raw value is "loudest sample in the last
+    // ~21ms report window", which for real music swings by 20-30dB between
+    // consecutive reports and, plotted at full density, drew as a dense
+    // comb of spikes rather than a readable level trace.
+    // Same reasoning as inputDb above — meterRaw.truePeakDb is also a raw
+    // per-report-window max; meterDisp.truePeakDb is the peak-held version
+    // already computed by applyPeakHold() a few lines up. Keep it null
+    // (not 0/-60) when True Peak is off so the sparse-dot drawing below
+    // still skips those points entirely, same as before.
+    const truePeakForHistory = meterRaw.truePeakDb !== null ? meterDisp.truePeakDb : null;
+    meterHistory.push({ t: nowMs, inputDb: meterDisp.inputPeakDb, reductionDb: db + limDb, truePeakDb: truePeakForHistory });
     const cutoff = nowMs - HISTORY_SECONDS * 1000;
     while (meterHistory.length && meterHistory[0].t < cutoff) meterHistory.shift();
 
@@ -825,10 +864,10 @@
   }
 
   function buildAudioFxPanel() {
-    const limiterRow = (id, label, min, max, step, value, unit) => `
+    const limiterRow = (id, label, min, max, step, value, unit, help) => `
       <div class="vmu-setting-row vmu-slider-row">
         <div class="vmu-setting-info">
-          <span class="vmu-setting-label">${label}</span>
+          <span class="vmu-setting-label">${label}${help ? helpIcon(help) : ''}</span>
         </div>
         <div class="vmu-slider-wrap">
           <input type="range" id="${id}" class="vmu-slider" min="${min}" max="${max}" step="${step}" value="${value}">
@@ -848,7 +887,7 @@
         <span class="vmu-eq-band-freq">${formatFreqLabel(AUDIOFX_FREQS[i])}</span>
       </div>`).join('');
 
-    const tab = settings.audioFxActiveTab || 'limiter';
+    const tab = settings.audioFxActiveTab || 'compressor';
     const isTab = t => tab === t ? ' active' : '';
     const pageDisplay = t => tab === t ? '' : ' style="display:none"';
 
@@ -884,27 +923,28 @@
             <button type="button" id="vmu-fx-preset-save-cancel" class="vmu-fx-preset-btn-secondary">Отмена</button>
           </div>
         </div>
+        <div class="vmu-audiofx-section vmu-audiofx-chain-section">
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Цепочка${helpIcon('Порядок обработки сигнала — в каком порядке он проходит через эквалайзер, компрессор и лимитер. Например, поставьте лимитер первым, чтобы поймать пики ещё до эквализации, или эквалайзер последним, чтобы подчистить тембр после сжатия.')}</span>
+            </div>
+            ${buildDropdownHtml('vmu-fx-chain-dd', AUDIOFX_CHAIN_ORDER_LABELS, settings.audioFxChainOrder)}
+          </div>
+          ${limiterRow('vmu-fx-input', 'Вход', -24, 24, 0.5, settings.audioFxInputGain, ' дБ', 'Гейн перед всей цепочкой обработки (EQ + компрессор + лимитер). Поднимите, если исходный сигнал слишком тихий, чтобы раскачать компрессор или лимитер.')}
+          ${limiterRow('vmu-fx-output', 'Выход', -24, 24, 0.5, settings.audioFxOutputGain, ' дБ', 'Гейн после всей цепочки обработки. Компенсирует громкость, которую сняли компрессор и лимитер, либо намеренно понижает финальный уровень.')}
+        </div>
         <div class="vmu-audiofx-tabs" id="vmu-audiofx-tabs" role="tablist">
-          <button type="button" data-vmu-fxtab="limiter" class="${isTab('limiter')}">Динамика</button>
+          <button type="button" data-vmu-fxtab="compressor" class="${isTab('compressor')}">Компрессор</button>
+          <button type="button" data-vmu-fxtab="limiter" class="${isTab('limiter')}">Лимитер</button>
           <button type="button" data-vmu-fxtab="eq" class="${isTab('eq')}">EQ</button>
           <button type="button" data-vmu-fxtab="metering" class="${isTab('metering')}">Метринг</button>
         </div>
         <div class="vmu-audiofx-body">
-          <div class="vmu-audiofx-tabpage${isTab('limiter')}" data-vmu-fxtab-page="limiter"${pageDisplay('limiter')}>
+          <div class="vmu-audiofx-tabpage${isTab('compressor')}" data-vmu-fxtab-page="compressor"${pageDisplay('compressor')}>
             <div class="vmu-audiofx-section">
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Цепочка</span>
-                  <span class="vmu-setting-hint">Порядок стадий обработки</span>
-                </div>
-                ${buildDropdownHtml('vmu-fx-chain-dd', AUDIOFX_CHAIN_ORDER_LABELS, settings.audioFxChainOrder)}
-              </div>
-              ${limiterRow('vmu-fx-input', 'Input', -24, 24, 0.5, settings.audioFxInputGain, ' дБ')}
-              ${limiterRow('vmu-fx-output', 'Output', -24, 24, 0.5, settings.audioFxOutputGain, ' дБ')}
-              <div class="vmu-audiofx-section-title">Компрессор</div>
-              <div class="vmu-setting-row">
-                <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Компрессор</span>
+                  <span class="vmu-setting-label">Компрессор${helpIcon('Включает/выключает стадию компрессии. При выключении сигнал проходит через это место в цепочке без изменений — лимитер и EQ остаются на своих местах в порядке цепочки.')}</span>
                 </div>
                 <label class="vmu-toggle">
                   <input type="checkbox" id="vmu-fx-comp-enable" ${settings.audioFxCompEnabled ? 'checked' : ''}>
@@ -913,24 +953,23 @@
               </div>
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Style</span>
+                  <span class="vmu-setting-label">Стиль${helpIcon('Характер компрессии — от мягкого и незаметного (Transparent) до жёсткого и предсказуемого (Safe). Меняет форму колена, тип детектора (пик/RMS) и подмес быстрого восстановления — сами слайдеры ниже при этом не трогает. Allround — поведение по умолчанию.')}</span>
                 </div>
                 ${buildDropdownHtml('vmu-fx-style-dd', AUDIOFX_STYLE_NAMES, settings.audioFxStyle)}
               </div>
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Обработка стерео</span>
+                  <span class="vmu-setting-label">Обработка стерео${helpIcon('Связка — общее решение по громче́му из двух каналов (по умолчанию). Раздельно — независимое усиление на левом и правом канале. M-S — независимое усиление на средней (mid) и боковой (side) составляющей стерео-сигнала. Действует на обе динамические стадии.')}</span>
                 </div>
                 <div class="vmu-mode-switch" id="vmu-fx-procmode" role="tablist">
-                  <button type="button" data-vmu-procmode="0" class="${settings.audioFxProcessingMode === 0 ? 'active' : ''}">Linked</button>
-                  <button type="button" data-vmu-procmode="1" class="${settings.audioFxProcessingMode === 1 ? 'active' : ''}">Unlinked</button>
+                  <button type="button" data-vmu-procmode="0" class="${settings.audioFxProcessingMode === 0 ? 'active' : ''}">Связка</button>
+                  <button type="button" data-vmu-procmode="1" class="${settings.audioFxProcessingMode === 1 ? 'active' : ''}">Раздельно</button>
                   <button type="button" data-vmu-procmode="2" class="${settings.audioFxProcessingMode === 2 ? 'active' : ''}">M-S</button>
                 </div>
               </div>
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Auto Release</span>
-                  <span class="vmu-setting-hint">Скорость восстановления подстраивается под материал</span>
+                  <span class="vmu-setting-label">Авто-восстановление${helpIcon('Время восстановления подстраивается под материал в реальном времени: медленнее на плотном/громком звуке (чтобы не «пампировало»), быстрее на резком/перкуссивном (чтобы успевать восстанавливаться между ударами) — вместо фиксированного значения слайдера «Восстановление» ниже.')}</span>
                 </div>
                 <label class="vmu-toggle">
                   <input type="checkbox" id="vmu-fx-autorelease" ${settings.audioFxAutoRelease ? 'checked' : ''}>
@@ -939,8 +978,7 @@
               </div>
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Auto Gain</span>
-                  <span class="vmu-setting-hint">Компенсирует громкость компрессора для честного A/B — приближение, не точный LUFS-матчинг</span>
+                  <span class="vmu-setting-label">Авто-гейн${helpIcon('Компенсирует громкость, которую забирает компрессор, чтобы сравнение вкл/выкл (A/B) было честным по громкости, а не просто «включено — значит громче». Приближение, не точный LUFS-матчинг.')}</span>
                 </div>
                 <span class="vmu-slider-value" id="vmu-fx-autogain-val" style="margin-right:8px">0.0 дБ</span>
                 <label class="vmu-toggle">
@@ -952,31 +990,32 @@
                 <canvas id="vmu-fx-curve" class="vmu-audiofx-canvas"></canvas>
               </div>
               <div class="vmu-audiofx-meter-row">
-                <span class="vmu-audiofx-meter-label">Gain Reduction</span>
+                <span class="vmu-audiofx-meter-label">Снижение усиления${helpIcon('Сколько дБ компрессор сейчас снимает с сигнала.')}</span>
                 <div class="vmu-audiofx-meter"><div class="vmu-audiofx-meter-fill" id="vmu-fx-meter-fill"></div></div>
                 <span class="vmu-audiofx-meter-val" id="vmu-fx-meter-val">0.0 дБ</span>
               </div>
-              ${limiterRow('vmu-fx-threshold', 'Threshold', -60, 0, 1, settings.audioFxThreshold, ' дБ')}
-              ${limiterRow('vmu-fx-ratio', 'Ratio', 1, 20, 0.5, settings.audioFxRatio, ':1')}
-              ${limiterRow('vmu-fx-knee', 'Knee', 0, 40, 1, settings.audioFxKnee, ' дБ')}
-              ${limiterRow('vmu-fx-attack', 'Attack', 0, 100, 1, settings.audioFxAttack, ' мс')}
-              ${limiterRow('vmu-fx-release', 'Release', 0, 1000, 5, settings.audioFxRelease, ' мс')}
-              <div class="vmu-audiofx-section-title">Лимитер</div>
+              ${limiterRow('vmu-fx-threshold', 'Порог', -60, 0, 1, settings.audioFxThreshold, ' дБ', 'Уровень сигнала (в дБ), выше которого начинает работать компрессия. Чем ниже порог — тем больше материала попадает под сжатие.')}
+              ${limiterRow('vmu-fx-ratio', 'Соотношение', 1, 20, 0.5, settings.audioFxRatio, ':1', 'Степень сжатия сигнала выше порога. Например, 4:1 означает, что превышение порога на 4 дБ на входе станет превышением всего на 1 дБ на выходе.')}
+              ${limiterRow('vmu-fx-knee', 'Колено', 0, 40, 1, settings.audioFxKnee, ' дБ', 'Ширина плавного перехода вокруг порога (в дБ). 0 — жёсткое колено (компрессия включается резко ровно на пороге), больше — мягкий, постепенный переход в компрессию.')}
+              ${limiterRow('vmu-fx-attack', 'Атака', 0, 100, 1, settings.audioFxAttack, ' мс', 'Как быстро (в мс) компрессор реагирует на превышение порога и начинает снижать громкость.')}
+              ${limiterRow('vmu-fx-release', 'Восстановление', 0, 1000, 5, settings.audioFxRelease, ' мс', 'Как быстро (в мс) компрессор отпускает сигнал обратно после того, как уровень опустился ниже порога. Игнорируется, если включено «Авто-восстановление» выше.')}
+            </div>
+          </div>
+          <div class="vmu-audiofx-tabpage${isTab('limiter')}" data-vmu-fxtab-page="limiter"${pageDisplay('limiter')}>
+            <div class="vmu-audiofx-section">
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Лимитер</span>
-                  <span class="vmu-setting-hint">Brick-wall с собственной огибающей; атака фиксирована lookahead-ом (5 мс)</span>
+                  <span class="vmu-setting-label">Лимитер${helpIcon('Настоящий lookahead brick-wall лимитер с собственной огибающей: бесконечное соотношение к потолку, атака жёстко привязана к lookahead (5 мс — огибающая успевает опуститься до выхода транзиента из задержки). Финальный клэмп остаётся только страховкой от остаточных долей дБ, а не основным механизмом ограничения.')}</span>
                 </div>
                 <label class="vmu-toggle">
                   <input type="checkbox" id="vmu-fx-limiter-enable" ${settings.audioFxLimiterEnabled ? 'checked' : ''}>
                   <span class="vmu-toggle-track"></span>
                 </label>
               </div>
-              ${limiterRow('vmu-fx-limgain', 'Гейн', -24, 24, 0.5, settings.audioFxLimGain, ' дБ')}
+              ${limiterRow('vmu-fx-limgain', 'Гейн', -24, 24, 0.5, settings.audioFxLimGain, ' дБ', 'Отдельный дожим сигнала прямо перед лимитером, независимо от общих Входа/Выхода цепочки (вкладка сверху). Потолок остаётся тем же — лимитер просто снимает больше или меньше. Классическая ручка «подать погорячее».')}
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">True Peak</span>
-                  <span class="vmu-setting-hint">Лимитировать по межсэмпловым пикам, а не только по сэмплам</span>
+                  <span class="vmu-setting-label">Истинный пик${helpIcon('Лимитирует по межсэмпловым перегрузам (inter-sample peaks), а не только по значениям самих сэмплов — важно для стриминга и вещания, где декодер может восстановить более высокий пик, чем виден в сэмплах на этой дорожке.')}</span>
                 </div>
                 <label class="vmu-toggle">
                   <input type="checkbox" id="vmu-fx-truepeak" ${settings.audioFxTruePeak ? 'checked' : ''}>
@@ -985,21 +1024,19 @@
               </div>
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Oversampling</span>
-                  <span class="vmu-setting-hint">Кратность передискретизации для True Peak</span>
+                  <span class="vmu-setting-label">Передискретизация${helpIcon('Кратность передискретизации для расчёта истинного пика (2×/4×/8×/16×) — настоящий полифазный FIR-банк, а не приближение. Выше — точнее, но чуть больше нагрузка на процессор. Учитывается только пока включён «Истинный пик».')}</span>
                 </div>
                 ${buildDropdownHtml('vmu-fx-oversampling-dd', AUDIOFX_OVERSAMPLE_LABELS, settings.audioFxOversampling)}
               </div>
               <div class="vmu-audiofx-meter-row">
-                <span class="vmu-audiofx-meter-label">Gain Reduction</span>
+                <span class="vmu-audiofx-meter-label">Снижение усиления${helpIcon('Сколько дБ лимитер сейчас снимает с сигнала.')}</span>
                 <div class="vmu-audiofx-meter"><div class="vmu-audiofx-meter-fill" id="vmu-fx-limmeter-fill"></div></div>
                 <span class="vmu-audiofx-meter-val" id="vmu-fx-limmeter-val">0.0 дБ</span>
               </div>
-              ${limiterRow('vmu-fx-ceiling', 'Ceiling', -20, 0, 0.1, settings.audioFxCeiling, ' дБ')}
+              ${limiterRow('vmu-fx-ceiling', 'Потолок', -20, 0, 0.1, settings.audioFxCeiling, ' дБ', 'Максимальный уровень сигнала на выходе лимитера (в дБ) — сигнал не может превысить этот уровень.')}
               <div class="vmu-setting-row vmu-slider-row" id="vmu-fx-ceilingr-row" style="${settings.audioFxProcessingMode === 1 ? '' : 'display:none'}">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Ceiling R</span>
-                  <span class="vmu-setting-hint">Отдельный потолок правого канала (только Unlinked)</span>
+                  <span class="vmu-setting-label">Потолок R${helpIcon('Отдельный потолок для правого канала — учитывается только в режиме «Раздельно» на вкладке «Компрессор», когда каналы обрабатываются независимо.')}</span>
                 </div>
                 <div class="vmu-slider-wrap">
                   <input type="range" id="vmu-fx-ceilingr" class="vmu-slider" min="-20" max="0" step="0.1" value="${settings.audioFxCeilingR}">
@@ -1007,14 +1044,14 @@
                   <button type="button" id="vmu-fx-ceilingr-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
                 </div>
               </div>
-              ${limiterRow('vmu-fx-limrelease', 'Release', 1, 1000, 1, settings.audioFxLimRelease, ' мс')}
+              ${limiterRow('vmu-fx-limrelease', 'Восстановление', 1, 1000, 1, settings.audioFxLimRelease, ' мс', 'Как быстро (в мс) лимитер отпускает снижение громкости после того, как пиковый сигнал прошёл. Атака у лимитера фиксирована (5 мс, привязана к lookahead) и отдельно не настраивается.')}
             </div>
           </div>
           <div class="vmu-audiofx-tabpage${isTab('eq')}" data-vmu-fxtab-page="eq"${pageDisplay('eq')}>
             <div class="vmu-audiofx-section">
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Эквалайзер</span>
+                  <span class="vmu-setting-label">Эквалайзер${helpIcon('Включает/выключает 10-полосный графический эквалайзер.')}</span>
                 </div>
                 <label class="vmu-toggle">
                   <input type="checkbox" id="vmu-fx-eq-enable" ${settings.audioFxEqEnabled ? 'checked' : ''}>
@@ -1022,7 +1059,7 @@
                 </label>
               </div>
               <div class="vmu-audiofx-section-title">
-                Полосы
+                <span>Полосы${helpIcon('10 полос по стандартной ISO-сетке частот (31 Гц – 16 кГц), каждая ±12 дБ. Колесо мыши на полосе — шаг 0.5 дБ (Shift — 0.1 дБ), двойной клик — сброс полосы.')}</span>
                 <button type="button" id="vmu-fx-eq-reset" class="vmu-slider-reset" title="Сбросить все полосы">↺</button>
               </div>
               <div class="vmu-eq-bands-row">
@@ -1039,27 +1076,27 @@
           <div class="vmu-audiofx-tabpage${isTab('metering')}" data-vmu-fxtab-page="metering"${pageDisplay('metering')}>
             <div class="vmu-audiofx-section">
               <div class="vmu-audiofx-section-title">
-                Метринг
+                <span>Метринг${helpIcon('Живые измерения текущего трека: история за последние 15 секунд, пиковые и интегральные показатели громкости (LUFS/LRA) по стандарту ITU-R BS.1770-4.')}</span>
                 <button type="button" id="vmu-fx-lufs-reset" class="vmu-slider-reset" title="Сбросить накопленные значения">↺</button>
               </div>
               <div class="vmu-audiofx-canvas-wrap">
                 <canvas id="vmu-fx-history" class="vmu-audiofx-canvas vmu-audiofx-canvas-history"></canvas>
               </div>
               <div class="vmu-fx-history-legend">
-                <span><i class="vmu-fx-legend-dot" style="background:rgba(150,180,255,0.85)"></i>Input</span>
-                <span><i class="vmu-fx-legend-dot" style="background:rgba(230,76,76,0.6)"></i>Gain Reduction</span>
-                <span><i class="vmu-fx-legend-dot" style="background:#e6a63c"></i>True Peak</span>
+                <span><i class="vmu-fx-legend-dot" style="background:rgba(150,180,255,0.85)"></i>Вход</span>
+                <span><i class="vmu-fx-legend-dot" style="background:rgba(230,76,76,0.6)"></i>Снижение усиления</span>
+                <span><i class="vmu-fx-legend-dot" style="background:#e6a63c"></i>Истинный пик</span>
               </div>
               <div class="vmu-audiofx-meter-row">
-                <span class="vmu-audiofx-meter-label">True Peak</span>
+                <span class="vmu-audiofx-meter-label">Истинный пик</span>
                 <div class="vmu-audiofx-meter"><div class="vmu-audiofx-meter-fill vmu-audiofx-meter-fill-tp" id="vmu-fx-tp-fill"></div></div>
                 <span class="vmu-audiofx-meter-val" id="vmu-fx-tp-val">— дБTP</span>
               </div>
-              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Momentary</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-m">—</span></div>
-              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Short-term</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-s">—</span></div>
-              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Integrated</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-i">—</span></div>
-              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">LRA</span></div><span class="vmu-slider-value" id="vmu-fx-lra">—</span></div>
-              <span class="vmu-setting-hint">Требует включённого True Peak для показаний true-peak метра.</span>
+              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Мгновенная${helpIcon('Momentary LUFS — громкость за последние 400 мс, самый быстрый из LUFS-показателей, следует за сиюминутными изменениями.')}</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-m">—</span></div>
+              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Кратковременная${helpIcon('Short-term LUFS — громкость за последние 3 секунды, сглаженный показатель, обычно используется как ориентир при сведении/мастеринге.')}</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-s">—</span></div>
+              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Интегральная${helpIcon('Integrated LUFS — средняя громкость за весь трек с момента открытия панели или сброса, с гейтингом тихих участков (ITU-R BS.1770-4). Стандарт для нормализации громкости на стриминговых сервисах.')}</span></div><span class="vmu-slider-value" id="vmu-fx-lufs-i">—</span></div>
+              <div class="vmu-setting-row"><div class="vmu-setting-info"><span class="vmu-setting-label">Диапазон громкости${helpIcon('LRA (Loudness Range) в LU — разброс громкости трека: разница между тихими и громкими участками. Меньше — более ровный/сжатый по динамике трек, больше — более динамичный.')}</span></div><span class="vmu-slider-value" id="vmu-fx-lra">—</span></div>
+              <span class="vmu-setting-hint">Требует включённого «Истинный пик» на вкладке «Лимитер» для показаний true-peak метра.</span>
             </div>
           </div>
         </div>
@@ -1611,18 +1648,9 @@
         stopMeterLoop();
       });
     }
-
-    // Click-outside-to-close. Clicks on the toggle button itself are excluded
-    // here — its own click handler already opens/closes the panel, and this
-    // listener firing on top of that (it bubbles to document after) would
-    // otherwise immediately re-close a panel that button click just opened.
-    document.addEventListener('click', e => {
-      const panel = document.getElementById('vmu-audiofx-panel');
-      if (!panel || !panel.classList.contains('vmu-audiofx-panel-open')) return;
-      if (panel.contains(e.target) || e.target.closest('.vmu-audiofx-btn')) return;
-      panel.classList.remove('vmu-audiofx-panel-open');
-      stopMeterLoop();
-    });
+    // Deliberately no click-outside-to-close — the panel has sliders/inputs
+    // that are easy to overshoot a click past while dragging, so it now only
+    // closes via the × button or the toggle button in the player bar.
   }
 
   function ensureAudioFxUI() {

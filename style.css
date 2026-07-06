@@ -154,6 +154,27 @@ html.vmu-theme-light {
 }
 .vmu-setting-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .vmu-setting-label { font-size: 13px; color: var(--vmu-text-2); font-weight: 500; }
+/* "?" help badge next to a control's label — native title tooltip (see
+   helpIcon() in content.js for why: always-readable contrast, no clipping
+   risk inside the audio-FX panel's scrolling body). */
+.vmu-help-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 13px;
+  height: 13px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: rgba(var(--vmu-ov),0.14);
+  color: var(--vmu-text-muted);
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+  transition: background .12s, color .12s;
+}
+.vmu-help-icon:hover { background: rgba(38,136,235,0.4); color: #fff; }
 .vmu-setting-hint  { font-size: 11px; color: var(--vmu-text-hint-2); }
 
 /* Toggle switch */
@@ -1492,8 +1513,17 @@ html.vmu-theme-light {
 }
 .vmu-audiofx-presets-row .vmu-audiofx-select { flex: 1 1 auto; min-width: 0; }
 
+/* Chain section (order + input/output trim) — applies to the whole signal
+   path regardless of which module tab is open below, so it sits above the
+   tabs instead of being duplicated inside Компрессор/Лимитер. */
+.vmu-audiofx-chain-section {
+  border-bottom: 1px solid rgba(var(--vmu-ov),0.06);
+  padding-bottom: 12px !important;
+}
+
 /* Tab bar — same segmented-control look as .vmu-mode-switch, scaled down
-   (tighter padding) so 3 labels fit the panel's 380px width without wrap. */
+   (tighter padding/font) so 4 labels fit the panel's 380px width without
+   wrapping ("Компрессор" is the long one). */
 .vmu-audiofx-tabs {
   display: flex;
   gap: 2px;
@@ -1505,14 +1535,17 @@ html.vmu-theme-light {
 .vmu-audiofx-tabs button {
   flex: 1 1 0;
   font-family: inherit;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 500;
   color: var(--vmu-text-muted);
   background: transparent;
   border: none;
   border-radius: 6px;
-  padding: 5px 4px;
+  padding: 5px 2px;
   cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   transition: background .12s, color .12s;
 }
 .vmu-audiofx-tabs button:hover { color: var(--vmu-text-2); }
@@ -1875,10 +1908,17 @@ html.vmu-theme-light {
 .vmu-fx-preset-btn-secondary:hover { background: rgba(var(--vmu-ov),0.1); color: var(--vmu-text-2); }
 
 /* ── Audio FX: transfer-curve / history canvases ───────────────────────────── */
+/* Fixed dark "scope" surface in both themes — deliberately NOT themed via
+   --vmu-ov/--vmu-panel-bg. The canvas drawing itself (grid lines, curve,
+   live dot, meter traces — see drawTransferCurve/drawHistoryGraph in
+   content.js) is all hardcoded light-on-dark, since a <canvas> ignores CSS
+   custom properties entirely; a light theme's white/light wrapper would
+   wash all of that out to near-invisible against its own background,
+   which is exactly what made this panel "blend together". */
 .vmu-audiofx-canvas-wrap {
   margin: 4px 0 10px;
-  background: rgba(var(--vmu-ov),0.03);
-  border: 1px solid rgba(var(--vmu-ov),0.06);
+  background: #16171a;
+  border: 1px solid rgba(255,255,255,0.08);
   border-radius: 8px;
   overflow: hidden;
 }
@@ -1997,8 +2037,7 @@ html.vmu-theme-light .vmu-fx-dd-btn,
 html.vmu-theme-light .vmu-fx-preset-search,
 html.vmu-theme-light .vmu-fx-preset-input,
 html.vmu-theme-light .vmu-fx-preset-browser,
-html.vmu-theme-light .vmu-fx-preset-saveform,
-html.vmu-theme-light .vmu-audiofx-canvas-wrap {
+html.vmu-theme-light .vmu-fx-preset-saveform {
   background: #f0f1f3;
   border-color: rgba(0,0,0,0.1);
 }
