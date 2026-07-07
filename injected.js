@@ -2574,6 +2574,14 @@
       const limiter = new AudioWorkletNode(c, 'vmu-limiter');
       limiter.port.onmessage = e => {
         if (e.data && e.data.type === 'meter') {
+          // Nodes are never torn down when a track ends (see the block
+          // comment above `attachFx`/`buildGraph`) — VK pauses the old
+          // <audio> element but its worklet stays connected and keeps
+          // reporting forever. Without this guard, a stale node's near-
+          // silent reports and the current track's real ones would both land
+          // in content.js's single shared meter state and stomp on each
+          // other, making the live meters flicker/jump unpredictably.
+          if (el !== lastAudioEl) return;
           lastMeterDb = e.data.reductionDb;
           lastLimMeterDb = e.data.limReductionDb;
           lastInputPeakDb = e.data.inputPeakDb;
@@ -2613,6 +2621,15 @@
       });
     }
 
+    // Whether the worklet graph needs to be attached at all — not just the
+    // three stage toggles: Input/Output trim and the metering readouts are
+    // chain-independent features and must work even with EQ/comp/limiter all
+    // off, so a non-neutral gain or an open Метринг tab also count as "in use".
+    function fxNeeded() {
+      return limiterEnabled || compEnabled || eqEnabled || meteringActive
+        || fx.inputGain !== 0 || fx.outputGain !== 0;
+    }
+
     // VK never appends its <audio> element to the document — confirmed live:
     // playback runs off a blob: URL on a detached HTMLAudioElement
     // (el.isConnected === false), a new one per track. A MutationObserver on
@@ -2624,7 +2641,7 @@
     const origPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
       lastAudioEl = this;
-      if (limiterEnabled || compEnabled || eqEnabled) attachFx(this);
+      if (fxNeeded()) attachFx(this);
       return origPlay.apply(this, args);
     };
 
@@ -2635,7 +2652,9 @@
         return;
       }
       if (e.data.type === 'VMU_AUDIOFX_METERING_ACTIVE') {
+        const wasNeeded = fxNeeded();
         meteringActive = !!e.data.active;
+        if (fxNeeded() && !wasNeeded && lastAudioEl) attachFx(lastAudioEl);
         applyToAll();
         return;
       }
@@ -2647,7 +2666,7 @@
         return;
       }
       if (e.data.type !== 'VMU_AUDIOFX_SET') return;
-      const wasActive = limiterEnabled || compEnabled || eqEnabled;
+      const wasActive = fxNeeded();
       limiterEnabled = !!e.data.limiterEnabled;
       compEnabled = !!e.data.compEnabled;
       eqEnabled = !!e.data.eqEnabled;
@@ -2673,10 +2692,10 @@
       if (Array.isArray(e.data.bands)) fx.bands = e.data.bands.map(v => Number(v) || 0);
 
       // Attach to whatever's already playing right away, instead of waiting
-      // for the next play()/track change, so toggling either switch takes
-      // effect immediately on the current track.
-      const nowActive = limiterEnabled || compEnabled || eqEnabled;
-      if (nowActive && !wasActive && lastAudioEl) attachFx(lastAudioEl);
+      // for the next play()/track change, so toggling any switch (or dialing
+      // in a non-zero Input/Output trim) takes effect immediately on the
+      // current track.
+      if (fxNeeded() && !wasActive && lastAudioEl) attachFx(lastAudioEl);
       applyToAll();
     });
 

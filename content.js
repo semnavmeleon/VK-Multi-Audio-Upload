@@ -444,6 +444,99 @@
     return Math.min(inputDb - reductionDb, settings.audioFxCeiling);
   }
 
+  // Mirrors limiter-worklet.js's designBiquadPeaking (RBJ cookbook peaking EQ,
+  // same Q) so this canvas can plot the combined curve without any DSP state.
+  // fs is a nominal 48kHz — close enough for a visualization; band centers
+  // topping out at 16kHz are far enough below Nyquist at 44.1k too that the
+  // curve shape doesn't meaningfully shift.
+  const EQ_CURVE_Q = 1.41;
+  const EQ_CURVE_FS = 48000;
+  function designBiquadPeakingForCurve(f0, gainDb, Q, fs) {
+    const A = Math.pow(10, gainDb / 40);
+    const w0 = 2 * Math.PI * f0 / fs;
+    const cosw0 = Math.cos(w0), sinw0 = Math.sin(w0);
+    const alpha = sinw0 / (2 * Q);
+    const b0 = 1 + alpha * A;
+    const b1 = -2 * cosw0;
+    const b2 = 1 - alpha * A;
+    const a0 = 1 + alpha / A;
+    const a1 = -2 * cosw0;
+    const a2 = 1 - alpha / A;
+    return { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 };
+  }
+  // Evaluates a biquad's magnitude response (in dB) at frequency f by sampling
+  // its digital transfer function on the unit circle (z = e^jw). Cascaded
+  // biquads' magnitudes multiply, so summing each band's dB here gives the
+  // exact composite response — no need to model the actual filter chain.
+  function biquadMagnitudeDb(co, f, fs) {
+    const w = 2 * Math.PI * f / fs;
+    const cosw = Math.cos(w), sinw = Math.sin(w);
+    const cos2w = Math.cos(2 * w), sin2w = Math.sin(2 * w);
+    const numRe = co.b0 + co.b1 * cosw + co.b2 * cos2w;
+    const numIm = -co.b1 * sinw - co.b2 * sin2w;
+    const denRe = 1 + co.a1 * cosw + co.a2 * cos2w;
+    const denIm = -co.a1 * sinw - co.a2 * sin2w;
+    const numMag = Math.sqrt(numRe * numRe + numIm * numIm);
+    const denMag = Math.sqrt(denRe * denRe + denIm * denIm);
+    return 20 * Math.log10(numMag / denMag);
+  }
+  function eqCurveOutputDb(freq) {
+    let totalDb = 0;
+    settings.audioFxBands.forEach((g, i) => {
+      if (Math.abs(g) < 0.01) return;
+      totalDb += biquadMagnitudeDb(designBiquadPeakingForCurve(AUDIOFX_FREQS[i], g, EQ_CURVE_Q, EQ_CURVE_FS), freq, EQ_CURVE_FS);
+    });
+    return totalDb;
+  }
+
+  function drawEqCurve() {
+    if (settings.audioFxActiveTab !== 'eq') return;
+    const canvas = document.getElementById('vmu-fx-eq-curve');
+    if (!canvas) return;
+    const sized = sizeCanvasForDisplay(canvas);
+    if (!sized) return;
+    const { ctx, w: W, h: H } = sized;
+    ctx.clearRect(0, 0, W, H);
+
+    const freqMin = 20, freqMax = 20000;
+    const logMin = Math.log10(freqMin), logMax = Math.log10(freqMax);
+    const xOf = f => (Math.log10(f) - logMin) / (logMax - logMin) * W;
+    const dbMin = -15, dbMax = 15;
+    const yOf = db => H - (Math.max(dbMin, Math.min(dbMax, db)) - dbMin) / (dbMax - dbMin) * H;
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 1;
+    [100, 1000, 10000].forEach(f => {
+      ctx.beginPath(); ctx.moveTo(xOf(f) + 0.5, 0); ctx.lineTo(xOf(f) + 0.5, H); ctx.stroke();
+    });
+    for (let db = dbMin; db <= dbMax; db += 6) {
+      ctx.beginPath(); ctx.moveTo(0, yOf(db) + 0.5); ctx.lineTo(W, yOf(db) + 0.5); ctx.stroke();
+    }
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+    ctx.beginPath(); ctx.moveTo(0, yOf(0) + 0.5); ctx.lineTo(W, yOf(0) + 0.5); ctx.stroke();
+
+    ctx.strokeStyle = '#2688eb';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    const STEPS = 200;
+    for (let i = 0; i <= STEPS; i++) {
+      const f = Math.pow(10, logMin + (logMax - logMin) * i / STEPS);
+      const x = xOf(f), y = yOf(eqCurveOutputDb(f));
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Each band's own center-frequency/gain point — lines up with its slider
+    // below so the curve and the controls read as the same instrument.
+    ctx.fillStyle = '#ffffff';
+    settings.audioFxBands.forEach((g, i) => {
+      ctx.beginPath();
+      ctx.arc(xOf(AUDIOFX_FREQS[i]), yOf(g), 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
   // Resizes the canvas' backing buffer to match its CSS size at the current
   // devicePixelRatio (only when it actually changed) and returns a context
   // pre-scaled so all drawing below can keep using CSS-pixel coordinates.
@@ -635,6 +728,7 @@
     while (meterHistory.length && meterHistory[0].t < cutoff) meterHistory.shift();
 
     drawTransferCurve();
+    drawEqCurve();
     drawHistoryGraph();
   }
 
@@ -1061,6 +1155,9 @@
                   <input type="checkbox" id="vmu-fx-eq-enable" ${settings.audioFxEqEnabled ? 'checked' : ''}>
                   <span class="vmu-toggle-track"></span>
                 </label>
+              </div>
+              <div class="vmu-audiofx-canvas-wrap">
+                <canvas id="vmu-fx-eq-curve" class="vmu-audiofx-canvas"></canvas>
               </div>
               <div class="vmu-audiofx-section-title">
                 <span>Полосы${helpIcon('10 полос по стандартной ISO-сетке частот (31 Гц – 16 кГц), каждая ±12 дБ. Колесо мыши на полосе — шаг 0.5 дБ (Shift — 0.1 дБ), двойной клик — сброс полосы.')}</span>

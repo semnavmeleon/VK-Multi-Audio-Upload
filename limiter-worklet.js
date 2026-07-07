@@ -444,13 +444,13 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     const meteringActive = parameters.meteringActive[0] >= 0.5;
     const processingMode = channelCount === 2 ? Math.max(0, Math.min(2, Math.round(parameters.processingMode[0]))) : 0;
 
-    // Input/Output trim live on the dynamics panel and have always bypassed
-    // together with it — now "it" is either dynamics stage.
-    const gainsActive = compEnabled || limEnabled;
-    const inputGainLin = gainsActive ? Math.pow(10, inputGainDb / 20) : 1;
-    const outputGainLin = gainsActive ? Math.pow(10, outputGainDb / 20) : 1;
-    // Gated on the limiter stage itself, not `gainsActive` — a bypassed
-    // limiter must stay fully transparent regardless of this knob.
+    // Input/Output trim are chain-wide controls, independent of every stage's
+    // own enable switch — they must keep working even with EQ/comp/limiter
+    // all bypassed.
+    const inputGainLin = Math.pow(10, inputGainDb / 20);
+    const outputGainLin = Math.pow(10, outputGainDb / 20);
+    // Gated on the limiter stage itself — a bypassed limiter must stay fully
+    // transparent regardless of this knob.
     const limGainLin = limEnabled ? Math.pow(10, limGainDb / 20) : 1;
     const ceilingLin = Math.pow(10, ceilingDb / 20);
     // Only meaningfully different from ceilingLin in Unlinked mode.
@@ -461,9 +461,8 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     // when the limiter is the last stage — with EQ/comp deliberately ordered
     // after it, overshoot lands on the safety clamp, which is the user's
     // explicit trade to make.
-    const appliedOutputGainDb = gainsActive ? outputGainDb : 0;
-    const limTargetDb = ceilingDb - appliedOutputGainDb;
-    const limTargetRDb = ceilingRDb - appliedOutputGainDb;
+    const limTargetDb = ceilingDb - outputGainDb;
+    const limTargetRDb = ceilingRDb - outputGainDb;
     const halfKnee = knee / 2;
 
     // Compressor one-pole smoothing coefficients from attack/release time
