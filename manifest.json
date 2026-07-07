@@ -3,7 +3,13 @@
   "name": "VK Multi Audio Upload",
   "version": "2.1",
   "description": "Мультизагрузка музыки во ВКонтакте + авто-плейлист + поиск дубликатов + скачивание плейлистов",
-  "permissions": ["downloads"],
+  "permissions": ["downloads", "storage"],
+  "host_permissions": [
+    "https://soundcloud.com/*",
+    "https://*.soundcloud.com/*",
+    "https://snd.sc/*",
+    "https://*.sndcdn.com/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },

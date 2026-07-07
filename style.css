@@ -230,6 +230,36 @@ html.vmu-theme-light {
 }
 #vmu-cover-clear:hover { color: var(--vmu-text); background: rgba(var(--vmu-ov),0.13); }
 
+/* ── SoundCloud download panel ────────────────────────────────────────────── */
+#vmu-sc-panel { flex-shrink: 0; padding: 10px 16px; }
+.vmu-sc-row { display: flex; align-items: center; gap: 8px; }
+.vmu-sc-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: rgba(var(--vmu-ov),0.06);
+  border: 1px solid rgba(var(--vmu-ov),0.13);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--vmu-text);
+  font-family: inherit;
+}
+.vmu-sc-input:focus { outline: none; border-color: #ff7700; }
+.vmu-sc-input::placeholder { color: var(--vmu-text-dim); }
+.vmu-sc-download-btn { flex-shrink: 0; background: #ff5500; }
+.vmu-sc-download-btn:hover { background: #e64d00; }
+.vmu-sc-download-btn:active { background: #cc4400; }
+.vmu-sc-download-btn:disabled { opacity: 0.6; cursor: default; }
+.vmu-sc-status {
+  margin-top: 8px;
+  font-size: 11.5px;
+  line-height: 1.3;
+  color: var(--vmu-text-dim);
+  min-height: 14px;
+}
+.vmu-sc-status-error { color: #e64646; }
+.vmu-sc-status-done { color: #4bb34b; }
+
 /* ── Drop zone ────────────────────────────────────────────────────────────── */
 #vmu-dropzone {
   margin: 10px 0;

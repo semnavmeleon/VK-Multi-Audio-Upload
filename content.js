@@ -25,6 +25,10 @@
     <path d="M8 4.754a3.246 3.246 0 1 0 0 6.492 3.246 3.246 0 0 0 0-6.492zM5.754 8a2.246 2.246 0 1 1 4.492 0 2.246 2.246 0 0 1-4.492 0z"/>
     <path d="M9.796 1.343c-.527-1.79-3.065-1.79-3.592 0l-.094.319a.873.873 0 0 1-1.255.52l-.292-.16c-1.64-.892-3.433.902-2.54 2.541l.159.292a.873.873 0 0 1-.52 1.255l-.319.094c-1.79.527-1.79 3.065 0 3.592l.319.094a.873.873 0 0 1 .52 1.255l-.16.292c-.892 1.64.901 3.434 2.541 2.54l.292-.159a.873.873 0 0 1 1.255.52l.094.319c.527 1.79 3.065 1.79 3.592 0l.094-.319a.873.873 0 0 1 1.255-.52l.292.16c1.64.892 3.433-.902 2.54-2.541l-.159-.292a.873.873 0 0 1 .52-1.255l.319-.094c1.79-.527 1.79-3.065 0-3.592l-.319-.094a.873.873 0 0 1-.52-1.255l.16-.292c.892-1.64-.901-3.433-2.541-2.54l-.292.159a.873.873 0 0 1-1.255-.52l-.094-.319zm-2.633.283c.246-.835 1.428-.835 1.674 0l.094.319a1.873 1.873 0 0 0 2.693 1.115l.291-.16c.764-.415 1.6.42 1.184 1.185l-.159.292a1.873 1.873 0 0 0 1.116 2.692l.318.094c.835.246.835 1.428 0 1.674l-.319.094a1.873 1.873 0 0 0-1.115 2.693l.16.291c.415.764-.42 1.6-1.185 1.184l-.291-.159a1.873 1.873 0 0 0-2.693 1.116l-.094.318c-.246.835-1.428.835-1.674 0l-.094-.319a1.873 1.873 0 0 0-2.692-1.115l-.292.16c-.764.415-1.6-.42-1.184-1.185l.159-.291A1.873 1.873 0 0 0 1.945 8.93l-.319-.094c-.835-.246-.835-1.428 0-1.674l.319-.094A1.873 1.873 0 0 0 3.06 4.47l-.16-.292c-.415-.764.42-1.6 1.185-1.184l.292.159a1.873 1.873 0 0 0 2.692-1.115l.094-.319z"/>
   </svg>`;
+  const ICON_SOUNDCLOUD = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M1.5 8v3.2M3.3 6.5v4.7M5.1 7.2v4M6.9 5v6.2" />
+    <path d="M9 6.6c.2-.15.5-.25.85-.25 1.2 0 2.15 1.05 2.15 2.35 0 .1 0 .2-.02.3h.32a1.8 1.8 0 0 1 0 3.6H9V6.6z" fill="currentColor" stroke="none"/>
+  </svg>`;
   const ICON_AUDIOFX = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none">
     <path d="M3 2v6M3 11v3M8 2v2M8 7v7M13 2v9M13 14v0" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
     <circle cx="3" cy="9" r="1.6" fill="currentColor"/>
@@ -2935,6 +2939,7 @@
   function toggleSettings() {
     syncVmuTheme(); // cheap self-heal in case the observer's target got replaced
     settingsPanelOpen = !settingsPanelOpen;
+    if (settingsPanelOpen) closeSoundCloudPanel();
     const panel = document.getElementById('vmu-settings-panel');
     const btn = document.getElementById('vmu-settings-btn');
     if (panel) panel.style.display = settingsPanelOpen ? 'block' : 'none';
@@ -3287,6 +3292,110 @@
     newPanel.innerHTML = buildSettingsPanel();
     panel.replaceWith(newPanel.firstElementChild);
     attachSettingsHandlers();
+  }
+
+  // ─── SoundCloud download panel ─────────────────────────────────────────────
+  let soundCloudPanelOpen = false;
+
+  function closeSoundCloudPanel() {
+    soundCloudPanelOpen = false;
+    const panel = document.getElementById('vmu-sc-panel');
+    if (panel) panel.style.display = 'none';
+    const btn = document.getElementById('vmu-sc-btn');
+    if (btn) btn.style.color = '';
+  }
+
+  function toggleSoundCloud() {
+    syncVmuTheme();
+    soundCloudPanelOpen = !soundCloudPanelOpen;
+    if (soundCloudPanelOpen) {
+      settingsPanelOpen = false;
+      const sp = document.getElementById('vmu-settings-panel');
+      if (sp) sp.style.display = 'none';
+      const sb = document.getElementById('vmu-settings-btn');
+      if (sb) sb.style.color = '';
+    }
+    const panel = document.getElementById('vmu-sc-panel');
+    const btn = document.getElementById('vmu-sc-btn');
+    if (panel) panel.style.display = soundCloudPanelOpen ? 'block' : 'none';
+    if (btn) btn.style.color = soundCloudPanelOpen ? '#ff7700' : '';
+    if (soundCloudPanelOpen) document.getElementById('vmu-sc-input')?.focus();
+  }
+
+  function buildSoundCloudPanel() {
+    return `
+      <div id="vmu-sc-panel" style="display:none">
+        <div class="vmu-sc-row">
+          <input type="text" id="vmu-sc-input" class="vmu-sc-input" placeholder="Ссылка на трек или сет SoundCloud…" spellcheck="false" autocomplete="off">
+          <button type="button" id="vmu-sc-download-btn" class="vmu-pick-btn vmu-sc-download-btn">Скачать</button>
+        </div>
+        <div id="vmu-sc-status" class="vmu-sc-status"></div>
+      </div>`;
+  }
+
+  function scMsg(type, payload) {
+    return new Promise(resolve => {
+      try { chrome.runtime.sendMessage({ type, ...payload }, res => resolve(res)); }
+      catch { resolve({ ok: false, error: 'extension context error' }); }
+    });
+  }
+
+  function setScStatus(text, kind) {
+    const el = document.getElementById('vmu-sc-status');
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'vmu-sc-status' + (kind ? ` vmu-sc-status-${kind}` : '');
+  }
+
+  async function handleSoundCloudDownload() {
+    const input = document.getElementById('vmu-sc-input');
+    const btn = document.getElementById('vmu-sc-download-btn');
+    const url = (input?.value || '').trim();
+    if (!/^https?:\/\/([a-z0-9-]+\.)?(soundcloud\.com|snd\.sc)\//i.test(url)) {
+      setScStatus('Вставьте ссылку на трек или сет soundcloud.com', 'error');
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = 'Скачиваем…'; }
+    setScStatus('Получаем информацию о треке…');
+
+    const res = await scMsg('VKD_SC_RESOLVE', { url });
+    if (!res?.ok) {
+      setScStatus('Ошибка: ' + (res?.error || 'не удалось получить трек'), 'error');
+      if (btn) { btn.disabled = false; btn.textContent = 'Скачать'; }
+      return;
+    }
+
+    const tracks = res.tracks;
+    let ok = 0, fail = 0;
+    for (const t of tracks) {
+      setScStatus(`Скачиваем ${ok + fail + 1}/${tracks.length}: ${t.artist} — ${t.title}`);
+      const dl = await scMsg('VKD_DOWNLOAD', { url: t.url, filename: t.filename, folder: 'SoundCloud' });
+      if (dl?.ok) ok++; else fail++;
+    }
+
+    const skipped = res.failedCount || 0;
+    const parts = [`скачано: ${ok}`];
+    if (fail) parts.push(`ошибок сохранения: ${fail}`);
+    if (skipped) parts.push(`пропущено (нет прямого потока): ${skipped}`);
+    setScStatus(`Готово — ${parts.join(', ')}`, fail || skipped ? 'error' : 'done');
+
+    if (btn) { btn.disabled = false; btn.textContent = 'Скачать'; }
+    if (ok && !fail) input.value = '';
+  }
+
+  function attachSoundCloudHandlers() {
+    const btn = document.getElementById('vmu-sc-download-btn');
+    if (btn && !btn.dataset.vmuBound) {
+      btn.dataset.vmuBound = '1';
+      btn.addEventListener('click', handleSoundCloudDownload);
+    }
+    const input = document.getElementById('vmu-sc-input');
+    if (input && !input.dataset.vmuBound) {
+      input.dataset.vmuBound = '1';
+      input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') handleSoundCloudDownload();
+      });
+    }
   }
 
   // ─── retry / copy helpers ──────────────────────────────────────────────────
@@ -4116,6 +4225,7 @@
     const ownHeader = withOwnHeader ? `
       <div id="vmu-header">
         <span id="vmu-header-title">${isCheck ? 'Проверка аудиозаписей' : 'Загрузка аудиозаписей'}</span>
+        <button type="button" id="vmu-sc-btn" class="vmu-settings-btn-header" title="Скачать с SoundCloud">${ICON_SOUNDCLOUD}</button>
         <button type="button" id="vmu-settings-btn" class="vmu-settings-btn-header" title="Настройки">${ICON_SETTINGS}</button>
         <button type="button" id="vmu-close-btn" class="vmu-settings-btn-header" title="Закрыть">${ICON_CLOSE}</button>
       </div>` : '';
@@ -4123,6 +4233,7 @@
       ${ownHeader}
 
       ${buildSettingsPanel()}
+      ${buildSoundCloudPanel()}
 
       <div id="vmu-dropzone">
         <div class="vmu-dz-label">${dzLabel}</div>
@@ -4242,6 +4353,7 @@
       else box.appendChild(ui);
       if (vkInput) box.appendChild(vkInput);
       injectGearIntoNativeHeader(header);
+      injectSoundCloudIntoNativeHeader(header);
       injectClearIntoNativeFooter(footer);
     } else {
       // No recognizable native chrome (old VK .audio_add_box) — replace the
@@ -4273,6 +4385,26 @@
     else header.appendChild(btn);
   }
 
+  // SoundCloud download button placed right before the settings gear (same
+  // anchoring trick as injectGearIntoNativeHeader — survives VK re-rendering
+  // its native header).
+  function injectSoundCloudIntoNativeHeader(header) {
+    if (!header || document.getElementById('vmu-sc-btn')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vmu-sc-btn';
+    btn.className = 'vmu-settings-btn-header';
+    btn.title = 'Скачать с SoundCloud';
+    btn.innerHTML = ICON_SOUNDCLOUD;
+    btn.addEventListener('click', toggleSoundCloud);
+    if (soundCloudPanelOpen) btn.style.color = '#ff7700';
+    const gearBtn = document.getElementById('vmu-settings-btn');
+    const closeWrap = header.querySelector('[data-testid="modal-close-button"]');
+    if (gearBtn) gearBtn.parentElement.insertBefore(btn, gearBtn);
+    else if (closeWrap && closeWrap.parentElement) closeWrap.parentElement.insertBefore(btn, closeWrap);
+    else header.appendChild(btn);
+  }
+
   // Relocates the (already-built, listener-attached) #vmu-clear button from
   // our own footer to sit right after VK's native "Выбрать из своих
   // аудиозаписей" button, instead of duplicating it — same DOM node, same
@@ -4293,6 +4425,7 @@
     // Scoped to our own header — the native-header gear gets its listener in
     // injectGearIntoNativeHeader (binding by id here would double-toggle it)
     document.querySelector('#vmu-embedded #vmu-settings-btn')?.addEventListener('click', toggleSettings);
+    document.querySelector('#vmu-embedded #vmu-sc-btn')?.addEventListener('click', toggleSoundCloud);
     document.getElementById('vmu-close-btn')?.addEventListener('click', closeUploadModal);
     document.getElementById('vmu-clear')?.addEventListener('click', () => {
       fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
@@ -4305,6 +4438,13 @@
       const btn = document.getElementById('vmu-settings-btn');
       if (btn) btn.style.color = '#2688eb';
     }
+    if (soundCloudPanelOpen) {
+      const panel = document.getElementById('vmu-sc-panel');
+      if (panel) panel.style.display = 'block';
+      const btn = document.getElementById('vmu-sc-btn');
+      if (btn) btn.style.color = '#ff7700';
+    }
+    attachSoundCloudHandlers();
 
     document.getElementById('vmu-input')?.addEventListener('change', e => {
       addFiles([...e.target.files].filter(isMP3));
@@ -5328,6 +5468,9 @@
     // Restore the gear if VK re-rendered its native header
     if (box && box.dataset.vmuInjected && !document.getElementById('vmu-settings-btn')) {
       injectGearIntoNativeHeader(box.querySelector('[data-testid="modalheader"], [class*="vkitModalHeader"]'));
+    }
+    if (box && box.dataset.vmuInjected && !document.getElementById('vmu-sc-btn')) {
+      injectSoundCloudIntoNativeHeader(box.querySelector('[data-testid="modalheader"], [class*="vkitModalHeader"]'));
     }
     // Restore Clear's spot next to "Выбрать из своих аудиозаписей" if VK
     // re-rendered its native footer (cheap no-op once already in place)
