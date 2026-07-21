@@ -1086,10 +1086,14 @@ html.vmu-theme-light {
 }
 .vmu-single-dl-loading:hover { color: #ff5757 !important; }
 /* New VK playlist modal — row has no buttonGroup; my button shares the
-   right "after" slot with the duration label. Make the slot inline-flex so
-   they sit on one line, with the button hover-revealed like native VK rows. */
-.vkitAudioRow__after--s6OAG.vmu-after-host,
-[class*="vkitAudioRow__after"].vmu-after-host {
+   right "after" slot (data-testid="audiorow-actions", was class
+   vkitAudioRow__after before VK hashed it away) with the duration label.
+   .vmu-after-host is added by injectSingleDlBtn directly onto whatever
+   element it resolves as that slot, so styling just the class — without
+   also requiring VK's now-defunct class on the same element — is enough.
+   Make the slot inline-flex so they sit on one line, with the button
+   hover-revealed like native VK rows. */
+.vmu-after-host {
   display: inline-flex;
   align-items: center;
   gap: 4px;

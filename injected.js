@@ -797,8 +797,12 @@
       window.__vmuGetUploadServerBody = parseBodyStr(args[1]?.body);
     }
 
-    // Capture audio data for playlist download
-    if (url.includes('al_audio') || url.includes('api.vk.com')) {
+    // Capture audio data for playlist download. Modern API calls (batch.call
+    // etc.) now come back from web.api.vk.ru instead of api.vk.com, so match
+    // on the domain-agnostic /method/ path like processForAudioData's own
+    // guard below already does — a literal api.vk.com check alone silently
+    // drops every response since VK moved the API host.
+    if (url.includes('al_audio') || url.includes('/method/') || url.includes('api.vk.com')) {
       result.clone().text().then(t => { try { processForAudioData(url, t); } catch {} }).catch(() => {});
     }
 

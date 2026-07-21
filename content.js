@@ -4109,7 +4109,16 @@
     return document.querySelector('.audio_add_box') || null;
   }
   function getUploadDialogBody(box) {
-    return box?.querySelector('[class*="vkitModalBody__container"]') || box;
+    if (!box) return null;
+    // vkitModalBody__container is gone (VK hashes it away with no semantic
+    // trace now) and there's no data-testid replacement for the generic
+    // middle section, so pick it positionally: the one child that isn't the
+    // header or footer — mirrors the children-filter injectIntoVkDialog
+    // already uses successfully for the main New-VK path.
+    const header = box.querySelector('[data-testid="modalheader"]');
+    const footer = box.querySelector('[data-testid="modalfooter"]');
+    const mid = [...box.children].find(c => c !== header && c !== footer);
+    return mid || box;
   }
   // The "create playlist" dialog contains its own audio upload input, so the
   // vkitInternalModalBox matcher above would grab it and injectIntoVkDialog
@@ -4709,18 +4718,32 @@
     }
     if (!anchorGroup) return;
 
-    // The flex wrapper that hosts all body-button rows. Append our row there
-    // so it sits below VK's own buttons regardless of how many rows VK rendered.
+    // The flex wrapper that hosts all body-button rows — its presence just
+    // confirms we're looking at the right dialog (playlist view, not e.g.
+    // the plain edit form).
     const flexParent = anchorGroup.closest('[class*="vkuiFlex__host"]')
       || anchorGroup.parentElement?.parentElement;
     if (!flexParent) return;
 
     const newRow = document.createElement('div');
-    newRow.style.cssText = 'display:flex;gap:8px;flex-basis:100%;';
+    newRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;padding:8px 16px 0;';
     newRow.appendChild(makeDupesBtn(plInfo));
     newRow.appendChild(makeDlDialogBtn(plInfo, 'individual'));
     newRow.appendChild(makeDlDialogBtn(plInfo, 'zip'));
-    flexParent.appendChild(newRow);
+
+    // Appending inside flexParent used to be enough to have the row sit below
+    // VK's own buttons, but VK's header (MusicPlaylistModal_Header, was
+    // vkitAudioListBoxHeader__root) now has a fixed height + overflow:hidden
+    // — sized for exactly VK's own rows, so a 3rd row appended inside it gets
+    // silently clipped and never shows up. Insert it as a sibling right after
+    // the header instead (same header/body split dlpInit's progress strip
+    // already relies on), landing it in the unclipped body area below.
+    const headerEl = modal.querySelector('[data-testid="MusicPlaylistModal_Header"]');
+    if (headerEl && headerEl.parentNode) {
+      headerEl.insertAdjacentElement('afterend', newRow);
+    } else {
+      flexParent.appendChild(newRow);
+    }
   }
 
   // ─── playlist download feature ────────────────────────────────────────────────
@@ -4758,9 +4781,13 @@
       <div class="vmu-dlp-error" style="display:none"></div>`;
     const modal = getActiveModal();
     if (modal) {
-      // Insert between header and body
-      const header = modal.querySelector('[class*="vkitAudioListBoxHeader__root"]');
-      const body = modal.querySelector('[class*="vkitModalBody__container"]');
+      // Insert between header and body. VK renamed both again: the header's
+      // class lost the vkitAudioListBoxHeader__root semantic name (now a bare
+      // hash), but it kept a context testid (MusicPlaylistModal_Header) with
+      // MusicPlaylistModal_Body as its sibling — same relationship the old
+      // class pair described, just moved from class to data-testid.
+      const header = modal.querySelector('[data-testid="MusicPlaylistModal_Header"], [class*="vkitAudioListBoxHeader__root"]');
+      const body = modal.querySelector('[data-testid="MusicPlaylistModal_Body"], [class*="vkitModalBody__container"]');
       if (header && body && header.parentNode === body.parentNode) {
         body.parentNode.insertBefore(strip, body);
       } else {
@@ -5202,7 +5229,10 @@
   function getPlaylistTitle() {
     const modal = getActiveModal();
     if (!modal) return null;
-    const title = modal.querySelector('[class*="vkitAudioListBoxHeader__info"] a, [class*="vkitAudioListBoxHeader__info"] [class*="TextClamp"]');
+    // vkitAudioListBoxHeader__info's class is hashed away now; VK gives the
+    // title itself a stable testid instead, so read it directly rather than
+    // hunting for an <a> or a TextClamp-classed span inside the info block.
+    const title = modal.querySelector('[data-testid="MusicPlaylistModal_Title"], [class*="vkitAudioListBoxHeader__info"] a, [class*="vkitAudioListBoxHeader__info"] [class*="TextClamp"]');
     return title?.textContent?.trim() || null;
   }
 
@@ -5431,9 +5461,11 @@
 
     if (row.querySelector('.vmu-single-dl')) return;
 
-    // Fallback: vkitAudioRow__after slot. Used when buttonGroup is not in DOM
-    // yet (rare). A subsequent sweep with buttonGroup present will migrate it.
-    const after = row.querySelector('[class*="vkitAudioRow__after"]');
+    // Fallback: the row's trailing slot (data-testid="audiorow-actions"; was
+    // class vkitAudioRow__after before VK hashed it away). Used when
+    // buttonGroup is not in DOM yet (rare). A subsequent sweep with
+    // buttonGroup present will migrate it.
+    const after = row.querySelector('[data-testid="audiorow-actions"], [class*="vkitAudioRow__after"]');
     if (after) {
       after.classList.add('vmu-after-host');
       after.prepend(makeSingleDlBtn(row, 'vmu-single-dl-after'));

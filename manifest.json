@@ -18,12 +18,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://vk.com/*"],
+      "matches": ["https://vk.com/*", "https://vk.ru/*"],
       "js": ["injector_early.js"],
       "run_at": "document_start"
     },
     {
-      "matches": ["https://vk.com/*"],
+      "matches": ["https://vk.com/*", "https://vk.ru/*"],
       "js": ["content.js"],
       "css": ["style.css"],
       "run_at": "document_idle"
@@ -37,7 +37,7 @@
   "web_accessible_resources": [
     {
       "resources": ["injected.js", "limiter-worklet.js"],
-      "matches": ["https://vk.com/*"]
+      "matches": ["https://vk.com/*", "https://vk.ru/*"]
     }
   ]
 }
