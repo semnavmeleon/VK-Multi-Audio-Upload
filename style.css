@@ -49,6 +49,14 @@ html.vmu-theme-light {
   --vmu-check-present-text: #2f7a2f;
 }
 
+/* ── Native VK chrome removal ──────────────────────────────────────────────── */
+/* "Яндекс Браузер" left-menu entry — a paid banner slot, not a real nav item
+   (its <a href> literally points at yandex.ru/project/browser/vk/gen/top-banner).
+   Stable id, unlike the rest of the left menu's hashed classes. */
+#l_invite_promo {
+  display: none !important;
+}
+
 /* ── Embedded container (inside VK's native dialog) ──────────────────────── */
 #vmu-embedded {
   display: flex;
