@@ -5,6 +5,17 @@
 
   const pause = ms => new Promise(r => setTimeout(r, ms));
 
+  // Frozen fallback switch for the VK_INJECT_FILES handler below: VK's own
+  // Upload.onFileApiSend used to only work for the very first file of a
+  // session (it kept a stale one-shot JWT for file #2+, so we minted our own
+  // via audio.getUploadServer and POSTed directly — the "direct v2 pipeline",
+  // doDirectUpload()). Verified live in 2026 that VK's native flow now
+  // handles every file in the queue correctly on its own, so native is tried
+  // first for every file. Set this true to force the old direct-pipeline
+  // path back on if VK regresses multi-file support again — the code stays
+  // in place, just unreachable by default.
+  const USE_DIRECT_UPLOAD_PIPELINE = false;
+
   // Page-context console.log is invisible to extension's MCP/devtools bridge;
   // mirror crucial diagnostics into a window-accessible ring buffer.
   window.__vmuTrace = window.__vmuTrace || [];
@@ -508,31 +519,34 @@
   let __editPlaylistCapture = null;
 
   // ── Pending upload → done_add bridge ────────────────────────────────────────
-  // VK's upload chain is: pu.vk.com/...upload (file transfer) → al_audio.php?act=done_add
+  // VK's upload chain is: <upload-host>/...upload (file transfer) → al_audio.php?act=done_add
   // (commit). Only done_add tells us whether the track was actually attached to
   // the user's audio (it returns payload[0]=0 on success, error code otherwise —
   // e.g. "9|Вы не можете загружать так много аудиозаписей" on rate limit).
   // We defer VK_UPLOAD_DONE until done_add resolves; if done_add doesn't come
   // within a few seconds (older VK flows without it), we fall back to the raw
   // upload response so the queue doesn't hang.
-  let __vmuPendingUpload = null;
-  let __vmuPendingTimer = null;
+  // FIFO, not keyed by filename: legacy done_add responses don't carry the
+  // filename anywhere we can read, only a hash/server pointer. Fine in
+  // practice — this is the fallback path for markup without the v2 redirect
+  // response below, and VK processes a batch's commits one at a time even
+  // when uploads are inflight together.
+  const __vmuPendingUploads = [];
   function emitDoneFromDoneAdd(text) {
-    if (!__vmuPendingUpload) return false;
-    clearTimeout(__vmuPendingTimer);
-    __vmuPendingTimer = null;
-    __vmuPendingUpload = null;
+    if (!__vmuPendingUploads.length) return false;
+    const pending = __vmuPendingUploads.shift();
+    clearTimeout(pending.timer);
     let code, errArr;
     try {
       const d = JSON.parse(text);
       code = d?.payload?.[0];
       errArr = d?.payload?.[1];
     } catch {
-      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: 'Ошибка ответа done_add' }, '*');
+      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: 'Ошибка ответа done_add', fileName: pending.fileName }, '*');
       return true;
     }
     if (code === 0 || code === '0') {
-      window.postMessage({ type: 'VK_UPLOAD_DONE', response: text }, '*');
+      window.postMessage({ type: 'VK_UPLOAD_DONE', response: text, fileName: pending.fileName }, '*');
     } else {
       let msg = 'Ошибка загрузки';
       if (Array.isArray(errArr) && errArr[0]) {
@@ -542,11 +556,11 @@
         msg = raw.replace(/<br\s*\/?>/gi, ' ').replace(/\\"/g, '"').trim() || msg;
       }
       console.log('[VMU UPLOAD] done_add error code=', code, 'msg=', msg);
-      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: code }, '*');
+      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: code, fileName: pending.fileName }, '*');
     }
     return true;
   }
-  function deferUploadDone(uploadResponseText) {
+  function deferUploadDone(uploadResponseText, fileName) {
     // New VK v2 API path: upload server replies with {"redirect":"vk.com/audio.php?act=done_add&audio={...}"}
     // The frontend never re-fetches that URL via XHR/fetch — VK uses navigation
     // (form/sendBeacon) for it, so the al_audio.php hook below never fires.
@@ -559,22 +573,21 @@
       if (r && (r.error_code != null || r.error != null) && !r.redirect) {
         const msg = r.error_msg || r.error || ('VK error ' + r.error_code);
         trace('[VMU UPLOAD] upload-server error: ' + msg);
-        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: r.error_code }, '*');
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: r.error_code, fileName }, '*');
         return;
       }
       if (r && typeof r.redirect === 'string' && r.redirect.includes('done_add')) {
         // v2 upload server returned a "redirect" URL that points to done_add
         // with an audio={...sha,hash,server,...} payload. Whether we need to
         // follow it depends on which path drove this upload:
-        //   • Upload.onFileApiSend (file #1): VK's React UI eats this response
-        //     itself, navigates to the redirect (via form/sendBeacon), and the
-        //     library gets the new track. Following it ourselves would double-
-        //     commit.
-        //   • doDirectUpload (file #2+): VK's UI is gone by the time the upload
-        //     response comes back, so nobody follows the redirect. Without our
-        //     fetch the track sits on pu.vk.com forever and never attaches to
-        //     the user's audio library — exactly the "second file didn't
-        //     upload" symptom.
+        //   • Upload.onFileApiSend (native, every file now): VK's React UI
+        //     eats this response itself, navigates to the redirect (via
+        //     form/sendBeacon), and the library gets the new track.
+        //     Following it ourselves would double-commit.
+        //   • doDirectUpload (frozen fallback): VK's UI is gone by the time
+        //     the upload response comes back, so nobody follows the
+        //     redirect. Without our fetch the track sits on the upload host
+        //     forever and never attaches to the user's audio library.
         let sha = '';
         try {
           const audioEnc = r.redirect.match(/[?&]audio=([^&]+)/)?.[1];
@@ -595,31 +608,31 @@
           origFetch(redirectUrl, { method: 'GET', credentials: 'include' })
             .then(resp => {
               trace('[VMU UPLOAD] redirect commit status=' + resp.status);
-              window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText }, '*');
+              window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText, fileName }, '*');
             })
             .catch(err => {
               trace('[VMU UPLOAD] redirect commit failed: ' + err.message);
               // Still resolve — the upload itself succeeded, even if the commit
               // navigation failed the row UI shouldn't hang forever.
-              window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText }, '*');
+              window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText, fileName }, '*');
             });
           return;
         }
         trace('[VMU UPLOAD] v2 upload ok sha=' + sha + ' (VK UI will commit)');
-        window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText }, '*');
+        window.postMessage({ type: 'VK_UPLOAD_DONE', response: uploadResponseText, fileName }, '*');
         return;
       }
     } catch {}
     // Legacy VK path: wait for al_audio.php?act=done_add XHR
-    __vmuPendingUpload = { response: uploadResponseText };
-    clearTimeout(__vmuPendingTimer);
-    __vmuPendingTimer = setTimeout(() => {
-      if (!__vmuPendingUpload) return;
-      console.log('[VMU UPLOAD] done_add timeout — flushing raw upload response');
-      const pending = __vmuPendingUpload;
-      __vmuPendingUpload = null;
-      window.postMessage({ type: 'VK_UPLOAD_DONE', response: pending.response }, '*');
+    const pending = { response: uploadResponseText, fileName, timer: null };
+    pending.timer = setTimeout(() => {
+      const idx = __vmuPendingUploads.indexOf(pending);
+      if (idx === -1) return;
+      console.log('[VMU UPLOAD] done_add timeout — flushing raw upload response for', fileName);
+      __vmuPendingUploads.splice(idx, 1);
+      window.postMessage({ type: 'VK_UPLOAD_DONE', response: pending.response, fileName: pending.fileName }, '*');
     }, 8000);
+    __vmuPendingUploads.push(pending);
   }
 
   function parseBodyStr(body) {
@@ -639,6 +652,38 @@
     return bodyStr.match(/(?:^|&)hash=([^&]+)/)?.[1] || '';
   }
 
+  // Audio file upload host — VK moved this off pu.vk.com/vkontakte.ru at some
+  // point in 2026 onto a per-upload numbered subdomain of ms.vk.ru (observed
+  // live: https://652221.ms.vk.ru/, https://632221.ms.vk.ru/ — the number
+  // isn't a fixed id, so match the parent domain, not a literal host).
+  // Missing this host meant neither interceptor below ever recognized the
+  // real upload request, so deferUploadDone() never ran and the queue just
+  // sat on "uploading…" until the 90s timeout in content.js gave up — kept
+  // the old hosts too in case VK serves either depending on region/rollout.
+  function isVkUploadUrl(url) {
+    return url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php') || url.includes('.ms.vk.ru');
+  }
+
+  // Pull the File out of a multipart upload body to identify WHICH queued
+  // track a given upload request belongs to. Needed because native batch
+  // uploads (see VK_INJECT_FILES) can have several of these in flight/
+  // pending at once — a single global "current upload" no longer identifies
+  // anything.
+  function extractUploadFileName(body) {
+    try {
+      if (body instanceof FormData) {
+        for (const v of body.values()) {
+          if (v instanceof File) return v.name;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  // fileName -> in-flight XHR, so VMU_CANCEL_UPLOAD can abort the ONE the
+  // user clicked ✕ on instead of whatever happens to be "current".
+  window.__vmuCurrentUploads = window.__vmuCurrentUploads || new Map();
+
   // ── XHR interceptor ──────────────────────────────────────────────────────────
   const origOpen = XMLHttpRequest.prototype.open;
   const origSend = XMLHttpRequest.prototype.send;
@@ -652,34 +697,45 @@
     if (!this._vkUrl) return origSend.call(this, body);
     const url = this._vkUrl;
 
-    // Audio file upload — match pu.vk.com, vkontakte.ru, or any upload.php endpoint
-    const isUploadUrl = url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php');
+    const isUploadUrl = isVkUploadUrl(url);
     if (isUploadUrl) {
       const xhr = this;
-      window.__vmuCurrentUpload = xhr;
+      const fileName = extractUploadFileName(body);
+      xhr._vmuFileName = fileName;
+      if (fileName) window.__vmuCurrentUploads.set(fileName, xhr);
+      window.__vmuCurrentUpload = xhr; // last-writer-wins alias, kept for the frozen direct pipeline
       window.__vmuLastUploadUrl = url; // saved for zombie-mode direct uploads
-      console.log('[VMU XHR] upload start', url.slice(0, 80));
+      console.log('[VMU XHR] upload start', url.slice(0, 80), 'file=', fileName);
+      // Batches are handed to VK all at once now, but VK still transfers
+      // files one request at a time — this is the earliest real signal that
+      // THIS file's transfer actually began, so content.js can flip only
+      // this row to "uploading" instead of spinning the whole batch from
+      // the moment it was sent.
+      if (fileName) window.postMessage({ type: 'VK_UPLOAD_STARTED', fileName }, '*');
       if (xhr.upload) {
         xhr.upload.addEventListener('progress', (e) => {
           if (e.lengthComputable) {
-            window.postMessage({ type: 'VK_UPLOAD_PROGRESS', loaded: e.loaded, total: e.total }, '*');
+            window.postMessage({ type: 'VK_UPLOAD_PROGRESS', loaded: e.loaded, total: e.total, fileName }, '*');
           }
         });
       }
       this.addEventListener('load', () => {
-        console.log('[VMU XHR] load', xhr.status, (xhr.responseText || '').slice(0, 200));
-        window.__vmuCurrentUpload = null;
-        deferUploadDone(xhr.responseText);
+        console.log('[VMU XHR] load', xhr.status, (xhr.responseText || '').slice(0, 200), 'file=', fileName);
+        if (fileName) window.__vmuCurrentUploads.delete(fileName);
+        if (window.__vmuCurrentUpload === xhr) window.__vmuCurrentUpload = null;
+        deferUploadDone(xhr.responseText, fileName);
       });
       this.addEventListener('error', () => {
-        console.log('[VMU XHR] error');
-        window.__vmuCurrentUpload = null;
-        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*');
+        console.log('[VMU XHR] error', 'file=', fileName);
+        if (fileName) window.__vmuCurrentUploads.delete(fileName);
+        if (window.__vmuCurrentUpload === xhr) window.__vmuCurrentUpload = null;
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, fileName }, '*');
       });
       this.addEventListener('abort', () => {
-        console.log('[VMU XHR] abort');
-        window.__vmuCurrentUpload = null;
-        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, aborted: true }, '*');
+        console.log('[VMU XHR] abort', 'file=', fileName);
+        if (fileName) window.__vmuCurrentUploads.delete(fileName);
+        if (window.__vmuCurrentUpload === xhr) window.__vmuCurrentUpload = null;
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, aborted: true, fileName }, '*');
       });
     }
 
@@ -741,17 +797,18 @@
   window.fetch = async function (...args) {
     const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
 
-    // Audio file upload — match pu.vk.com, vkontakte.ru, or any upload.php endpoint
-    const isUploadUrl = url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php');
+    const isUploadUrl = isVkUploadUrl(url);
     if (isUploadUrl) {
+      const fileName = extractUploadFileName(args[1]?.body);
       window.__vmuLastUploadUrl = url; // saved for zombie-mode direct uploads
+      if (fileName) window.postMessage({ type: 'VK_UPLOAD_STARTED', fileName }, '*');
       return origFetch.apply(this, args).then(result => {
         result.clone().text().then(text => {
-          deferUploadDone(text);
-        }).catch(() => window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*'));
+          deferUploadDone(text, fileName);
+        }).catch(() => window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, fileName }, '*'));
         return result;
       }, err => {
-        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true }, '*');
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, fileName }, '*');
         throw err;
       });
     }
@@ -902,30 +959,66 @@
 
     switch (e.data.type) {
 
+      // Simple, safe hand-off used while the rich queue (VK_INJECT_FILES,
+      // below) is frozen: drop every file straight onto VK's own hidden
+      // native input and let VK's own change-handler take it from there —
+      // no attempt to observe or correlate the actual network transfer,
+      // since that's what turned out unreliable. Fire-and-forget by design.
+      case 'VK_HANDOFF_FILES': {
+        const items = e.data.items || [];
+        const files = items.map(it => new File([it.buffer], it.name, { type: it.mimeType || 'audio/mpeg' }));
+        console.log('[VMU HANDOFF] sending', files.length, 'file(s) straight to VK\'s native input:', files.map(f => f.name).join(', '));
+        let tries = 0;
+        (function tryInject() {
+          const input = document.querySelector('[data-vmu-vk="1"]');
+          if (input) {
+            const dt = new DataTransfer();
+            files.forEach(f => dt.items.add(f));
+            input.files = dt.files;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            console.log('[VMU HANDOFF] dispatched change on native input');
+            window.postMessage({ type: 'VK_HANDOFF_DISPATCHED', ok: true }, '*');
+          } else if (tries++ < 15) {
+            setTimeout(tryInject, 200);
+          } else {
+            console.log('[VMU HANDOFF] no native input found — giving up');
+            window.postMessage({ type: 'VK_HANDOFF_DISPATCHED', ok: false }, '*');
+          }
+        })();
+        break;
+      }
+
       case 'VMU_CANCEL_UPLOAD': {
-        if (window.__vmuCurrentUpload) {
+        const { fileName } = e.data;
+        if (fileName && window.__vmuCurrentUploads?.has(fileName)) {
+          try { window.__vmuCurrentUploads.get(fileName).abort(); } catch {}
+          window.__vmuCurrentUploads.delete(fileName);
+        } else if (!fileName && window.__vmuCurrentUpload) {
+          // No fileName given (older caller) — best effort, abort whatever's current.
           try { window.__vmuCurrentUpload.abort(); } catch {}
           window.__vmuCurrentUpload = null;
         }
         break;
       }
 
-      case 'VK_INJECT_FILE': {
-        const { name, mimeType, buffer } = e.data;
-        const file = new File([buffer], name, { type: mimeType || 'audio/mpeg' });
-        console.log('[VMU INJECT] received file', name, file.size, 'bytes');
+      case 'VK_INJECT_FILES': {
+        const items = e.data.items || [];
+        const files = items.map(it => new File([it.buffer], it.name, { type: it.mimeType || 'audio/mpeg' }));
+        console.log('[VMU INJECT] received batch:', files.map(f => f.name + ' (' + f.size + 'b)').join(', '));
 
+        // FROZEN (see USE_DIRECT_UPLOAD_PIPELINE above) — kept for the day VK
+        // breaks native multi-file upload again, not called by default.
         // Direct v2 pipeline: mint a fresh JWT through audio.getUploadServer
         // ourselves, then POST the file. fetch wrapper's deferUploadDone() will
         // see the {"redirect":...} response and (because we set __vmuOurUpload)
-        // follow that redirect to commit the track to the library.
-        // This bypasses VK's Upload manager entirely from the 2nd file onwards
-        // (it kept a stale one-shot JWT in uploadUrls[0] and re-using it hung).
-        async function doDirectUpload() {
+        // follow that redirect to commit the track to the library. One JWT is
+        // only good for one file, so a batch still needs one call per file
+        // here — this path just skips VK's own Upload manager entirely.
+        async function doDirectUpload(file) {
           const tmpl = window.__vmuGetUploadServerBody;
           const gusUrl = window.__vmuGetUploadServerUrl || 'https://api.vk.com/method/audio.getUploadServer';
           if (!tmpl) {
-            window.postMessage({ type: 'VK_FILE_INJECTED', ok: false, error: 'no getUploadServer template' }, '*');
+            window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: 'no getUploadServer template', fileName: file.name }, '*');
             return;
           }
           trace('[VMU INJECT] doDirectUpload file="' + file.name + '" size=' + file.size);
@@ -945,41 +1038,39 @@
             trace('[VMU INJECT] fresh upload_url tokTail=…' + tokTail + ' for "' + file.name + '"');
           } catch (err) {
             console.log('[VMU INJECT] getUploadServer failed:', err.message);
-            window.postMessage({ type: 'VK_FILE_INJECTED', ok: false, error: 'getUploadServer: ' + err.message }, '*');
+            window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: 'getUploadServer: ' + err.message, fileName: file.name }, '*');
             return;
           }
           const fd = new FormData();
           fd.append('file', file, file.name);
           // Mark that WE drove this upload (not VK's Upload manager). When the
-          // pu.vk.com response comes back with a `redirect` URL, deferUploadDone
-          // checks this flag — if we drove it, no VK UI is alive to follow the
-          // redirect, so we must fetch it ourselves to commit the track to the
-          // library.
+          // upload host's response comes back with a `redirect` URL,
+          // deferUploadDone checks this flag — if we drove it, no VK UI is
+          // alive to follow the redirect, so we must fetch it ourselves to
+          // commit the track to the library.
           window.__vmuOurUpload = true;
           // Use XHR (not fetch): the XHR interceptor above auto-attaches
           // upload.progress → VK_UPLOAD_PROGRESS so the row's progress bar
-          // animates, registers __vmuCurrentUpload for cancel, and fires
+          // animates, tracks it in __vmuCurrentUploads for cancel, and fires
           // deferUploadDone on `load` (which detects v2 {"redirect":...}
-          // and emits VK_UPLOAD_DONE). Fetch has no upload-progress events,
-          // so 2nd+ tracks looked stuck at 0% with no visible activity.
+          // and emits VK_UPLOAD_DONE, tagged with this file's name).
           const xhr = new XMLHttpRequest();
           xhr.open('POST', uploadUrl);
           xhr.send(fd);
-          window.postMessage({ type: 'VK_FILE_INJECTED', ok: true }, '*');
         }
 
-        // Once we've captured a getUploadServer template, prefer our own
-        // pipeline. VK's onFileApiSend reuses a dead JWT after file #1.
-        if (window.__vmuGetUploadServerBody && window.__vmuGetUploadServerUrl) {
-          console.log('[VMU INJECT] using direct v2 pipeline (template captured)');
-          doDirectUpload();
+        if (USE_DIRECT_UPLOAD_PIPELINE && window.__vmuGetUploadServerBody && window.__vmuGetUploadServerUrl) {
+          console.log('[VMU INJECT] using direct v2 pipeline (frozen path forced on) for', files.length, 'file(s)');
+          files.forEach(doDirectUpload);
+          window.postMessage({ type: 'VK_FILES_INJECTED', ok: true, native: false }, '*');
           break;
         }
 
-        // First-ever upload of the session — no template yet. Let VK drive
-        // the flow once via Upload.onFileApiSend so we capture audio.getUploadServer.
-        // Do NOT touch uploadUrls[0] here: for the first file VK already has a
-        // fresh one in there and our React-portal upload modal works as-is.
+        // Native-first for the WHOLE batch in one call — VK's own queue
+        // handles sequencing/progress for every file in it now, so there's
+        // no need to drive files through one at a time any more. Reset the
+        // upload slot first so onFileApiSend treats this as a fresh send
+        // instead of tripping over state left by a previous batch.
         if (!window.Upload?.options?.[0]) {
           const restored = restoreUploadSlot();
           console.log('[VMU INJECT] slot was empty, restored=', restored);
@@ -997,31 +1088,41 @@
 
         try {
           if (window.Upload && typeof window.Upload.onFileApiSend === 'function' && window.Upload.options?.[0]) {
-            console.log('[VMU INJECT] first file → Upload.onFileApiSend');
-            Promise.resolve(window.Upload.onFileApiSend(0, [file])).catch(err => {
+            console.log('[VMU INJECT] driving batch via Upload.onFileApiSend (native), count=', files.length);
+            Promise.resolve(window.Upload.onFileApiSend(0, files)).catch(err => {
               console.log('[VMU INJECT] onFileApiSend rejected:', err?.message || err);
             });
-            window.postMessage({ type: 'VK_FILE_INJECTED', ok: true }, '*');
+            window.postMessage({ type: 'VK_FILES_INJECTED', ok: true, native: true }, '*');
             break;
           }
         } catch (err) { console.log('[VMU INJECT] direct call failed:', err.message); }
 
-        // Final fallback: try VK's own DOM input
+        // Native path unavailable (no window.Upload) — try the frozen direct
+        // pipeline if we have a captured template, before giving up to the
+        // DOM-input fallback below.
+        if (window.__vmuGetUploadServerBody && window.__vmuGetUploadServerUrl) {
+          console.log('[VMU INJECT] native path unavailable, falling back to direct pipeline for', files.length, 'file(s)');
+          files.forEach(doDirectUpload);
+          window.postMessage({ type: 'VK_FILES_INJECTED', ok: true, native: false }, '*');
+          break;
+        }
+
+        // Final fallback: try VK's own DOM input with every file at once
         let tries = 0;
         (function tryInject() {
           const input = document.querySelector('[data-vmu-vk="1"]');
           if (input) {
             console.log('[VMU INJECT] DOM input found');
             const dt = new DataTransfer();
-            dt.items.add(file);
+            files.forEach(f => dt.items.add(f));
             input.files = dt.files;
             input.dispatchEvent(new Event('change', { bubbles: true }));
-            window.postMessage({ type: 'VK_FILE_INJECTED', ok: true }, '*');
+            window.postMessage({ type: 'VK_FILES_INJECTED', ok: true, native: false }, '*');
           } else if (tries++ < 15) {
             setTimeout(tryInject, 200);
           } else {
             console.log('[VMU INJECT] no input found, no template captured — giving up');
-            window.postMessage({ type: 'VK_FILE_INJECTED', ok: false, error: 'no input, no template' }, '*');
+            window.postMessage({ type: 'VK_FILES_INJECTED', ok: false, error: 'no input, no template' }, '*');
           }
         })();
         break;

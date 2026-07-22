@@ -48,17 +48,14 @@
   // ─── state ───────────────────────────────────────────────────────────────────
   let fileQueue = [];
   let isProcessing = false;
-  let uploadDoneCallback = null;
+  // Batches are now sent to VK's native uploader all at once (see
+  // processQueue), so several files can be in flight/pending together —
+  // keyed by filename instead of a single global callback/item.
+  const uploadDoneCallbacks = new Map();   // fileName -> (data) => void
+  const uploadingItemsByName = new Map();  // fileName -> queue item
   let autoPlaylistRunning = false;
   let isPaused = false;
-  let currentUploadingItem = null;
   let itemIdCounter = 0;
-  // How many files were added to the CURRENT batch (resets when a fresh batch
-  // starts from an empty queue). itemIdCounter itself is a lifetime id
-  // generator and must stay monotonic for React-less list keying, so it can't
-  // double as this — reusing it here previously misclassified any batch after
-  // the first single-file one as "multi-file" (see reloadAfterBatchIfNeeded).
-  let sessionFileCount = 0;
 
   // ─── playlist download state ──────────────────────────────────────────────────
   const dlTracks = new Map();   // trackId -> {id, title, artist, url}
@@ -66,9 +63,13 @@
 
   window.addEventListener('message', (e) => {
     if (e.source !== window) return;
-    if (e.data?.type === 'VK_UPLOAD_DONE' && uploadDoneCallback) {
-      uploadDoneCallback(e.data);
-      uploadDoneCallback = null;
+    if (e.data?.type === 'VK_UPLOAD_DONE') {
+      const fn = e.data.fileName;
+      const cb = fn ? uploadDoneCallbacks.get(fn) : null;
+      if (cb) {
+        uploadDoneCallbacks.delete(fn);
+        cb(e.data);
+      }
     }
     if (e.data?.type === 'VK_COVER_DONE' && window.__vmuCoverCallback) {
       window.__vmuCoverCallback(e.data);
@@ -82,12 +83,32 @@
       const t = e.data.track;
       if (t?.id && !dlTracks.has(t.id)) dlTracks.set(t.id, t);
     }
-    if (e.data?.type === 'VK_UPLOAD_PROGRESS' && currentUploadingItem) {
+    if (e.data?.type === 'VK_UPLOAD_PROGRESS') {
+      const item = e.data.fileName ? uploadingItemsByName.get(e.data.fileName) : null;
       const total = e.data.total || 0;
-      if (total > 0) {
-        currentUploadingItem.progress = e.data.loaded / total;
-        updateRowProgress(currentUploadingItem.id);
+      if (item && total > 0) {
+        item.progress = e.data.loaded / total;
+        updateRowProgress(item.id);
       }
+    }
+    // A batch is handed to VK's native uploader all at once, but VK still
+    // transfers files one at a time — this fires when THIS file's network
+    // request actually starts, so only that row flips to "uploading"
+    // instead of the whole batch spinning from the moment it was sent.
+    if (e.data?.type === 'VK_UPLOAD_STARTED') {
+      const item = e.data.fileName ? uploadingItemsByName.get(e.data.fileName) : null;
+      if (item && item.status === 'pending') {
+        item.status = 'uploading';
+        renderQueue();
+      }
+    }
+    // Files were actually dispatched onto VK's native input (see
+    // handoffFilesNatively / VK_HANDOFF_FILES in injected.js) — swap our
+    // static dropzone out for VK's own dialog content so its real progress
+    // bar and success/error state show instead of our UI sitting frozen on
+    // top of it.
+    if (e.data?.type === 'VK_HANDOFF_DISPATCHED' && e.data.ok) {
+      revealNativeUploadUI();
     }
   });
 
@@ -141,6 +162,26 @@
 
   // ─── settings ────────────────────────────────────────────────────────────────
   const SETTINGS_KEY = 'vmu_settings_v2';
+  const DAILY_UPLOAD_KEY = 'vmu_daily_upload_v1';
+  const DAILY_UPLOAD_LIMIT = 70; // VK's own per-account daily audio upload cap
+
+  function todayStr() {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+  // Approximate — VK's own daily-limit window reset time isn't public, so
+  // this counts against local midnight. Good enough to warn well before 70.
+  function getTodayUploadCount() {
+    try {
+      const s = JSON.parse(localStorage.getItem(DAILY_UPLOAD_KEY) || 'null');
+      return s && s.date === todayStr() ? (s.count || 0) : 0;
+    } catch { return 0; }
+  }
+  function bumpTodayUploadCount() {
+    const count = getTodayUploadCount() + 1;
+    try { localStorage.setItem(DAILY_UPLOAD_KEY, JSON.stringify({ date: todayStr(), count })); } catch {}
+    return count;
+  }
   let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
@@ -2419,6 +2460,17 @@
   // title; pull the first such number we find. Returns null if not visible.
   function getPlaylistTotalFromModal(modal) {
     if (!modal) return null;
+    // Primary: VK's own stat node holds just the bare number (data-testid
+    // musicplayliststatistics-count), separate from the "Треки" label node.
+    // Reading textContent off the whole modal glues label+count+listen-count
+    // together with no separator ("Треки" + "6" + "21 прослушиваний" ->
+    // "Треки621 прослушиваний"), so regexing that blob below misreads "621"
+    // as the total instead of "6". Read the dedicated node first.
+    const countEl = modal.querySelector('[data-testid="musicplayliststatistics-count"], [data-testid$="statistics-count"]');
+    if (countEl) {
+      const n = parseInt((countEl.textContent || '').replace(/[\s ]/g, ''), 10);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
     const text = (modal.textContent || '').slice(0, 4000);
     const m = text.match(/(\d[\d\s ]{0,6})\s*(?:трек(?:а|ов)?|записе?[йяи]|композици[йия])/i);
     if (!m) return null;
@@ -3521,23 +3573,25 @@
     if (!item) return;
     if (item.status === 'uploading') {
       item.abortReason = 'cancel';
-      window.postMessage({ type: 'VMU_CANCEL_UPLOAD' }, '*');
+      window.postMessage({ type: 'VMU_CANCEL_UPLOAD', fileName: item.file.name }, '*');
     } else {
       fileQueue.splice(idx, 1);
       renderQueue();
     }
   }
 
-  // Pause / resume the queue. If a track is uploading, abort it so the user
-  // sees the pause take effect immediately — it'll get re-uploaded from
-  // scratch on resume (VK upload protocol doesn't support resume).
+  // Pause / resume the queue. Batches now go to VK's native uploader all at
+  // once, so "pause" can't stop it mid-batch — it aborts every file that's
+  // still uploading (each re-uploads from scratch on resume, VK's protocol
+  // doesn't support resuming a partial upload) and simply doesn't start a
+  // new batch for anything still pending until resumed.
   function togglePause() {
     isPaused = !isPaused;
     if (isPaused) {
-      const upl = fileQueue.find(i => i.status === 'uploading');
-      if (upl) {
-        upl.abortReason = 'pause';
-        window.postMessage({ type: 'VMU_CANCEL_UPLOAD' }, '*');
+      for (const item of fileQueue) {
+        if (item.status !== 'uploading') continue;
+        item.abortReason = 'pause';
+        window.postMessage({ type: 'VMU_CANCEL_UPLOAD', fileName: item.file.name }, '*');
       }
     } else if (!isProcessing) {
       processQueue();
@@ -3620,6 +3674,9 @@
         ? `<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M4 2 L11 7 L4 12 Z"/></svg>`
         : `<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><rect x="3" y="2" width="3" height="10" rx="0.8"/><rect x="8" y="2" width="3" height="10" rx="0.8"/></svg>`;
       buttons.push(`<button class="vmu-action-btn vmu-pause-btn ${isPaused ? 'vmu-resume' : ''}" id="vmu-pause-btn" data-vmu-tip="${isPaused ? 'Продолжить' : 'Пауза'}">${pauseIcon}</button>`);
+      const dailyCount = getTodayUploadCount();
+      const nearLimit = dailyCount >= DAILY_UPLOAD_LIMIT - 10;
+      buttons.push(`<span class="vmu-daily-count${nearLimit ? ' vmu-daily-count-warn' : ''}" title="Загружено сегодня (лимит ВК — ${DAILY_UPLOAD_LIMIT}/сутки)">${dailyCount}/${DAILY_UPLOAD_LIMIT}</span>`);
     }
     if (allSettled && counts.error > 0) {
       buttons.push(`<button class="vmu-action-btn" id="vmu-copy-failed" data-vmu-tip="Скопировать имена ошибок">
@@ -3633,15 +3690,73 @@
   }
 
   // ─── queue ────────────────────────────────────────────────────────────────────
+  // FROZEN: the whole per-file queue UI (progress bars, retry/cancel, pause,
+  // auto-playlist trigger, processQueue/prepareFileForUpload below) depended
+  // on correlating VK's own upload requests back to a specific file — which
+  // stopped being reliable once VK moved to a transport our XHR/fetch
+  // interceptors can't always see (see the long comment in processQueue).
+  // Rather than keep fighting VK's upload internals, files now go straight
+  // into VK's own native input and VK's own dialog shows the rest — our UI
+  // is just the drop zone + "Выбрать файлы" button. Flip this back to true
+  // to re-enable the rich queue if a reliable per-file signal is found
+  // again; the old code is untouched below, just unreachable.
+  const NATIVE_HANDOFF_ONLY = true;
+
+  // Un-hides VK's own dialog content (see the `vmuNativeMiddle` hide in
+  // injectIntoVkDialog) and drops our own dropzone UI, so VK's real
+  // progress/success/error state — updated by VK's own re-render once the
+  // handed-off input's change event lands — becomes visible instead of our
+  // static dropzone sitting on top of it forever.
+  function revealNativeUploadUI() {
+    nativeUiRevealed = true;
+    document.querySelectorAll('[data-vmu-native-middle="1"]').forEach(c => {
+      c.style.display = '';
+      delete c.dataset.vmuNativeMiddle;
+    });
+    document.getElementById('vmu-embedded')?.remove();
+  }
+
+  // Reads ID3 (for auto-meta), then hands every file straight to VK's own
+  // hidden native file input (see VK_HANDOFF_FILES in injected.js) and lets
+  // VK's own dialog do the rest — no progress/status tracking on our side.
+  async function handoffFilesNatively(files) {
+    const items = [];
+    for (const f of files) {
+      let file = f;
+      if (settings.autoMeta) {
+        try {
+          const tags = await readID3(f);
+          const hasArtist = !!(tags.TPE1 || tags.TPE2);
+          const hasTitle = !!tags.TIT2;
+          if (!hasArtist || !hasTitle) {
+            const parsed = parseMetaFromFilename(f.name);
+            const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : parsed.artist;
+            const title = hasTitle ? tags.TIT2 : parsed.title;
+            if (artist || title) file = await patchID3(f, artist, title);
+          }
+        } catch {}
+      }
+      const buffer = await file.arrayBuffer();
+      items.push({ name: file.name, mimeType: file.type || 'audio/mpeg', buffer });
+    }
+    // Optimistic count — without per-file confirmation from VK we can't know
+    // exactly how many actually landed, only how many we handed off. Close
+    // enough for the "you're approaching VK's 70/day cap" warning this is for.
+    for (let i = 0; i < items.length; i++) bumpTodayUploadCount();
+    window.postMessage({ type: 'VK_HANDOFF_FILES', items }, '*', items.map(i => i.buffer));
+  }
+
   function addFiles(files) {
     if (!files.length) return;
     if (settings.workMode === 'check') {
       runCheckMode(files);
       return;
     }
+    if (NATIVE_HANDOFF_ONLY) {
+      handoffFilesNatively(files);
+      return;
+    }
     autoPlaylistRunning = false;
-    if (fileQueue.length === 0) sessionFileCount = 0;
-    sessionFileCount += files.length;
     files.forEach(f => {
       const item = { id: ++itemIdCounter, file: f, status: 'pending', errorMsg: null, tags: {}, progress: 0 };
       fileQueue.push(item);
@@ -3736,7 +3851,11 @@
     // the exact same MusicTrackRow markup — scanning the whole document
     // pulled those in as false "already on the page" matches. Falls back to
     // the whole document on markups where this section isn't present.
-    const scanRoot = document.querySelector('[data-testid="AudioCatalog_SectionTracks"]') || document;
+    // VK renamed the testid from AudioCatalog_SectionTracks to
+    // AudioCatalog_BlockMusicAudiosList; keep both so either markup works.
+    const scanRoot = document.querySelector(
+      '[data-testid="AudioCatalog_BlockMusicAudiosList"], [data-testid="AudioCatalog_SectionTracks"]'
+    ) || document;
 
     function pull() {
       const uploadBox = getUploadDialog();
@@ -3761,6 +3880,14 @@
 
     const findScroller = () => {
       const candidates = [...document.querySelectorAll('*')].filter(el => {
+        // Exclude our own injected UI (results panel from a previous check,
+        // settings/EQ panels, toasts, ...). A leftover scrollable panel like
+        // #vmu-check-panel's track list sorts earlier in document order than
+        // VK's real scroller, so it used to get picked here — the scroll dance
+        // below then scrolled OUR panel instead of the page, and VK's
+        // lazy-loader never fired past the first batch (page pagination
+        // appeared "broken" whenever a previous check panel was still open).
+        if (el.closest('[id^="vmu-"], [class*="vmu-"]')) return false;
         const cs = getComputedStyle(el);
         return (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
       });
@@ -3850,6 +3977,12 @@
       // 2) close the upload modal
       closeUploadModal();
       await sleep(250);
+
+      // Drop any results panel left over from a previous check run — besides
+      // being stale, its scrollable track list would otherwise be a candidate
+      // for harvestPageTracks' findScroller() below.
+      document.getElementById('vmu-check-panel')?._vmuCleanup?.();
+      document.getElementById('vmu-check-panel')?.remove();
 
       // 3) harvest tracks from the page (default: first 100; full page on demand)
       const limit = settings.checkFullPage ? null : 100;
@@ -4151,16 +4284,44 @@
     window.postMessage({ type: 'VMU_BLOCK_AUDIO_HIDE', block }, '*');
   }
 
+  // Patches ID3 tags from the filename when Auto-metadata is on and either
+  // artist or title is missing from the file's own tags. Returns the file
+  // to actually upload (patched copy, or the original if nothing to do).
+  async function prepareFileForUpload(item) {
+    let file = item.file;
+    if (settings.autoMeta) {
+      const tags = item.tags || {};
+      const hasArtist = !!(tags.TPE1 || tags.TPE2);
+      const hasTitle = !!tags.TIT2;
+      if (!hasArtist || !hasTitle) {
+        const parsed = parseMetaFromFilename(file.name);
+        const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : parsed.artist;
+        const title = hasTitle ? tags.TIT2 : parsed.title;
+        if (artist || title) {
+          try { file = await patchID3(file, artist, title); } catch {}
+        }
+      }
+    }
+    return file;
+  }
+
+  // Whether the most recently sent batch actually went through VK's native
+  // uploader (Upload.onFileApiSend) — set from VK_INJECT_FILES' response.
+  // reloadAfterBatchIfNeeded uses this: native uploads update VK's own store
+  // directly, so nothing needs to reload; the frozen/DOM-input fallbacks
+  // don't, and still need the old reload-to-see-it workaround.
+  let lastBatchNative = true;
+
   async function processQueue() {
     if (isProcessing) return;
     if (isPaused) return;
-    const next = fileQueue.find(f => f.status === 'pending');
-    console.log('[VMU QUEUE] processQueue: pending=', fileQueue.filter(f => f.status === 'pending').length,
+    const pending = fileQueue.filter(f => f.status === 'pending');
+    console.log('[VMU QUEUE] processQueue: pending=', pending.length,
       'uploading=', fileQueue.filter(f => f.status === 'uploading').length,
       'done=', fileQueue.filter(f => f.status === 'done').length,
       'error=', fileQueue.filter(f => f.status === 'error').length,
-      'next=', next?.file?.name);
-    if (!next) {
+      'batch=', pending.map(f => f.file.name));
+    if (!pending.length) {
       renderQueue();
       if (fileQueue.length > 0 && !fileQueue.some(f => f.status === 'uploading')) {
         // Trigger auto-playlist if enabled (once per completed batch)
@@ -4180,142 +4341,148 @@
 
     setBlockAudioHide(true);
     isProcessing = true;
-    next.status = 'uploading';
-    next.progress = 0;
+
+    // Resolve (possibly ID3-patched) files for the whole batch up front,
+    // then hand VK's native uploader every one of them in a single call —
+    // it drives its own internal queue/progress for the batch now instead
+    // of us feeding it one file at a time and waiting between each.
+    const jobs = pending.map(item => ({ item, file: null, _finish: null }));
+    for (const job of jobs) {
+      job.file = await prepareFileForUpload(job.item);
+      job.item.progress = 0;
+      // Marked 'uploading' as soon as the batch is about to be sent — NOT
+      // left 'pending' waiting for a per-file network signal. This whole
+      // path is FROZEN (see NATIVE_HANDOFF_ONLY) precisely because that
+      // signal turned out unreliable: VK's current transport isn't always
+      // visible to our XHR/fetch interceptors, so a file could sit
+      // uncorrelated forever. If it stayed 'pending', the top-of-function
+      // `fileQueue.filter(f => f.status === 'pending')` would pick the same
+      // stuck items back up on the very next loop iteration and resend the
+      // whole batch again — verified live, this actually happened and
+      // uploaded duplicate copies of the same tracks repeatedly. Marking
+      // 'uploading' immediately removes them from that filter for good,
+      // even if we never learn how the upload actually turned out.
+      job.item.status = 'uploading';
+    }
     renderQueue();
 
-    try {
-      await uploadOne(next);
-      next.status = 'done';
-      next.progress = 1;
-    } catch (err) {
-      if (err.message === '__ABORTED__') {
-        const reason = next.abortReason || 'cancel';
-        next.progress = 0;
-        delete next.abortReason;
-        if (reason === 'cancel') {
-          const i = fileQueue.indexOf(next);
-          if (i >= 0) fileQueue.splice(i, 1);
-        } else {
-          next.status = 'pending'; // paused — keep for resume
-        }
-      } else {
-        next.status = 'error';
-        next.errorMsg = err.message;
-        console.warn('[VK Multi Upload]', err.message);
-        // VK rate limit (code 8) — fail the rest of the batch immediately, every
-        // subsequent file would just hit the same wall and produce noise.
-        const code = err.vkCode;
-        if (code === 8 || code === '8') {
-          for (const f of fileQueue) {
-            if (f.status === 'pending') { f.status = 'error'; f.errorMsg = err.message; }
-          }
-        }
-      }
-    }
-
-    currentUploadingItem = null;
-    renderQueue();
-    isProcessing = false;
-    // Hold-open stays on until the user explicitly closes — drag-and-drop
-    // of more files keeps working without re-opening the dialog.
-    await sleep(2000);
-    processQueue();
-  }
-
-  // VK's own UI re-renders the audio list only for the very first file of a
-  // session (it drives that one through Upload.onFileApiSend); every file
-  // after that is committed via our own direct upload (see injected.js'
-  // doDirectUpload), which never touches VK's store, so the visible list
-  // stays stale until the page reloads.
-  function reloadAfterBatchIfNeeded() {
-    if (sessionFileCount < 2) {
-      // Single file already renders correctly natively — release the close
-      // lock so the user can dismiss the dialog or keep dropping more files.
-      setBlockAudioHide(false);
-      return;
-    }
-    location.reload();
-  }
-
-  async function uploadOne(item) {
-    let file = item.file;
-    console.log('[VMU UPLOAD] uploadOne start:', file.name, 'size=', file.size);
-    // Snapshot dialog state for diagnostics
-    try {
-      const box = getUploadDialog();
-      const layer = box?.closest('#box_layer, .popup_box_container') || box;
-      console.log('[VMU UPLOAD] dialog state', {
-        boxOpen: !!box,
-        boxStyle: box ? box.style.cssText.slice(0, 100) : null,
-        boxClassExtras: box ? box.className : null,
-        layerPointerEvents: layer ? getComputedStyle(layer).pointerEvents : null,
-        layerOpacity: layer ? getComputedStyle(layer).opacity : null,
-        layerDisplay: layer ? getComputedStyle(layer).display : null,
-        layerCount: document.querySelectorAll('#box_layer').length,
-      });
-    } catch (err) { console.log('[VMU UPLOAD] dialog state read failed', err.message); }
-
-    if (settings.autoMeta) {
-      const tags = item.tags || {};
-      const hasArtist = !!(tags.TPE1 || tags.TPE2);
-      const hasTitle = !!tags.TIT2;
-      if (!hasArtist || !hasTitle) {
-        const parsed = parseMetaFromFilename(file.name);
-        const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : parsed.artist;
-        const title = hasTitle ? tags.TIT2 : parsed.title;
-        if (artist || title) {
-          try { file = await patchID3(file, artist, title); } catch {}
-        }
-      }
-    }
-
-    currentUploadingItem = item;
-
-    // Set the callback before injection to avoid losing a fast upload response.
-    const uploadPromise = new Promise((resolve, reject) => {
-      const t = setTimeout(() => {
+    // Register a settle function per file BEFORE sending anything, so a
+    // very fast response can't race past having a callback registered —
+    // matches each file's completion back to its row by filename (see
+    // extractUploadFileName in injected.js), since several files can now
+    // be in flight/pending together.
+    const settled = jobs.map(job => new Promise(resolveSettled => {
+      const { item, file } = job;
+      let done = false;
+      const finish = (outcome) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        uploadDoneCallbacks.delete(file.name);
+        uploadingItemsByName.delete(file.name);
+        resolveSettled({ item, ...outcome });
+      };
+      job._finish = finish;
+      const timer = setTimeout(() => {
         console.log('[VMU UPLOAD] 90s timeout —', file.name);
-        uploadDoneCallback = null;
-        reject(new Error('Timeout загрузки (90s)'));
+        finish({ error: new Error('Timeout загрузки (90s)') });
       }, 90_000);
-      uploadDoneCallback = data => {
-        clearTimeout(t);
+      uploadingItemsByName.set(file.name, item);
+      uploadDoneCallbacks.set(file.name, data => {
         console.log('[VMU UPLOAD] VK_UPLOAD_DONE received:', file.name, 'aborted=', !!data.aborted, 'error=', !!data.error, 'errorMsg=', data.errorMsg, 'code=', data.errorCode, 'resp=', (data.response || '').slice(0, 100));
-        if (data.aborted) { reject(new Error('__ABORTED__')); return; }
+        if (data.aborted) { finish({ error: new Error('__ABORTED__') }); return; }
         if (data.error) {
           const e = new Error(data.errorMsg || 'Ошибка сети');
           e.vkCode = data.errorCode;
-          reject(e);
+          finish({ error: e });
           return;
         }
         try {
           const r = JSON.parse(data.response);
           if (r.error_code) {
             console.log('[VMU UPLOAD] VK error_code=', r.error_code, r.error_msg);
-            reject(new Error(`VK ${r.error_code}: ${r.error_msg}`));
-          } else { resolve(r); }
-        } catch { resolve(); }
-      };
-    });
+            finish({ error: new Error(`VK ${r.error_code}: ${r.error_msg}`) });
+          } else { finish({ result: r }); }
+        } catch { finish({ result: undefined }); }
+      });
+    }));
 
-    const buffer = await file.arrayBuffer();
-    console.log('[VMU UPLOAD] sending VK_INJECT_FILE for', file.name);
-    await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('Timeout инжекта')), 5000);
-      const handler = e => {
-        if (e.source !== window || e.data?.type !== 'VK_FILE_INJECTED') return;
-        window.removeEventListener('message', handler);
-        clearTimeout(t);
-        console.log('[VMU UPLOAD] VK_FILE_INJECTED ok=', e.data.ok, 'err=', e.data.error);
-        e.data.ok ? resolve() : reject(new Error(e.data.error));
-      };
-      window.addEventListener('message', handler);
-      window.postMessage({ type: 'VK_INJECT_FILE', name: file.name, mimeType: file.type || 'audio/mpeg', buffer }, '*', [buffer]);
-    });
+    const items = [];
+    for (const { file } of jobs) {
+      const buffer = await file.arrayBuffer();
+      items.push({ name: file.name, mimeType: file.type || 'audio/mpeg', buffer });
+    }
+    console.log('[VMU UPLOAD] sending VK_INJECT_FILES for', items.map(i => i.name));
+    try {
+      lastBatchNative = await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('Timeout инжекта')), 5000);
+        const handler = e => {
+          if (e.source !== window || e.data?.type !== 'VK_FILES_INJECTED') return;
+          window.removeEventListener('message', handler);
+          clearTimeout(t);
+          console.log('[VMU UPLOAD] VK_FILES_INJECTED ok=', e.data.ok, 'native=', e.data.native, 'err=', e.data.error);
+          e.data.ok ? resolve(!!e.data.native) : reject(new Error(e.data.error));
+        };
+        window.addEventListener('message', handler);
+        window.postMessage({ type: 'VK_INJECT_FILES', items }, '*', items.map(i => i.buffer));
+      });
+    } catch (err) {
+      // Injection itself failed — nothing was ever sent, so settle every
+      // job as an error right away instead of waiting out each 90s timeout.
+      for (const job of jobs) job._finish({ error: err });
+    }
 
-    await uploadPromise;
-    await sleep(2000);
+    const results = await Promise.all(settled);
+    for (const { item, error } of results) {
+      if (error) {
+        if (error.message === '__ABORTED__') {
+          const reason = item.abortReason || 'cancel';
+          item.progress = 0;
+          delete item.abortReason;
+          if (reason === 'cancel') {
+            const i = fileQueue.indexOf(item);
+            if (i >= 0) fileQueue.splice(i, 1);
+          } else {
+            item.status = 'pending'; // paused — keep for resume
+          }
+        } else {
+          item.status = 'error';
+          item.errorMsg = error.message;
+          console.warn('[VK Multi Upload]', error.message);
+          // VK rate limit (code 8) — fail the rest of the batch immediately,
+          // every other file in it would just hit the same wall.
+          const code = error.vkCode;
+          if (code === 8 || code === '8') {
+            for (const f of fileQueue) {
+              if (f.status === 'pending' || f.status === 'uploading') { f.status = 'error'; f.errorMsg = error.message; }
+            }
+          }
+        }
+      } else {
+        item.status = 'done';
+        item.progress = 1;
+        bumpTodayUploadCount();
+      }
+    }
+
+    renderQueue();
+    isProcessing = false;
+    // Hold-open stays on until the user explicitly closes — drag-and-drop
+    // of more files keeps working without re-opening the dialog.
+    await sleep(1000);
+    processQueue();
+  }
+
+  // Native uploads (the normal case now) update VK's own store directly, so
+  // the visible list is already correct — just release the close lock. Only
+  // the frozen/DOM-input fallback paths in VK_INJECT_FILES never touch VK's
+  // store, so THEY still need the page-reload workaround to show up.
+  function reloadAfterBatchIfNeeded() {
+    if (lastBatchNative) {
+      setBlockAudioHide(false);
+      return;
+    }
+    location.reload();
   }
 
   // ─── Embed full UI into VK's native upload dialog ────────────────────────────
@@ -4432,9 +4599,19 @@
     }
   }
 
+  // True once revealNativeUploadUI() has deliberately removed #vmu-embedded
+  // to let VK's own progress UI show. The onPageMutated watchdog further
+  // down treats a missing #vmu-embedded as "VK wiped our UI, re-inject it" —
+  // true in the old architecture, but exactly wrong here: it was undoing
+  // the reveal within one MutationObserver tick (~120ms), so the native
+  // progress bar never stayed visible. Reset whenever a dialog is freshly
+  // (re-)injected, since that's back to showing our own dropzone.
+  let nativeUiRevealed = false;
+
   function injectIntoVkDialog(box) {
     if (box.dataset.vmuInjected) return;
     box.dataset.vmuInjected = '1';
+    nativeUiRevealed = false;
 
     // Save VK's original file input (with its VK event listeners intact)
     const vkInput = box.querySelector('input[type="file"]');
@@ -4451,8 +4628,18 @@
     const header = box.querySelector('[data-testid="modalheader"], [class*="vkitModalHeader"]');
     const footer = box.querySelector('[data-testid="modalfooter"], [class*="vkitModalFooter"]');
     if (header || footer) {
+      // NATIVE_HANDOFF_ONLY: hide VK's own middle section instead of
+      // destroying it. Once files are handed off (see handoffFilesNatively),
+      // VK's own re-render — its real progress bar, its own success/error
+      // state — needs a real DOM node to land in; a node we already called
+      // .remove() on can't come back without fighting React's reconciliation
+      // (see the "removeChild blocked" guard elsewhere in this file). Hiding
+      // leaves VK's own tree completely intact underneath ours, ready to
+      // reveal the moment revealNativeUploadUI() runs.
       [...box.children].forEach(c => {
-        if (c !== header && c !== footer) c.remove();
+        if (c === header || c === footer) return;
+        c.dataset.vmuNativeMiddle = '1';
+        c.style.display = 'none';
       });
       const ui = buildEmbeddedUI(false);
       if (footer) box.insertBefore(ui, footer);
@@ -4726,7 +4913,7 @@
     if (!flexParent) return;
 
     const newRow = document.createElement('div');
-    newRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;padding:8px 16px 0;';
+    newRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;padding:8px 0 0;';
     newRow.appendChild(makeDupesBtn(plInfo));
     newRow.appendChild(makeDlDialogBtn(plInfo, 'individual'));
     newRow.appendChild(makeDlDialogBtn(plInfo, 'zip'));
@@ -4741,6 +4928,26 @@
     const headerEl = modal.querySelector('[data-testid="MusicPlaylistModal_Header"]');
     if (headerEl && headerEl.parentNode) {
       headerEl.insertAdjacentElement('afterend', newRow);
+      // Measured BEFORE insertion (inserting a sibling after headerEl doesn't
+      // move headerEl/flexParent, only pushes the body down):
+      // Vertical — headerEl reserves ~40-50px of its own bottom padding below
+      // the native button row (for its own now-empty layout slot), so
+      // appending after the whole header leaves a big dead gap before our
+      // row. Pull newRow up by that exact gap so it sits flush under the
+      // native buttons — its own 8px top padding then reads as a normal row
+      // gap instead of a stray empty band.
+      // Horizontal — headerEl spans the album art + the text/button column,
+      // but flexParent (the native button row, both icon subgroups) only
+      // covers the text/button column further right. A full-width newRow
+      // therefore starts under the album art, not under the buttons. Match
+      // flexParent's left offset and width so it lines up with the buttons
+      // above it instead of the artwork.
+      const headerRect = headerEl.getBoundingClientRect();
+      const flexRect = flexParent.getBoundingClientRect();
+      const gap = headerRect.bottom - flexRect.bottom;
+      if (gap > 8) newRow.style.marginTop = `-${Math.round(gap)}px`;
+      newRow.style.marginLeft = `${Math.round(flexRect.left - headerRect.left)}px`;
+      newRow.style.width = `${Math.round(flexRect.width)}px`;
     } else {
       flexParent.appendChild(newRow);
     }
@@ -5580,17 +5787,21 @@
       fileQueue = [];
       autoPlaylistRunning = false;
       isProcessing = false;
-      uploadDoneCallback = null;
+      uploadDoneCallbacks.clear();
+      uploadingItemsByName.clear();
       dlTracks.clear();
       dlCancelFlag = true;
       dlpClose();
     }
 
     // Inject into VK's upload dialog whenever it appears;
-    // also re-inject if VK replaced the body content (success screen after upload)
+    // also re-inject if VK replaced the body content (success screen after upload) —
+    // but NOT if #vmu-embedded is missing because revealNativeUploadUI() just
+    // deliberately removed it (nativeUiRevealed) — this used to fight that
+    // reveal every ~120ms and put the dropzone straight back.
     const box = getUploadDialog();
     if (box && !box.dataset.vmuInjected) injectIntoVkDialog(box);
-    if (box && box.dataset.vmuInjected && !document.getElementById('vmu-embedded')) {
+    if (box && box.dataset.vmuInjected && !document.getElementById('vmu-embedded') && !nativeUiRevealed) {
       delete box.dataset.vmuInjected;
       injectIntoVkDialog(box);
     }

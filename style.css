@@ -102,6 +102,10 @@ html.vmu-theme-light {
   flex-shrink: 0;
 }
 .vmu-settings-btn-header:hover { background: rgba(var(--vmu-ov),0.13); color: var(--vmu-text); }
+/* SoundCloud button sits right before the settings gear (both injected next
+   to VK's native close button) with no gap of their own — VK's native
+   header flex has little to no gap, so the two circular icons touched. */
+#vmu-sc-btn { margin-right: 8px; }
 
 /* ── Settings panel ───────────────────────────────────────────────────────── */
 #vmu-settings-panel {
@@ -433,6 +437,19 @@ html.vmu-theme-light {
 }
 .vmu-action-btn:hover { background: rgba(var(--vmu-ov),0.08); color: var(--vmu-text); }
 .vmu-action-btn:active { background: rgba(var(--vmu-ov),0.14); }
+
+/* Daily upload counter, shown right under the pause button while a batch is
+   running — VK caps uploads at 70/account/day, this warns before you hit it. */
+.vmu-daily-count {
+  font-size: 9px;
+  line-height: 1.3;
+  color: var(--vmu-text-muted);
+  white-space: nowrap;
+  text-align: center;
+  cursor: default;
+  user-select: none;
+}
+.vmu-daily-count-warn { color: #e6a23c; font-weight: 700; }
 .vmu-action-btn svg { display: block; width: 12px; height: 12px; }
 
 /* Tooltip on hover — same VK overlay-style as elsewhere in the plugin */
@@ -507,19 +524,33 @@ html.vmu-theme-light {
 }
 
 /* ── Duplicate-track highlight ────────────────────────────────────────────── */
-/* Pulsing amber accent on the left edge + soft tint so duplicate rows are
-   visually obvious in the playlist popup. Works for both old VK (.audio_row)
-   and new VK (vkitAudioRow__root) layouts. */
-@keyframes vmu-dupe-pulse {
-  0%, 100% { box-shadow: inset 3px 0 0 rgba(245,166,35,0.85), 0 0 0 1px rgba(245,166,35,0.18); }
-  50%      { box-shadow: inset 3px 0 0 rgba(245,166,35,1),     0 0 0 1px rgba(245,166,35,0.42); }
+/* Blinking amber tint so duplicate rows are visually obvious in the playlist
+   popup. Works for both old VK (.audio_row) and new VK (vkitAudioRow__root)
+   layouts.
+   Used to be two coexisting layers — a static background gradient AND a
+   separately-animated box-shadow border — which read as two different
+   highlights stacked on the same row. Down to one layer now: a single
+   overlay (::before) that blinks via opacity. It's a pseudo-element rather
+   than animating the row's own `background` directly because that property
+   needed `!important` to beat VK's own row background on hover — and
+   `!important` inside @keyframes is invalid/dropped by browsers, so an
+   animated `background` would go transparent the moment the row is
+   hovered. An independent overlay element has no such conflict. */
+@keyframes vmu-dupe-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
 }
 .vmu-dupe-highlight {
   position: relative;
-  background: linear-gradient(90deg, rgba(245,166,35,0.14), rgba(245,166,35,0.04) 60%, transparent) !important;
+}
+.vmu-dupe-highlight::before {
+  content: '';
+  position: absolute;
+  inset: 0;
   border-radius: 6px;
-  animation: vmu-dupe-pulse 1.8s ease-in-out infinite;
-  transition: background .25s;
+  background: linear-gradient(90deg, rgba(245,166,35,0.32), rgba(245,166,35,0.1) 60%, transparent);
+  animation: vmu-dupe-blink 1.6s ease-in-out infinite;
+  pointer-events: none;
 }
 
 /* ── Unified issue panel (markers + blocked-tracks list) ──────────────────── */
@@ -590,17 +621,24 @@ html.vmu-theme-light {
   box-shadow: 0 0 5px rgba(230,70,70,0.7);
 }
 
-/* Row tint for VK-blocked / unavailable tracks (different from amber dupes) */
-@keyframes vmu-blocked-pulse {
-  0%, 100% { box-shadow: inset 3px 0 0 rgba(230,70,70,0.85), 0 0 0 1px rgba(230,70,70,0.18); }
-  50%      { box-shadow: inset 3px 0 0 rgba(230,70,70,1),     0 0 0 1px rgba(230,70,70,0.42); }
+/* Row tint for VK-blocked / unavailable tracks (different from amber dupes).
+   Same single-overlay-blink treatment as .vmu-dupe-highlight above, see
+   comment there — one ::before layer, no separate border layer. */
+@keyframes vmu-blocked-blink {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
 }
 .vmu-blocked-highlight {
   position: relative;
-  background: linear-gradient(90deg, rgba(230,70,70,0.16), rgba(230,70,70,0.04) 60%, transparent) !important;
+}
+.vmu-blocked-highlight::before {
+  content: '';
+  position: absolute;
+  inset: 0;
   border-radius: 6px;
-  animation: vmu-blocked-pulse 1.8s ease-in-out infinite;
-  transition: background .25s;
+  background: linear-gradient(90deg, rgba(230,70,70,0.34), rgba(230,70,70,0.1) 60%, transparent);
+  animation: vmu-blocked-blink 1.6s ease-in-out infinite;
+  pointer-events: none;
 }
 
 /* ── Blocked-tracks list column (inside #vmu-issue-panel) ─────────────────── */
@@ -762,6 +800,10 @@ html.vmu-theme-light {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  /* The row's container now matches the native button row's own width
+     (set from flexParent in content.js, not the full modal-body width like
+     before), so stretching to fill it lines up with how VK stretches its
+     own button subgroups instead of ballooning past them. */
   flex: 1;
   min-width: 0;
   height: 32px;
