@@ -1626,6 +1626,21 @@
     return null;
   }
 
+  // entity.url is no longer a getter on VK's track-entity class (verified live,
+  // 2026-07-31: Object.getOwnPropertyNames walk shows no `url` key at all) — the
+  // playable CDN URL now lives under apiAudio.url, with streamSources[0].url as
+  // a second source. Without this, every track looked url-less and fell through
+  // to the al_audio.php?act=reload_audio fallback, which then 400s with
+  // "bad_hash" for rows stamped via the new-VK path (no per-track hash to send).
+  function getEntityUrl(entity) {
+    return entity?.apiAudio?.url
+      || entity?.data?.apiAudio?.url
+      || entity?.streamSources?.[0]?.url
+      || entity?.data?.streamSources?.[0]?.url
+      || entity?.url
+      || null;
+  }
+
   // ── Playlist tail loader ─────────────────────────────────────────────────
   // The new playlist modal is hosted inside VK's OLD popup layer
   // (#box_layer_wrap), and VK's own IntersectionObserver tail-sentinel never
@@ -1703,7 +1718,7 @@
           id: expectedId,
           title: entity.title || entity.data?.title || '',
           artist,
-          url: entity.url || null,
+          url: getEntityUrl(entity),
           isBlocked: !!(entity.data?.isBlocked) || entity.data?.url === null,
         });
         marked++;
@@ -1743,7 +1758,7 @@
             id: trackId,
             title: entity.title || entity.data?.title || '',
             artist: artistName,
-            url: entity.url || null,
+            url: getEntityUrl(entity),
             duration: entity.duration || 0,
           });
           continue;
