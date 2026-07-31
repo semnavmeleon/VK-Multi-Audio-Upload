@@ -2599,8 +2599,8 @@
   // (fx.chainOrder) — lives inside the single 'vmu-limiter' worklet node from
   // limiter-worklet.js. The EQ moved in there from native BiquadFilterNodes so
   // reordering never has to splice the Web Audio graph (glitch-free, and lets
-  // the EQ sit between the two dynamics stages); band gains travel as
-  // AudioParams band0..band9.
+  // the EQ sit between the two dynamics stages); band gain/frequency travel
+  // as AudioParams band0..band9 / freq0..freq9.
   (function () {
     const EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
@@ -2624,7 +2624,7 @@
       threshold: -3, ratio: 4, inputGain: 0, outputGain: 0, attack: 3, release: 250,
       knee: 0, ceiling: -0.3, ceilingR: -0.3, limRelease: 50, limGain: 0, style: 3, autoRelease: false,
       truePeakMode: false, autoGain: false, oversampling: 1, processingMode: 0, chainOrder: 0,
-      bands: EQ_FREQS.map(() => 0),
+      bands: EQ_FREQS.map(f => ({ freq: f, gain: 0, q: 1.41 })),
     };
     const graphs = new WeakMap(); // audioEl -> { limiter }
     const attachedEls = new Set();
@@ -2657,7 +2657,11 @@
       setParam(lim, 'compEnabled', compEnabled ? 1 : 0);
       setParam(lim, 'eqEnabled', eqEnabled ? 1 : 0);
       setParam(lim, 'chainOrder', fx.chainOrder);
-      fx.bands.forEach((gDb, i) => setParam(lim, 'band' + i, gDb || 0));
+      fx.bands.forEach((b, i) => {
+        setParam(lim, 'band' + i, b.gain || 0);
+        setParam(lim, 'freq' + i, b.freq || EQ_FREQS[i]);
+        setParam(lim, 'q' + i, b.q || 1.41);
+      });
       setParam(lim, 'threshold', fx.threshold);
       setParam(lim, 'ratio', fx.ratio);
       setParam(lim, 'attack', fx.attack);
@@ -2809,7 +2813,15 @@
       fx.autoGain = !!e.data.autoGain;
       fx.processingMode = Math.max(0, Math.min(2, Math.round(Number(e.data.processingMode)) || 0));
       fx.chainOrder = Math.max(0, Math.min(5, Math.round(Number(e.data.chainOrder)) || 0));
-      if (Array.isArray(e.data.bands)) fx.bands = e.data.bands.map(v => Number(v) || 0);
+      // Accepts the current {freq,gain,q} shape, the earlier {freq,gain}
+      // shape (pre-width-drag), and the original plain-number shape
+      // (pre-parametric EQ) — so an in-flight content.js from before either
+      // change can't send a payload this side can't parse.
+      if (Array.isArray(e.data.bands)) {
+        fx.bands = e.data.bands.map((b, i) => (b && typeof b === 'object')
+          ? { freq: Number(b.freq) || EQ_FREQS[i], gain: Number(b.gain) || 0, q: Number(b.q) > 0 ? Number(b.q) : 1.41 }
+          : { freq: EQ_FREQS[i], gain: Number(b) || 0, q: 1.41 });
+      }
 
       // Attach to whatever's already playing right away, instead of waiting
       // for the next play()/track change, so toggling any switch (or dialing
@@ -2838,7 +2850,7 @@
         meteringActive: val('meteringActive'), autoGain: val('autoGain'), processingMode: val('processingMode'),
         lastMeterDb, lastLimMeterDb, lastInputPeakDb, lastTruePeakDb,
         lastMomentaryLufs, lastShortTermLufs, lastIntegratedLufs, lastLra, lastAutoGainTrimDb,
-        bands: EQ_FREQS.map((_, i) => val('band' + i)),
+        bands: EQ_FREQS.map((_, i) => ({ freq: val('freq' + i), gain: val('band' + i), q: val('q' + i) })),
         ctxState: ctx && ctx.state,
       };
     });

@@ -12,8 +12,9 @@
 //  - EQ: RBJ-cookbook peaking biquads (the same formula BiquadFilterNode is
 //    specced to implement, Q=1.41) — moved inside the worklet from native
 //    BiquadFilterNodes so the chain order can put the EQ anywhere, including
-//    between the two dynamics stages. Band gains smooth over ~40ms before
-//    coefficient redesign, so slider drags don't zipper.
+//    between the two dynamics stages. Band gain AND center frequency (each
+//    freely draggable on content.js's EQ graph) smooth over ~40ms before
+//    coefficient redesign, so drags don't zipper.
 //  - Compressor: the original envelope compressor unchanged in character —
 //    threshold/ratio/knee/styles/auto-release/auto-gain, Linked/Unlinked/M-S.
 //    Detection and gain application now happen on the same sample (the 5ms
@@ -290,8 +291,18 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
       { name: 'oversampling', defaultValue: 1, minValue: 0, maxValue: 3, automationRate: 'k-rate' },
       // ── EQ stage ──
       { name: 'eqEnabled', defaultValue: 0, minValue: 0, maxValue: 1, automationRate: 'k-rate' },
-      ...EQ_FREQS.map((_, i) => (
+      ...EQ_FREQS.map((f, i) => (
         { name: 'band' + i, defaultValue: 0, minValue: -12, maxValue: 12, automationRate: 'k-rate' }
+      )),
+      // Per-band center frequency — draggable horizontally in content.js's EQ
+      // graph, independent of the fixed ISO defaults in EQ_FREQS.
+      ...EQ_FREQS.map((f, i) => (
+        { name: 'freq' + i, defaultValue: f, minValue: 20, maxValue: 20000, automationRate: 'k-rate' }
+      )),
+      // Per-band Q (bandwidth/width) — mouse-wheel-adjustable on a band's dot
+      // in content.js's EQ graph. Same range as the graph's own clamp.
+      ...EQ_FREQS.map((_, i) => (
+        { name: 'q' + i, defaultValue: EQ_Q, minValue: 0.3, maxValue: 8, automationRate: 'k-rate' }
       )),
       // ── Global ──
       // Index into CHAIN_ORDERS — which permutation of EQ/Comp/Lim runs.
@@ -343,10 +354,12 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
     this._lEnvDb = 0;
     this._lEnvDbLane = new Float64Array(2);
 
-    // EQ stage: current (smoothed) gain per band, designed coefficients
-    // (null = band at 0dB, stage skips it), and DF1 state allocated per
-    // channel count in _ensureBuffers.
+    // EQ stage: current (smoothed) gain + center frequency + Q (width) per
+    // band, designed coefficients (null = band at 0dB, stage skips it), and
+    // DF1 state allocated per channel count in _ensureBuffers.
     this._eqGainCur = new Float64Array(EQ_FREQS.length);
+    this._eqFreqCur = Float64Array.from(EQ_FREQS);
+    this._eqQCur = new Float64Array(EQ_FREQS.length).fill(EQ_Q);
     this._eqCoeffs = new Array(EQ_FREQS.length).fill(null);
     this._eqState = null;
 
@@ -490,22 +503,45 @@ class VmuLimiterProcessor extends AudioWorkletProcessor {
 
     const frames = input[0].length;
 
-    // EQ per-block prep: smooth each band's gain toward its target (0 when
-    // the EQ is bypassed, so disabling fades to identity instead of
-    // clicking), redesign that band's coefficients only when the gain
-    // actually moved. null coefficients mark a band at 0dB — the per-sample
-    // loop skips those entirely.
+    // EQ per-block prep: smooth each band's gain, center frequency AND Q
+    // toward their targets (gain 0 when the EQ is bypassed, so disabling
+    // fades to identity instead of clicking; freq/Q smoothed the same way so
+    // dragging or wheel-adjusting a band's dot re-tunes instead of
+    // zippering), redesign that band's coefficients only when any of the
+    // three actually moved. null coefficients mark a band at 0dB — the
+    // per-sample loop skips those entirely.
     const eqSmooth = 1 - Math.exp(-frames / (sampleRate * EQ_GAIN_SMOOTH_SEC));
     const eqCoeffs = this._eqCoeffs;
     for (let b = 0; b < EQ_FREQS.length; b++) {
-      const p = parameters['band' + b];
-      const target = eqEnabled && p ? Math.max(-12, Math.min(12, p[0])) : 0;
-      let cur = this._eqGainCur[b];
-      if (cur !== target) {
-        cur += (target - cur) * eqSmooth;
-        if (Math.abs(target - cur) < 0.01) cur = target;
-        this._eqGainCur[b] = cur;
-        eqCoeffs[b] = Math.abs(cur) > 0.01 ? designBiquadPeaking(EQ_FREQS[b], cur, EQ_Q, sampleRate) : null;
+      const gp = parameters['band' + b];
+      const fp = parameters['freq' + b];
+      const qp = parameters['q' + b];
+      const targetGain = eqEnabled && gp ? Math.max(-12, Math.min(12, gp[0])) : 0;
+      const targetFreq = fp ? Math.max(20, Math.min(20000, fp[0])) : EQ_FREQS[b];
+      const targetQ = qp ? Math.max(0.3, Math.min(8, qp[0])) : EQ_Q;
+      let curGain = this._eqGainCur[b];
+      let curFreq = this._eqFreqCur[b];
+      let curQ = this._eqQCur[b];
+      const gainMoving = curGain !== targetGain;
+      const freqMoving = curFreq !== targetFreq;
+      const qMoving = curQ !== targetQ;
+      if (gainMoving || freqMoving || qMoving) {
+        if (gainMoving) {
+          curGain += (targetGain - curGain) * eqSmooth;
+          if (Math.abs(targetGain - curGain) < 0.01) curGain = targetGain;
+          this._eqGainCur[b] = curGain;
+        }
+        if (freqMoving) {
+          curFreq += (targetFreq - curFreq) * eqSmooth;
+          if (Math.abs(targetFreq - curFreq) < 0.5) curFreq = targetFreq;
+          this._eqFreqCur[b] = curFreq;
+        }
+        if (qMoving) {
+          curQ += (targetQ - curQ) * eqSmooth;
+          if (Math.abs(targetQ - curQ) < 0.005) curQ = targetQ;
+          this._eqQCur[b] = curQ;
+        }
+        eqCoeffs[b] = Math.abs(curGain) > 0.01 ? designBiquadPeaking(curFreq, curGain, curQ, sampleRate) : null;
       }
     }
 

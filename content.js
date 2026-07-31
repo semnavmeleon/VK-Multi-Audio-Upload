@@ -182,14 +182,19 @@
     try { localStorage.setItem(DAILY_UPLOAD_KEY, JSON.stringify({ date: todayStr(), count })); } catch {}
     return count;
   }
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  // ISO 10-band defaults — a band's default position, and where "reset"
+  // returns it to, but no longer a hard limit: each band's own {freq,gain,q}
+  // in settings.audioFxBands below can drift anywhere via the EQ graph drag
+  // (freq) / wheel (q, bandwidth).
+  const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+  const EQ_DEFAULT_Q = 1.41; // RBJ-cookbook default — matches BiquadFilterNode's own peaking-EQ default
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
   // the worklet module, so the knee formula's shape constants are duplicated
   // here. Keep in sync if STYLE_PRESETS changes.
   const AUDIOFX_STYLE_KNEE_SHAPES = [3.0, 2.5, 2.0, 2.0, 1.6, 1.3, 1.0];
-  const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   const AUDIOFX_OVERSAMPLE_LABELS = ['2x', '4x', '8x', '16x'];
   // Label i must describe limiter-worklet.js's CHAIN_ORDERS[i] — the dropdown
   // index is sent as the worklet's chainOrder param verbatim. Keep in sync.
@@ -210,12 +215,29 @@
   ];
   const AUDIOFX_PRESETS_KEY = 'vmu_audiofx_presets_v1';
 
+  // Migrates audioFxBands from the pre-parametric-EQ shape (plain numbers,
+  // frequency implied by array index into AUDIOFX_FREQS) or the earlier
+  // {freq,gain}-only shape (pre-width-drag) to the current {freq,gain,q}
+  // objects — each band's center frequency and width are now themselves
+  // adjustable, so both have to be stored per-band instead of read off a
+  // fixed ISO array / shared constant. Idempotent: already-migrated arrays
+  // pass through unchanged.
+  function migrateEqBands(bands) {
+    if (!Array.isArray(bands) || bands.length !== AUDIOFX_FREQS.length) {
+      return AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q }));
+    }
+    return bands.map((b, i) => (b && typeof b === 'object')
+      ? { freq: Number(b.freq) || AUDIOFX_FREQS[i], gain: Number(b.gain) || 0, q: Number(b.q) > 0 ? Number(b.q) : EQ_DEFAULT_Q }
+      : { freq: AUDIOFX_FREQS[i], gain: Number(b) || 0, q: EQ_DEFAULT_Q });
+  }
+
   function loadSettings() {
     try {
       const s = localStorage.getItem(SETTINGS_KEY);
       if (s) {
         const parsed = JSON.parse(s);
         Object.assign(settings, parsed);
+        settings.audioFxBands = migrateEqBands(settings.audioFxBands);
         // Migrates the old single audioFxEnabled master toggle (pre-split)
         // into the two independent limiter/EQ toggles the first time a
         // settings blob saved before the split is loaded, so existing users
@@ -279,10 +301,14 @@
     // reference. Without this, A/B slots (and presets) captured while
     // sharing the live settings.audioFxBands array would alias each other:
     // editing EQ bands on slot B would silently mutate slot A's stored snapshot
-    // too, since both would still point at the same underlying array.
+    // too, since both would still point at the same underlying array. Each
+    // element is itself an object now (freq+gain+q) — clone those too, so a
+    // future in-place mutation of one band can't leak across snapshots.
     for (const key of AUDIOFX_FIELD_KEYS) {
       const v = settings[key];
-      snap[key] = Array.isArray(v) ? v.slice() : v;
+      snap[key] = key === 'audioFxBands'
+        ? v.map(b => ({ freq: b.freq, gain: b.gain, q: b.q }))
+        : (Array.isArray(v) ? v.slice() : v);
     }
     return snap;
   }
@@ -299,6 +325,7 @@
     if (snap.audioFxCompEnabled === undefined) snap.audioFxCompEnabled = !!snap.audioFxLimiterEnabled;
     if (snap.audioFxLimRelease === undefined) snap.audioFxLimRelease = 50;
     if (snap.audioFxChainOrder === undefined) snap.audioFxChainOrder = 0;
+    snap.audioFxBands = migrateEqBands(snap.audioFxBands);
     return snap;
   }
   function presetCategoryOf(entry) { return (entry && entry.category) || 'Без категории'; }
@@ -485,12 +512,13 @@
     return Math.min(inputDb - reductionDb, settings.audioFxCeiling);
   }
 
-  // Mirrors limiter-worklet.js's designBiquadPeaking (RBJ cookbook peaking EQ,
-  // same Q) so this canvas can plot the combined curve without any DSP state.
-  // fs is a nominal 48kHz — close enough for a visualization; band centers
-  // topping out at 16kHz are far enough below Nyquist at 44.1k too that the
-  // curve shape doesn't meaningfully shift.
-  const EQ_CURVE_Q = 1.41;
+  // Mirrors limiter-worklet.js's designBiquadPeaking (RBJ cookbook peaking EQ)
+  // so this canvas can plot each band's curve without any DSP state — Q comes
+  // from the band itself (settings.audioFxBands[i].q) rather than a shared
+  // constant, same as the worklet's own per-band q0..q9 AudioParams. fs is a
+  // nominal 48kHz — close enough for a visualization; band centers topping
+  // out at 16kHz are far enough below Nyquist at 44.1k too that the curve
+  // shape doesn't meaningfully shift.
   const EQ_CURVE_FS = 48000;
   function designBiquadPeakingForCurve(f0, gainDb, Q, fs) {
     const A = Math.pow(10, gainDb / 40);
@@ -521,14 +549,42 @@
     const denMag = Math.sqrt(denRe * denRe + denIm * denIm);
     return 20 * Math.log10(numMag / denMag);
   }
-  function eqCurveOutputDb(freq) {
-    let totalDb = 0;
-    settings.audioFxBands.forEach((g, i) => {
-      if (Math.abs(g) < 0.01) return;
-      totalDb += biquadMagnitudeDb(designBiquadPeakingForCurve(AUDIOFX_FREQS[i], g, EQ_CURVE_Q, EQ_CURVE_FS), freq, EQ_CURVE_FS);
-    });
-    return totalDb;
+  // Shared coordinate mapping between drawEqCurve's rendering and the pointer
+  // drag handler in wireEqCanvasDrag — both need to agree pixel-for-pixel on
+  // where a given {freq,gain} sits, or dots would render in one place and
+  // hit-test/drag in another. Frequency axis is log (20Hz–20kHz, matches the
+  // worklet's freq0..9 AudioParam range); gain axis is linear with headroom
+  // past the ±12dB a band can actually be set to, so full-scale dots don't
+  // touch the graph edges.
+  const EQ_GRAPH_FREQ_MIN = 20, EQ_GRAPH_FREQ_MAX = 20000;
+  const EQ_GRAPH_LOG_MIN = Math.log10(EQ_GRAPH_FREQ_MIN), EQ_GRAPH_LOG_MAX = Math.log10(EQ_GRAPH_FREQ_MAX);
+  const EQ_GRAPH_DB_MIN = -15, EQ_GRAPH_DB_MAX = 15;
+  function eqXOfFreq(f, w) {
+    const clamped = Math.max(EQ_GRAPH_FREQ_MIN, Math.min(EQ_GRAPH_FREQ_MAX, f));
+    return (Math.log10(clamped) - EQ_GRAPH_LOG_MIN) / (EQ_GRAPH_LOG_MAX - EQ_GRAPH_LOG_MIN) * w;
   }
+  function eqFreqOfX(x, w) {
+    const t = Math.max(0, Math.min(1, x / w));
+    return Math.pow(10, EQ_GRAPH_LOG_MIN + (EQ_GRAPH_LOG_MAX - EQ_GRAPH_LOG_MIN) * t);
+  }
+  function eqYOfGain(db, h) {
+    return h - (Math.max(EQ_GRAPH_DB_MIN, Math.min(EQ_GRAPH_DB_MAX, db)) - EQ_GRAPH_DB_MIN) / (EQ_GRAPH_DB_MAX - EQ_GRAPH_DB_MIN) * h;
+  }
+  function eqGainOfY(y, h) {
+    const t = Math.max(0, Math.min(1, 1 - y / h));
+    return EQ_GRAPH_DB_MIN + (EQ_GRAPH_DB_MAX - EQ_GRAPH_DB_MIN) * t;
+  }
+
+  // Which band the pointer is currently dragging/hovering on the EQ graph
+  // (-1 = none) — read by drawEqCurve to highlight the active dot + draw its
+  // label, written by wireEqCanvasDrag's pointer/wheel handlers. eqPointerActive
+  // distinguishes an actual in-progress pointer drag from the transient
+  // highlight a wheel-adjust (no pointer down) also drives through the same
+  // eqDragBandIdx, so the wheel's auto-clear timeout can't stomp a real drag.
+  let eqDragBandIdx = -1;
+  let eqHoverBandIdx = -1;
+  let eqPointerActive = false;
+  let eqWheelHighlightTimer = null;
 
   function drawEqCurve() {
     if (settings.audioFxActiveTab !== 'eq') return;
@@ -539,43 +595,185 @@
     const { ctx, w: W, h: H } = sized;
     ctx.clearRect(0, 0, W, H);
 
-    const freqMin = 20, freqMax = 20000;
-    const logMin = Math.log10(freqMin), logMax = Math.log10(freqMax);
-    const xOf = f => (Math.log10(f) - logMin) / (logMax - logMin) * W;
-    const dbMin = -15, dbMax = 15;
-    const yOf = db => H - (Math.max(dbMin, Math.min(dbMax, db)) - dbMin) / (dbMax - dbMin) * H;
+    const xOf = f => eqXOfFreq(f, W);
+    const yOf = db => eqYOfGain(db, H);
 
     ctx.strokeStyle = 'rgba(255,255,255,0.06)';
     ctx.lineWidth = 1;
     [100, 1000, 10000].forEach(f => {
       ctx.beginPath(); ctx.moveTo(xOf(f) + 0.5, 0); ctx.lineTo(xOf(f) + 0.5, H); ctx.stroke();
     });
-    for (let db = dbMin; db <= dbMax; db += 6) {
+    for (let db = EQ_GRAPH_DB_MIN; db <= EQ_GRAPH_DB_MAX; db += 6) {
       ctx.beginPath(); ctx.moveTo(0, yOf(db) + 0.5); ctx.lineTo(W, yOf(db) + 0.5); ctx.stroke();
     }
 
     ctx.strokeStyle = 'rgba(255,255,255,0.16)';
     ctx.beginPath(); ctx.moveTo(0, yOf(0) + 0.5); ctx.lineTo(W, yOf(0) + 0.5); ctx.stroke();
 
-    ctx.strokeStyle = '#2688eb';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    const STEPS = 200;
-    for (let i = 0; i <= STEPS; i++) {
-      const f = Math.pow(10, logMin + (logMax - logMin) * i / STEPS);
-      const x = xOf(f), y = yOf(eqCurveOutputDb(f));
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // Each band's own center-frequency/gain point — lines up with its slider
-    // below so the curve and the controls read as the same instrument.
-    ctx.fillStyle = '#ffffff';
-    settings.audioFxBands.forEach((g, i) => {
+    // Each band's own isolated bump — what THAT band alone does to the
+    // spectrum, ignoring every other band — as a filled, translucent "wave"
+    // rising (or dipping) from the 0dB line. No combined/summed curve is
+    // drawn on top — each band reads as its own independent shape.
+    const BAND_STEPS = 120;
+    settings.audioFxBands.forEach((b, i) => {
+      if (Math.abs(b.gain) < 0.01) return;
+      const active = i === eqDragBandIdx || i === eqHoverBandIdx;
+      const co = designBiquadPeakingForCurve(b.freq, b.gain, b.q, EQ_CURVE_FS);
+      const y0 = yOf(0);
       ctx.beginPath();
-      ctx.arc(xOf(AUDIOFX_FREQS[i]), yOf(g), 2.5, 0, Math.PI * 2);
+      ctx.moveTo(0, y0);
+      for (let s = 0; s <= BAND_STEPS; s++) {
+        const f = Math.pow(10, EQ_GRAPH_LOG_MIN + (EQ_GRAPH_LOG_MAX - EQ_GRAPH_LOG_MIN) * s / BAND_STEPS);
+        ctx.lineTo(xOf(f), yOf(biquadMagnitudeDb(co, f, EQ_CURVE_FS)));
+      }
+      ctx.lineTo(W, y0);
+      ctx.closePath();
+      ctx.fillStyle = active ? 'rgba(38,136,235,0.20)' : 'rgba(38,136,235,0.09)';
       ctx.fill();
+      ctx.strokeStyle = active ? 'rgba(38,136,235,0.65)' : 'rgba(38,136,235,0.30)';
+      ctx.lineWidth = active ? 1.5 : 1;
+      ctx.stroke();
     });
+
+    // Each band's own draggable center-frequency/gain point — lines up with
+    // its slider below so the curve and the controls read as the same
+    // instrument. Hovered/dragged dot draws larger + filled blue so there's
+    // always a clear "what am I about to grab / what am I moving" cue.
+    settings.audioFxBands.forEach((b, i) => {
+      const active = i === eqDragBandIdx || i === eqHoverBandIdx;
+      ctx.beginPath();
+      ctx.arc(xOf(b.freq), yOf(b.gain), active ? 5.5 : 3, 0, Math.PI * 2);
+      ctx.fillStyle = active ? '#2688eb' : '#ffffff';
+      ctx.fill();
+      if (active) {
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+        ctx.stroke();
+      }
+    });
+
+    if (eqDragBandIdx >= 0) {
+      const b = settings.audioFxBands[eqDragBandIdx];
+      const label = `${formatFreqLabel(Math.round(b.freq))} Гц · ${fmtBandDb(b.gain)} дБ · Q ${b.q.toFixed(2)}`;
+      const x = xOf(b.freq), y = yOf(b.gain);
+      ctx.font = '11px sans-serif';
+      const tw = ctx.measureText(label).width;
+      let lx = x + 9; if (lx + tw + 4 > W) lx = x - tw - 9;
+      let ly = y - 9; if (ly < 11) ly = y + 19;
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.fillText(label, lx, ly);
+    }
+  }
+
+  // Makes the EQ graph itself draggable: pointerdown on (near) a band's dot
+  // grabs it, horizontal movement re-tunes that band's center frequency
+  // (log-mapped, 20Hz–20kHz), vertical movement sets its gain (±12dB), and
+  // the mouse wheel over a dot narrows/widens it (Q 0.3–8, the same "how far
+  // does this band's own bump reach" the filled wave already draws) — all
+  // three inline on the graph, no separate width control elsewhere. The
+  // per-band vertical sliders below the graph remain as a gain-only, more
+  // precise complement, kept in sync with whatever the graph drag/wheel does.
+  function wireEqCanvasDrag() {
+    const canvas = document.getElementById('vmu-fx-eq-curve');
+    if (!canvas) return;
+    const HIT_RADIUS = 12; // CSS px — generous since the dots themselves render smaller
+
+    function bandNear(clientX, clientY) {
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left, y = clientY - rect.top;
+      let best = -1, bestDist = HIT_RADIUS;
+      settings.audioFxBands.forEach((b, i) => {
+        const d = Math.hypot(eqXOfFreq(b.freq, rect.width) - x, eqYOfGain(b.gain, rect.height) - y);
+        if (d < bestDist) { bestDist = d; best = i; }
+      });
+      return best;
+    }
+
+    function syncBandControls(i) {
+      const b = settings.audioFxBands[i];
+      const slider = document.getElementById(`vmu-fx-band-${i}`);
+      if (slider) slider.value = String(b.gain);
+      const valEl = document.getElementById(`vmu-fx-band-${i}-val`);
+      if (valEl) valEl.textContent = fmtBandDb(b.gain);
+      const freqEl = document.getElementById(`vmu-fx-band-${i}-freq`);
+      if (freqEl) freqEl.textContent = formatFreqLabel(Math.round(b.freq));
+    }
+
+    canvas.addEventListener('pointerdown', (e) => {
+      const idx = bandNear(e.clientX, e.clientY);
+      if (idx < 0) return;
+      e.preventDefault();
+      clearTimeout(eqWheelHighlightTimer);
+      eqPointerActive = true;
+      eqDragBandIdx = idx;
+      canvas.setPointerCapture(e.pointerId);
+      canvas.style.cursor = 'grabbing';
+    });
+
+    canvas.addEventListener('pointermove', (e) => {
+      if (eqPointerActive && eqDragBandIdx >= 0) {
+        const rect = canvas.getBoundingClientRect();
+        const freq = Math.round(eqFreqOfX(e.clientX - rect.left, rect.width));
+        const gain = Math.max(-12, Math.min(12, Math.round(eqGainOfY(e.clientY - rect.top, rect.height) * 10) / 10));
+        settings.audioFxBands[eqDragBandIdx] = { freq, gain, q: settings.audioFxBands[eqDragBandIdx].q };
+        syncBandControls(eqDragBandIdx);
+        postAudioFxState();
+      } else {
+        eqHoverBandIdx = bandNear(e.clientX, e.clientY);
+        canvas.style.cursor = eqHoverBandIdx >= 0 ? 'grab' : 'default';
+      }
+    });
+
+    function endDrag(e) {
+      if (!eqPointerActive) return;
+      try { canvas.releasePointerCapture(e.pointerId); } catch {}
+      eqPointerActive = false;
+      eqDragBandIdx = -1;
+      canvas.style.cursor = 'default';
+      saveSettings();
+    }
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+    canvas.addEventListener('pointerleave', () => { if (!eqPointerActive) eqHoverBandIdx = -1; });
+
+    // Double-click a dot resets just that band (frequency, gain AND width)
+    // back to its ISO default — mirrors the per-slider dblclick-to-zero
+    // below, but this one also undoes a frequency/width change, which the
+    // slider can't touch.
+    canvas.addEventListener('dblclick', (e) => {
+      const idx = bandNear(e.clientX, e.clientY);
+      if (idx < 0) return;
+      settings.audioFxBands[idx] = { freq: AUDIOFX_FREQS[idx], gain: 0, q: EQ_DEFAULT_Q };
+      syncBandControls(idx);
+      saveSettings();
+      postAudioFxState();
+    });
+
+    // Wheel over a dot narrows/widens that band (Q) — multiplicative steps
+    // since Q is perceived logarithmically (the jump from 0.5→1 and 4→8 both
+    // "sound like" one notch). Gain already has its own axis (vertical drag)
+    // and its own precise control (the slider below), so wheel is free to
+    // mean width here instead of duplicating that. Briefly reuses
+    // eqDragBandIdx to flash the dot + label (same visual the drag itself
+    // uses) so the change is visible without holding a mouse button down.
+    canvas.addEventListener('wheel', (e) => {
+      const idx = bandNear(e.clientX, e.clientY);
+      if (idx < 0) return;
+      e.preventDefault();
+      const factor = e.shiftKey ? 1.04 : 1.12;
+      const b = settings.audioFxBands[idx];
+      const q = Math.max(0.3, Math.min(8, Math.round(b.q * (e.deltaY < 0 ? factor : 1 / factor) * 100) / 100));
+      settings.audioFxBands[idx] = { freq: b.freq, gain: b.gain, q };
+      saveSettings();
+      postAudioFxState();
+      if (!eqPointerActive) {
+        eqDragBandIdx = idx;
+        clearTimeout(eqWheelHighlightTimer);
+        eqWheelHighlightTimer = setTimeout(() => {
+          if (!eqPointerActive) eqDragBandIdx = -1;
+        }, 900);
+      }
+    }, { passive: false });
   }
 
   // Resizes the canvas' backing buffer to match its CSS size at the current
@@ -1019,11 +1217,11 @@
     // combined with the live numeric readout and the wheel/dblclick handlers
     // wired in attachAudioFxHandlers, dragging a 90px-tall slider by hand is
     // no longer the only way to land on a precise value.
-    const bands = settings.audioFxBands.map((g, i) => `
+    const bands = settings.audioFxBands.map((b, i) => `
       <div class="vmu-eq-band">
-        <span class="vmu-eq-band-val" id="vmu-fx-band-${i}-val">${fmtBandDb(g)}</span>
-        <input type="range" id="vmu-fx-band-${i}" class="vmu-eq-band-slider" min="-12" max="12" step="0.1" value="${g}" title="Колесо мыши — шаг 0.5 дБ (Shift — 0.1 дБ), двойной клик — сброс полосы" orient="vertical">
-        <span class="vmu-eq-band-freq">${formatFreqLabel(AUDIOFX_FREQS[i])}</span>
+        <span class="vmu-eq-band-val" id="vmu-fx-band-${i}-val">${fmtBandDb(b.gain)}</span>
+        <input type="range" id="vmu-fx-band-${i}" class="vmu-eq-band-slider" min="-12" max="12" step="0.1" value="${b.gain}" title="Колесо мыши — шаг 0.5 дБ (Shift — 0.1 дБ), двойной клик — сброс полосы" orient="vertical">
+        <span class="vmu-eq-band-freq" id="vmu-fx-band-${i}-freq">${formatFreqLabel(Math.round(b.freq))}</span>
       </div>`).join('');
 
     const tab = settings.audioFxActiveTab || 'compressor';
@@ -1190,7 +1388,7 @@
             <div class="vmu-audiofx-section">
               <div class="vmu-setting-row">
                 <div class="vmu-setting-info">
-                  <span class="vmu-setting-label">Эквалайзер${helpIcon('Включает/выключает 10-полосный графический эквалайзер.')}</span>
+                  <span class="vmu-setting-label">Эквалайзер${helpIcon('Включает/выключает 10-полосный параметрический эквалайзер.')}</span>
                 </div>
                 <label class="vmu-toggle">
                   <input type="checkbox" id="vmu-fx-eq-enable" ${settings.audioFxEqEnabled ? 'checked' : ''}>
@@ -1198,10 +1396,10 @@
                 </label>
               </div>
               <div class="vmu-audiofx-canvas-wrap">
-                <canvas id="vmu-fx-eq-curve" class="vmu-audiofx-canvas"></canvas>
+                <canvas id="vmu-fx-eq-curve" class="vmu-audiofx-canvas vmu-eq-canvas-interactive"></canvas>
               </div>
               <div class="vmu-audiofx-section-title">
-                <span>Полосы${helpIcon('10 полос по стандартной ISO-сетке частот (31 Гц – 16 кГц), каждая ±12 дБ. Колесо мыши на полосе — шаг 0.5 дБ (Shift — 0.1 дБ), двойной клик — сброс полосы.')}</span>
+                <span>Полосы${helpIcon('10 полос, по умолчанию на стандартной ISO-сетке (31 Гц – 16 кГц), каждая ±12 дБ. Точки на графике выше можно тащить прямо мышью: вертикально — громкость полосы, горизонтально — её частота. Колесо мыши на точке графика — ширина полосы (Shift — мельче шаг); колесо на полосе ниже — громкость (шаг 0.5 дБ, Shift — 0.1 дБ). Двойной клик по точке или полосе — сброс.')}</span>
                 <button type="button" id="vmu-fx-eq-reset" class="vmu-slider-reset" title="Сбросить все полосы">↺</button>
               </div>
               <div class="vmu-eq-bands-row">
@@ -1300,11 +1498,13 @@
       if (val) val.textContent = fmt(settings[key]);
     }
 
-    settings.audioFxBands.forEach((g, i) => {
+    settings.audioFxBands.forEach((b, i) => {
       const slider = document.getElementById(`vmu-fx-band-${i}`);
-      if (slider) slider.value = String(g);
+      if (slider) slider.value = String(b.gain);
       const val = document.getElementById(`vmu-fx-band-${i}-val`);
-      if (val) val.textContent = fmtBandDb(g);
+      if (val) val.textContent = fmtBandDb(b.gain);
+      const freqEl = document.getElementById(`vmu-fx-band-${i}-freq`);
+      if (freqEl) freqEl.textContent = formatFreqLabel(Math.round(b.freq));
     });
   }
 
@@ -1735,48 +1935,52 @@
     // (startMeterLoop/paintMeters) — see the "audio FX metering" block above,
     // started/stopped alongside the panel's open/close state below.
 
+    // The vertical slider only ever touches gain — frequency for that band is
+    // whatever the EQ graph (wireEqCanvasDrag, wired below) last set it to.
     settings.audioFxBands.forEach((_, i) => {
       const slider = document.getElementById(`vmu-fx-band-${i}`);
       if (!slider) return;
       const valEl = document.getElementById(`vmu-fx-band-${i}-val`);
-      const setBand = (v) => {
+      const setGain = (v) => {
         v = Math.max(-12, Math.min(12, Math.round(v * 10) / 10));
-        settings.audioFxBands[i] = v;
+        settings.audioFxBands[i] = { freq: settings.audioFxBands[i].freq, gain: v, q: settings.audioFxBands[i].q };
         slider.value = String(v);
         if (valEl) valEl.textContent = fmtBandDb(v);
         postAudioFxState();
       };
       slider.addEventListener('input', () => {
-        settings.audioFxBands[i] = parseFloat(slider.value) || 0;
-        if (valEl) valEl.textContent = fmtBandDb(settings.audioFxBands[i]);
-        postAudioFxState();
+        setGain(parseFloat(slider.value) || 0);
       });
       slider.addEventListener('change', saveSettings);
       // Precision helpers — a 90px vertical slider is too short to land on a
       // specific tenth of a dB by hand alone: wheel nudges in fixed steps
       // (0.5dB per notch, 0.1dB with Shift for fine trim), double-click
-      // zeroes just that one band instead of resetting the whole curve.
+      // zeroes just that one band's gain instead of resetting the whole curve.
       slider.addEventListener('wheel', e => {
         e.preventDefault();
         const step = e.shiftKey ? 0.1 : 0.5;
-        setBand(settings.audioFxBands[i] + (e.deltaY < 0 ? step : -step));
+        setGain(settings.audioFxBands[i].gain + (e.deltaY < 0 ? step : -step));
         saveSettings();
       }, { passive: false });
       slider.addEventListener('dblclick', () => {
-        setBand(0);
+        setGain(0);
         saveSettings();
       });
     });
 
+    wireEqCanvasDrag();
+
     const eqReset = document.getElementById('vmu-fx-eq-reset');
     if (eqReset) {
       eqReset.addEventListener('click', () => {
-        settings.audioFxBands = settings.audioFxBands.map(() => 0);
-        settings.audioFxBands.forEach((_, i) => {
+        settings.audioFxBands = AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q }));
+        settings.audioFxBands.forEach((b, i) => {
           const slider = document.getElementById(`vmu-fx-band-${i}`);
           if (slider) slider.value = '0';
           const valEl = document.getElementById(`vmu-fx-band-${i}-val`);
           if (valEl) valEl.textContent = fmtBandDb(0);
+          const freqEl = document.getElementById(`vmu-fx-band-${i}-freq`);
+          if (freqEl) freqEl.textContent = formatFreqLabel(b.freq);
         });
         saveSettings();
         postAudioFxState();

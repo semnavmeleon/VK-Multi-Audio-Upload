@@ -2012,6 +2012,10 @@ html.vmu-theme-light {
   height: 120px;
 }
 .vmu-audiofx-canvas-history { height: 80px; }
+/* Default cursor before the first hover-driven cursor swap (see
+   wireEqCanvasDrag in content.js, which sets grab/grabbing/default inline
+   once the pointer actually moves over the canvas). */
+.vmu-eq-canvas-interactive { cursor: default; touch-action: none; }
 .vmu-fx-history-legend {
   display: flex;
   gap: 12px;
