@@ -697,6 +697,8 @@
       if (valEl) valEl.textContent = fmtBandDb(b.gain);
       const freqEl = document.getElementById(`vmu-fx-band-${i}-freq`);
       if (freqEl) freqEl.textContent = formatFreqLabel(Math.round(b.freq));
+      const qEl = document.getElementById(`vmu-fx-band-${i}-q`);
+      if (qEl) qEl.textContent = formatQLabel(b.q);
     }
 
     canvas.addEventListener('pointerdown', (e) => {
@@ -764,6 +766,7 @@
       const b = settings.audioFxBands[idx];
       const q = Math.max(0.3, Math.min(8, Math.round(b.q * (e.deltaY < 0 ? factor : 1 / factor) * 100) / 100));
       settings.audioFxBands[idx] = { freq: b.freq, gain: b.gain, q };
+      syncBandControls(idx);
       saveSettings();
       postAudioFxState();
       if (!eqPointerActive) {
@@ -774,6 +777,34 @@
         }, 900);
       }
     }, { passive: false });
+  }
+
+  // Makes a band readout span (contenteditable — see buildAudioFxPanel)
+  // directly typeable: focusing it swaps the display text for the raw
+  // number and selects it, Enter or losing focus commits whatever's typed
+  // (via `set`, which clamps/persists/pushes it live), Escape reverts
+  // without committing. `get`/`format` are called again after commit so a
+  // clamped value is echoed back rather than the raw typed text.
+  function wireInlineBandEdit(el, { get, set, format }) {
+    if (!el) return;
+    el.addEventListener('focus', () => {
+      el.textContent = String(get());
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    });
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); el.blur(); }
+      else if (e.key === 'Escape') { e.preventDefault(); el.textContent = format(get()); el.blur(); }
+    });
+    el.addEventListener('blur', () => {
+      const n = parseFloat((el.textContent || '').replace(',', '.'));
+      if (isFinite(n)) set(n);
+      el.textContent = format(get());
+      saveSettings();
+    });
   }
 
   // Resizes the canvas' backing buffer to match its CSS size at the current
@@ -1137,6 +1168,9 @@
   function fmtBandDb(v) {
     return (v > 0 ? '+' : '') + v.toFixed(1);
   }
+  function formatQLabel(q) {
+    return 'Q' + q.toFixed(2);
+  }
 
   // Custom cascading dropdown — replaces native <select> for Style/Oversampling
   // so the option list can actually be themed (a native <select>'s popup is
@@ -1216,12 +1250,15 @@
     // step=0.1 (vs. the old 0.5) gives finer keyboard/native-drag resolution;
     // combined with the live numeric readout and the wheel/dblclick handlers
     // wired in attachAudioFxHandlers, dragging a 90px-tall slider by hand is
-    // no longer the only way to land on a precise value.
+    // no longer the only way to land on a precise value. All three readouts
+    // (gain/freq/Q) are contenteditable — click one and type an exact value,
+    // Enter/blur commits it, Escape reverts — wired in wireInlineBandEdit.
     const bands = settings.audioFxBands.map((b, i) => `
       <div class="vmu-eq-band">
-        <span class="vmu-eq-band-val" id="vmu-fx-band-${i}-val">${fmtBandDb(b.gain)}</span>
+        <span class="vmu-eq-band-val vmu-eq-editable" id="vmu-fx-band-${i}-val" contenteditable="true" spellcheck="false" inputmode="decimal" tabindex="0" title="Клик — ввести громкость вручную (дБ)">${fmtBandDb(b.gain)}</span>
         <input type="range" id="vmu-fx-band-${i}" class="vmu-eq-band-slider" min="-12" max="12" step="0.1" value="${b.gain}" title="Колесо мыши — шаг 0.5 дБ (Shift — 0.1 дБ), двойной клик — сброс полосы" orient="vertical">
-        <span class="vmu-eq-band-freq" id="vmu-fx-band-${i}-freq">${formatFreqLabel(Math.round(b.freq))}</span>
+        <span class="vmu-eq-band-freq vmu-eq-editable" id="vmu-fx-band-${i}-freq" contenteditable="true" spellcheck="false" inputmode="decimal" tabindex="0" title="Клик — ввести частоту вручную (Гц)">${formatFreqLabel(Math.round(b.freq))}</span>
+        <span class="vmu-eq-band-q vmu-eq-editable" id="vmu-fx-band-${i}-q" contenteditable="true" spellcheck="false" inputmode="decimal" tabindex="0" title="Клик — ввести ширину полосы вручную (Q)">${formatQLabel(b.q)}</span>
       </div>`).join('');
 
     const tab = settings.audioFxActiveTab || 'compressor';
@@ -1505,6 +1542,8 @@
       if (val) val.textContent = fmtBandDb(b.gain);
       const freqEl = document.getElementById(`vmu-fx-band-${i}-freq`);
       if (freqEl) freqEl.textContent = formatFreqLabel(Math.round(b.freq));
+      const qEl = document.getElementById(`vmu-fx-band-${i}-q`);
+      if (qEl) qEl.textContent = formatQLabel(b.q);
     });
   }
 
@@ -1935,17 +1974,30 @@
     // (startMeterLoop/paintMeters) — see the "audio FX metering" block above,
     // started/stopped alongside the panel's open/close state below.
 
-    // The vertical slider only ever touches gain — frequency for that band is
-    // whatever the EQ graph (wireEqCanvasDrag, wired below) last set it to.
+    // The vertical slider only ever touches gain — frequency/Q for that band
+    // are whatever the EQ graph (wireEqCanvasDrag, wired below) last set them
+    // to, or whatever was typed into their own readout (wireInlineBandEdit).
     settings.audioFxBands.forEach((_, i) => {
       const slider = document.getElementById(`vmu-fx-band-${i}`);
       if (!slider) return;
       const valEl = document.getElementById(`vmu-fx-band-${i}-val`);
+      const freqEl = document.getElementById(`vmu-fx-band-${i}-freq`);
+      const qEl = document.getElementById(`vmu-fx-band-${i}-q`);
       const setGain = (v) => {
         v = Math.max(-12, Math.min(12, Math.round(v * 10) / 10));
         settings.audioFxBands[i] = { freq: settings.audioFxBands[i].freq, gain: v, q: settings.audioFxBands[i].q };
         slider.value = String(v);
         if (valEl) valEl.textContent = fmtBandDb(v);
+        postAudioFxState();
+      };
+      const setFreq = (f) => {
+        f = Math.max(20, Math.min(20000, Math.round(f)));
+        settings.audioFxBands[i] = { freq: f, gain: settings.audioFxBands[i].gain, q: settings.audioFxBands[i].q };
+        postAudioFxState();
+      };
+      const setQ = (q) => {
+        q = Math.max(0.3, Math.min(8, Math.round(q * 100) / 100));
+        settings.audioFxBands[i] = { freq: settings.audioFxBands[i].freq, gain: settings.audioFxBands[i].gain, q };
         postAudioFxState();
       };
       slider.addEventListener('input', () => {
@@ -1966,6 +2018,10 @@
         setGain(0);
         saveSettings();
       });
+
+      wireInlineBandEdit(valEl, { get: () => settings.audioFxBands[i].gain, set: setGain, format: fmtBandDb });
+      wireInlineBandEdit(freqEl, { get: () => Math.round(settings.audioFxBands[i].freq), set: setFreq, format: v => formatFreqLabel(Math.round(v)) });
+      wireInlineBandEdit(qEl, { get: () => settings.audioFxBands[i].q, set: setQ, format: formatQLabel });
     });
 
     wireEqCanvasDrag();
@@ -1981,6 +2037,8 @@
           if (valEl) valEl.textContent = fmtBandDb(0);
           const freqEl = document.getElementById(`vmu-fx-band-${i}-freq`);
           if (freqEl) freqEl.textContent = formatFreqLabel(b.freq);
+          const qEl = document.getElementById(`vmu-fx-band-${i}-q`);
+          if (qEl) qEl.textContent = formatQLabel(b.q);
         });
         saveSettings();
         postAudioFxState();

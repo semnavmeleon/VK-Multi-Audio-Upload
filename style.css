@@ -1809,6 +1809,32 @@ html.vmu-theme-light {
   color: var(--vmu-text-hint);
   font-variant-numeric: tabular-nums;
 }
+.vmu-eq-band-q {
+  font-size: 9px;
+  color: var(--vmu-text-hint);
+  opacity: 0.7;
+  font-variant-numeric: tabular-nums;
+}
+/* Gain/freq/Q readouts are contenteditable (see wireInlineBandEdit in
+   content.js) — click one, type an exact value, Enter/blur commits it. The
+   dashed underline is the only static "this is editable" cue since these
+   sit right next to the (non-editable) slider itself; the solid highlight
+   only appears once actually focused, so nothing looks "active" at rest. */
+.vmu-eq-editable {
+  cursor: text;
+  border-radius: 2px;
+  padding: 0 2px;
+  margin: 0 -2px;
+  border-bottom: 1px dashed transparent;
+}
+.vmu-eq-editable:hover {
+  border-bottom-color: rgba(var(--vmu-ov),0.35);
+}
+.vmu-eq-editable:focus {
+  outline: none;
+  background: rgba(38,136,235,0.16);
+  border-bottom-color: transparent;
+}
 
 /* ── Audio FX: preset browser (search/category/tags) + A/B switch ─────────── */
 .vmu-fx-preset-toggle-btn {
