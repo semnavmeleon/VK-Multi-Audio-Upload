@@ -188,7 +188,7 @@
   // (freq) / wheel (q, bandwidth).
   const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   const EQ_DEFAULT_Q = 1.41; // RBJ-cookbook default — matches BiquadFilterNode's own peaking-EQ default
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -274,6 +274,7 @@
         contentOffsetX: settings.contentOffsetX,
         optimizeBigPlaylists: settings.optimizeBigPlaylists,
         hideScrollToTop: settings.hideScrollToTop,
+        hideFriendsMusic: settings.hideFriendsMusic,
         pinTabsBar: settings.pinTabsBar,
         downloadThreads: settings.downloadThreads,
         audioFxActiveTab: settings.audioFxActiveTab,
@@ -1076,6 +1077,17 @@
       parts.push(`#stl_bg { width: 40px !important; height: calc(100% - 60px) !important; padding: 0 !important; margin: 60px 0 0 !important; overflow: hidden !important; display: flex !important; align-items: flex-start !important; justify-content: center !important; }`);
       parts.push(`#stl_text { font-size: 0 !important; margin: 0 !important; display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; height: 40px !important; flex: none !important; }`);
       parts.push(`#stl_text svg { width: 20px !important; height: 20px !important; margin: 0 !important; }`);
+    }
+
+    // "Музыка друзей" — the friends'-listening-activity block VK injects
+    // into "Моя музыка" between "Музыканты" and the track list. VK spaces
+    // catalog sections with plain 16px spacer <div>s in between rather than
+    // flex/grid gap, so hiding just the section leaves both its neighbouring
+    // spacers in place (32px gap instead of 16px) — also hide the spacer
+    // immediately after it to collapse back to a single gap.
+    if (settings.hideFriendsMusic) {
+      parts.push(`[data-testid="AudioCatalog_SectionFriendsMusic"] { display: none !important; }`);
+      parts.push(`[data-testid="AudioCatalog_SectionFriendsMusic"] + div { display: none !important; }`);
     }
 
     if (settings.optimizeBigPlaylists) {
@@ -2253,14 +2265,52 @@
   window.addEventListener('resize', applyAudioCatalogLayout);
   window.addEventListener('scroll', () => { if (settings.pinTabsBar) applyTabsBarPin(); }, { passive: true });
 
+  // Splits off trailing reuploader/site watermarks (e.g. "(hitmos.fm)",
+  // "[vk.com/reuploadunder]") from a filename fragment or raw ID3 tag value.
+  // `core` is whatever real text precedes them (repeated, so
+  // "Song (Live) (hitmos.fm)" only loses the site tag, not "(Live)" too);
+  // `junk` is the stripped-off watermark(s) rejoined, so callers can put it
+  // back where it belongs instead of just discarding it.
+  function splitTrailingTagJunk(s) {
+    let core = String(s || '').trim();
+    const junkParts = [];
+    for (;;) {
+      const m = core.match(/\s*((?:\([^()]*\)|\[[^\[\]]*\]))\s*$/);
+      if (!m) break;
+      junkParts.unshift(m[1]);
+      core = core.slice(0, m.index).trim();
+    }
+    return { core, junk: junkParts.join(' ') };
+  }
+  function stripTrailingTagJunk(s) { return splitTrailingTagJunk(s).core; }
+
+  // True if a raw ID3 tag value is *nothing but* a trailing reuploader
+  // watermark, e.g. TIT2 = " [vk.com/reuploadunder]" with no real title in
+  // front of it — that's treated as "tag missing" so auto-meta falls back to
+  // the filename (but see splitTrailingTagJunk: the watermark itself still
+  // gets reattached to whatever the filename parser comes up with, it's not
+  // just thrown away). When there IS real text before the watermark (e.g.
+  // "Сказка [vk.com/reuploadunder]"), the tag is left completely untouched —
+  // no stripping — since that's a normal, valid tag as far as this tool's
+  // concerned.
+  function isJunkTag(s) {
+    return !stripTrailingTagJunk(s);
+  }
+
+  function joinWithJunk(base, junk) {
+    return [base, junk].filter(Boolean).join(' ');
+  }
+
   // ─── filename → meta parser ───────────────────────────────────────────────────
   function parseMetaFromFilename(filename) {
     function cleanPart(s) {
-      return s
-        .replace(/_/g, ' ')           // underscores → spaces
-        .replace(/\s+/g, ' ')         // collapse multiple spaces
-        .replace(/^[\s\-–—_.,()\[\]]+|[\s\-–—_.,()\[\]]+$/g, '') // trim junk edges
-        .trim();
+      return stripTrailingTagJunk(
+        s
+          .replace(/_/g, ' ')           // underscores → spaces
+          .replace(/\s+/g, ' ')         // collapse multiple spaces
+          .trim()
+      ).replace(/^[\s\-–—_.,()\[\]]+|[\s\-–—_.,()\[\]]+$/g, '') // trim junk edges
+       .trim();
     }
     // Strip extension, remove leading track number (e.g. "01. ", "02 - ")
     const base = filename.replace(/\.[^.]+$/, '').replace(/^\d+[\s.\-–—]+/, '').trim();
@@ -3432,6 +3482,17 @@
 
           <div class="vmu-setting-row">
             <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Скрыть «Музыка друзей»</span>
+              <span class="vmu-setting-hint">Убрать блок с прослушанным у друзей на странице «Моя музыка»</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-hide-friends-music-toggle" ${settings.hideFriendsMusic ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+
+          <div class="vmu-setting-row">
+            <div class="vmu-setting-info">
               <span class="vmu-setting-label">Закрепить панель вкладок</span>
               <span class="vmu-setting-hint">«Моя музыка» / «Обзор» / поиск сливаются с верхней панелью при прокрутке</span>
             </div>
@@ -3545,6 +3606,15 @@
     if (hideStlToggle) {
       hideStlToggle.addEventListener('change', () => {
         settings.hideScrollToTop = hideStlToggle.checked;
+        saveSettings();
+        applyLayoutCustomizations();
+      });
+    }
+
+    const hideFriendsMusicToggle = document.getElementById('vmu-hide-friends-music-toggle');
+    if (hideFriendsMusicToggle) {
+      hideFriendsMusicToggle.addEventListener('change', () => {
+        settings.hideFriendsMusic = hideFriendsMusicToggle.checked;
         saveSettings();
         applyLayoutCustomizations();
       });
@@ -3988,12 +4058,14 @@
       if (settings.autoMeta) {
         try {
           const tags = await readID3(f);
-          const hasArtist = !!(tags.TPE1 || tags.TPE2);
-          const hasTitle = !!tags.TIT2;
+          const artistSplit = splitTrailingTagJunk(tags.TPE1 || tags.TPE2);
+          const titleSplit = splitTrailingTagJunk(tags.TIT2);
+          const hasArtist = !!(tags.TPE1 || tags.TPE2) && !!artistSplit.core;
+          const hasTitle = !!tags.TIT2 && !!titleSplit.core;
           if (!hasArtist || !hasTitle) {
             const parsed = parseMetaFromFilename(f.name);
-            const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : parsed.artist;
-            const title = hasTitle ? tags.TIT2 : parsed.title;
+            const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : joinWithJunk(parsed.artist, artistSplit.junk);
+            const title = hasTitle ? tags.TIT2 : joinWithJunk(parsed.title, titleSplit.junk);
             if (artist || title) file = await patchID3(f, artist, title);
           }
         } catch {}
@@ -4053,8 +4125,8 @@
 
   async function fileToCheckEntry(f) {
     const tags = await readID3(f).catch(() => ({}));
-    const tagArtist = tags.TPE1 || tags.TPE2 || '';
-    const tagTitle = tags.TIT2 || '';
+    const tagArtist = isJunkTag(tags.TPE1 || tags.TPE2) ? '' : (tags.TPE1 || tags.TPE2 || '');
+    const tagTitle = isJunkTag(tags.TIT2) ? '' : (tags.TIT2 || '');
     let artist = tagArtist, title = tagTitle;
     if (!artist || !title) {
       const parsed = parseMetaFromFilename(f.name);
@@ -4553,12 +4625,14 @@
     let file = item.file;
     if (settings.autoMeta) {
       const tags = item.tags || {};
-      const hasArtist = !!(tags.TPE1 || tags.TPE2);
-      const hasTitle = !!tags.TIT2;
+      const artistSplit = splitTrailingTagJunk(tags.TPE1 || tags.TPE2);
+      const titleSplit = splitTrailingTagJunk(tags.TIT2);
+      const hasArtist = !!(tags.TPE1 || tags.TPE2) && !!artistSplit.core;
+      const hasTitle = !!tags.TIT2 && !!titleSplit.core;
       if (!hasArtist || !hasTitle) {
         const parsed = parseMetaFromFilename(file.name);
-        const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : parsed.artist;
-        const title = hasTitle ? tags.TIT2 : parsed.title;
+        const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : joinWithJunk(parsed.artist, artistSplit.junk);
+        const title = hasTitle ? tags.TIT2 : joinWithJunk(parsed.title, titleSplit.junk);
         if (artist || title) {
           try { file = await patchID3(file, artist, title); } catch {}
         }
