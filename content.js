@@ -2456,6 +2456,283 @@
     });
   }
 
+  // ─── cover text-overlay editor: color analysis ─────────────────────────────────
+  // JS port of text_overlay_app/color_tools.py — same WCAG-contrast-driven
+  // auto text-color pick, working off the cover's own dominant colors rather
+  // than a single sampled pixel (a flat overlay color has to hold up against
+  // every major region of a busy cover, not just the patch behind the text).
+  const VMU_WCAG_AA_NORMAL = 4.5;
+  const VMU_WCAG_AA_LARGE = 3.0;
+  const VMU_WCAG_AAA_NORMAL = 7.0;
+  const VMU_NEUTRAL_BONUS = 40.0;
+
+  function vmuRelLuminance([r, g, b]) {
+    const ch = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+    return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b);
+  }
+  function vmuContrastRatio(a, b) {
+    const l1 = vmuRelLuminance(a), l2 = vmuRelLuminance(b);
+    const lighter = Math.max(l1, l2), darker = Math.min(l1, l2);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+  function vmuColorDistance(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
+  function vmuOppositeNeutral(rgb) { return vmuRelLuminance(rgb) >= 0.5 ? [0, 0, 0] : [255, 255, 255]; }
+  function vmuRgbToHex([r, g, b]) {
+    return '#' + [r, g, b].map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
+  }
+  function vmuHexToRgb(hex) {
+    const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || '');
+    return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [255, 255, 255];
+  }
+
+  function vmuThumbCanvas(sourceCanvas, size) {
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    c.getContext('2d').drawImage(sourceCanvas, 0, 0, size, size);
+    return c;
+  }
+
+  function vmuDominantColors(sourceCanvas, k = 6, thumbSize = 150, binSize = 32) {
+    const thumb = vmuThumbCanvas(sourceCanvas, thumbSize);
+    const { data } = thumb.getContext('2d').getImageData(0, 0, thumbSize, thumbSize);
+    const counts = new Map();
+    for (let i = 0; i < data.length; i += 4) {
+      const r = Math.floor(data[i] / binSize) * binSize + binSize / 2;
+      const g = Math.floor(data[i + 1] / binSize) * binSize + binSize / 2;
+      const b = Math.floor(data[i + 2] / binSize) * binSize + binSize / 2;
+      const key = r + ',' + g + ',' + b;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([key]) => key.split(',').map(Number));
+  }
+
+  function vmuAverageColor(sourceCanvas, thumbSize = 64) {
+    const thumb = vmuThumbCanvas(sourceCanvas, thumbSize);
+    const { data } = thumb.getContext('2d').getImageData(0, 0, thumbSize, thumbSize);
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let i = 0; i < data.length; i += 4) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
+    return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+  }
+
+  function vmuRgbToHsv(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    let h = 0;
+    if (d !== 0) {
+      if (max === r) h = ((g - b) / d) % 6;
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h /= 6;
+      if (h < 0) h += 1;
+    }
+    return [h, max === 0 ? 0 : d / max, max];
+  }
+  function vmuHsvToRgb(h, s, v) {
+    const i = Math.floor(h * 6);
+    const f = h * 6 - i;
+    const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+    let r, g, b;
+    switch (i % 6) {
+      case 0: r = v; g = t; b = p; break;
+      case 1: r = q; g = v; b = p; break;
+      case 2: r = p; g = v; b = t; break;
+      case 3: r = p; g = q; b = v; break;
+      case 4: r = t; g = p; b = v; break;
+      default: r = v; g = p; b = q; break;
+    }
+    return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+  }
+
+  function vmuFullGrayscaleRamp(step = 15) {
+    const out = [];
+    for (let v = 0; v <= 255; v += step) out.push([v, v, v]);
+    return out;
+  }
+  function vmuFixedAccents() {
+    return [[255, 235, 59], [255, 87, 34], [76, 175, 80], [33, 150, 243], [255, 193, 7]];
+  }
+  // Light + dark accent variants derived from the cover's own dominant hue
+  // (complementary + two triadic rotations) so a fallback accent still feels
+  // like it belongs on this cover.
+  function vmuComplementaryAccents(dominants) {
+    if (!dominants.length) return [];
+    const [h] = vmuRgbToHsv(...dominants[0]);
+    const out = [];
+    for (const shift of [0.5, 0.5 + 1 / 3, 0.5 - 1 / 3]) {
+      const nh = ((h + shift) % 1 + 1) % 1;
+      for (const [value, sat] of [[0.95, 0.55], [0.35, 0.65]]) out.push(vmuHsvToRgb(nh, sat, value));
+    }
+    return out;
+  }
+
+  // Returns { color, ratio, dominants }. Picks a flat color that clears the
+  // WCAG floor against every dominant color at once (not just one), tying
+  // toward neutrals and then whichever candidate stays furthest from all of
+  // them; falls back to the least-bad candidate if nothing clears the floor
+  // (busy cover spanning near-black to near-white — the outline picks up
+  // the slack there via vmuOppositeNeutral).
+  function vmuPickContrastingColor(dominants, minContrast = VMU_WCAG_AA_NORMAL) {
+    if (!dominants || !dominants.length) dominants = [[128, 128, 128]];
+    const palette = [...vmuFullGrayscaleRamp(), ...vmuFixedAccents(), ...vmuComplementaryAccents(dominants)];
+    const scored = palette.map(c => {
+      const worstRatio = Math.min(...dominants.map(d => vmuContrastRatio(c, d)));
+      const dist = Math.min(...dominants.map(d => vmuColorDistance(c, d)));
+      const isNeutral = (Math.max(...c) - Math.min(...c)) <= 12;
+      return { c, worstRatio, dist, isNeutral };
+    });
+    const passing = scored.filter(s => s.worstRatio >= minContrast);
+    let chosen;
+    if (passing.length) {
+      passing.sort((a, b) => (b.dist + (b.isNeutral ? VMU_NEUTRAL_BONUS : 0)) - (a.dist + (a.isNeutral ? VMU_NEUTRAL_BONUS : 0)) || b.worstRatio - a.worstRatio);
+      chosen = passing[0];
+    } else {
+      scored.sort((a, b) => b.worstRatio - a.worstRatio);
+      chosen = scored[0];
+    }
+    return { color: chosen.c, ratio: chosen.worstRatio, dominants };
+  }
+
+  // ─── cover text-overlay editor: text layer rendering ───────────────────────────
+  // JS port of text_overlay_app/image_ops.py. The outline is drawn the same
+  // way PIL does it — many copies of the fill text offset around a circle —
+  // rather than canvas's own stroke/lineWidth, since a stroked font distorts
+  // glyph shapes at the widths this tool uses; stamping copies keeps the
+  // letterforms intact and just thickens the silhouette.
+  const VMU_POSITION_LABELS = [
+    ['Центр', 'center'], ['Верх', 'top'], ['Низ', 'bottom'],
+    ['Верх-лево', 'top-left'], ['Верх-право', 'top-right'],
+    ['Низ-лево', 'bottom-left'], ['Низ-право', 'bottom-right'],
+    ['Произвольно', 'custom'],
+  ];
+  // Curated Cyrillic-capable font list — the reference desktop tool scans
+  // the OS's installed .ttf/.otf files for Cyrillic glyph coverage, which a
+  // content script can't do; this is the closest browser-side equivalent
+  // (common fonts a Windows/macOS box actually has, canvas falls back
+  // silently to a generic sans-serif if one isn't installed).
+  const VMU_COVER_FONTS = [
+    'Impact', 'Arial Black', 'Arial', 'Verdana', 'Tahoma', 'Times New Roman',
+    'Georgia', 'Comic Sans MS', 'Segoe UI', 'Calibri', 'Courier New', 'PT Sans', 'Roboto',
+  ];
+
+  function vmuMeasureMultiline(ctx, lines, fontCss) {
+    ctx.font = fontCss;
+    let maxWidth = 0, maxAscent = 0, maxDescent = 0;
+    for (const line of lines) {
+      const m = ctx.measureText(line || ' ');
+      maxWidth = Math.max(maxWidth, m.width);
+      maxAscent = Math.max(maxAscent, m.actualBoundingBoxAscent || 0);
+      maxDescent = Math.max(maxDescent, m.actualBoundingBoxDescent || 0);
+    }
+    const sizePx = parseFloat(fontCss) || 20;
+    const glyphHeight = (maxAscent + maxDescent) || sizePx * 1.2;
+    const lineHeight = glyphHeight * 1.25;
+    return { width: Math.max(1, Math.ceil(maxWidth)), lineHeight, ascent: maxAscent || sizePx, height: Math.max(1, Math.ceil(lineHeight * lines.length)) };
+  }
+
+  function vmuRenderTextLayer({ text, fontFamily, fontSize, textColor, outlineColor, outlineWidth, opacity }) {
+    const lines = text.split('\n');
+    const fontCss = `${fontSize}px "${fontFamily}", sans-serif`;
+    const probeCtx = document.createElement('canvas').getContext('2d');
+    const metrics = vmuMeasureMultiline(probeCtx, lines, fontCss);
+
+    const pad = outlineWidth + 4;
+    const layerW = Math.max(1, metrics.width + pad * 2);
+    const layerH = Math.max(1, metrics.height + pad * 2);
+    const layer = document.createElement('canvas');
+    layer.width = layerW; layer.height = layerH;
+    const ctx = layer.getContext('2d');
+    ctx.font = fontCss;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+
+    const centerX = layerW / 2;
+    const firstBaselineY = pad + metrics.ascent;
+    const drawLines = color => {
+      ctx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+      lines.forEach((line, i) => ctx.fillText(line, centerX, firstBaselineY + i * metrics.lineHeight));
+    };
+
+    if (outlineWidth > 0) {
+      const steps = Math.max(16, Math.round(outlineWidth * 10));
+      for (let i = 0; i < steps; i++) {
+        const angle = (2 * Math.PI * i) / steps;
+        ctx.save();
+        ctx.translate(outlineWidth * Math.cos(angle), outlineWidth * Math.sin(angle));
+        drawLines(outlineColor);
+        ctx.restore();
+      }
+    }
+    drawLines(textColor);
+
+    if (opacity < 255) {
+      const id = ctx.getImageData(0, 0, layerW, layerH);
+      const d = id.data;
+      const factor = Math.max(0, opacity) / 255;
+      for (let i = 3; i < d.length; i += 4) d[i] = Math.round(d[i] * factor);
+      ctx.putImageData(id, 0, 0);
+    }
+    return layer;
+  }
+
+  function vmuApplyScale(canvas, percent) {
+    if (percent === 100) return canvas;
+    const w = Math.max(1, Math.round(canvas.width * percent / 100));
+    const h = Math.max(1, Math.round(canvas.height * percent / 100));
+    const out = document.createElement('canvas');
+    out.width = w; out.height = h;
+    const ctx = out.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(canvas, 0, 0, w, h);
+    return out;
+  }
+
+  // Rotates with an expanded canvas (same idea as PIL's rotate(expand=True))
+  // so the already-padded layer never clips. Positive angle turns the text
+  // clockwise, matching the reference tool's rotation slider direction.
+  function vmuApplyRotation(canvas, angleDeg) {
+    if (!angleDeg) return canvas;
+    const rad = angleDeg * Math.PI / 180;
+    const w = canvas.width, h = canvas.height;
+    const cos = Math.abs(Math.cos(rad)), sin = Math.abs(Math.sin(rad));
+    const newW = Math.ceil(w * cos + h * sin);
+    const newH = Math.ceil(w * sin + h * cos);
+    const out = document.createElement('canvas');
+    out.width = newW; out.height = newH;
+    const ctx = out.getContext('2d');
+    ctx.translate(newW / 2, newH / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(canvas, -w / 2, -h / 2);
+    return out;
+  }
+
+  function vmuComputePosition(canvasSize, layerSize, position, customXY, margin = 20) {
+    const [cw, ch] = canvasSize;
+    const [lw, lh] = layerSize;
+    if (position === 'custom' && customXY) {
+      const [cx, cy] = customXY;
+      return [Math.round(cx - lw / 2), Math.round(cy - lh / 2)];
+    }
+    const anchors = {
+      center: [cw / 2, ch / 2],
+      top: [cw / 2, margin + lh / 2],
+      bottom: [cw / 2, ch - margin - lh / 2],
+      'top-left': [margin + lw / 2, margin + lh / 2],
+      'top-right': [cw - margin - lw / 2, margin + lh / 2],
+      'bottom-left': [margin + lw / 2, ch - margin - lh / 2],
+      'bottom-right': [cw - margin - lw / 2, ch - margin - lh / 2],
+    };
+    const [cx, cy] = anchors[position] || anchors.center;
+    return [Math.round(cx - lw / 2), Math.round(cy - lh / 2)];
+  }
+
+  function vmuBuildTextLayerPipeline(opts, scalePercent, rotationDeg) {
+    let layer = vmuRenderTextLayer(opts);
+    layer = vmuApplyScale(layer, scalePercent);
+    layer = vmuApplyRotation(layer, rotationDeg);
+    return layer;
+  }
+
   function getVkUserId() {
     // URL-first: works for any user (/audiosXXX) or group (/audios-XXX) page
     const m = location.href.match(/audios(-?\d+)/);
@@ -2762,6 +3039,778 @@
     return tracks;
   }
 
+  // ─── playlist sort-by-dropped-files ─────────────────────────────────────────
+  // "Редактирование плейлиста" popup — VK renders its track list two different
+  // ways (verified live, same playlist, different opens): the old .audio_row
+  // markup (data-full-id) or the modern vkit rows (data-sortable-id). Both are
+  // handled here so whichever VK serves this time still works. Reordering
+  // itself goes through injected.js' reorderPlaylistViaApi — see the comment
+  // there for why drag can't be automated from a content script.
+  // getPlaylistInfoFromUrl() only works when the popup was opened via a
+  // ?z=audio_playlist-…/playlist/… deep link — clicking a playlist card from
+  // a listing (the normal path) never touches location.href, so it stays
+  // null. Filled in from injected.js' relayEditPlaylistIds (reads owner_id/
+  // playlist_id off VK's own playlists_edit_data request) as a fallback.
+  let lastEditPlaylistIds = null;
+  window.addEventListener('message', e => {
+    if (e.source !== window || e.data?.type !== 'VKD_EDIT_PLAYLIST_IDS') return;
+    lastEditPlaylistIds = { ownerId: e.data.ownerId, playlistId: e.data.playlistId, accessHash: null };
+  });
+
+  function getEditPlaylistBox() {
+    const boxes = [...document.querySelectorAll('.popup_box_container')]
+      .filter(c => getComputedStyle(c).display !== 'none' && c.querySelector('.audio_pl_edit_box'));
+    return boxes[boxes.length - 1] || null;
+  }
+
+  // Reads the playlist's current track list+order straight from VK's API
+  // (audio.get via injected.js) instead of the popup's DOM. The row list
+  // there lazy-appends in batches as its inner .ape_item_list is scrolled —
+  // verified live on a 108-track playlist: only ~20 rows are mounted up
+  // front. Loading the rest turned out to depend on unpredictable session
+  // state — a synthetic `scrollTop` nudge reliably grew it to 108/108 in one
+  // tab but did nothing in a freshly opened tab, where only a genuine (CDP
+  // trusted-input) wheel scroll worked — the same trusted-input-only
+  // behavior already documented for this popup's native drag reorder. A
+  // content script can't dispatch trusted input, so DOM scrolling can't be
+  // made reliable; going through the API sidesteps the popup's virtualized
+  // DOM entirely and is what reorderPlaylistViaApi already does for the
+  // matching pass on the injected.js side.
+  function fetchPlaylistTracksViaApi(plInfo) {
+    return new Promise(resolve => {
+      const h = e => {
+        if (e.source !== window || e.data?.type !== 'VKD_GET_PLAYLIST_TRACKS_DONE') return;
+        window.removeEventListener('message', h);
+        resolve(e.data);
+      };
+      window.addEventListener('message', h);
+      window.postMessage({ type: 'VKD_GET_PLAYLIST_TRACKS', ownerId: plInfo.ownerId, playlistId: plInfo.playlistId, accessHash: plInfo.accessHash }, '*');
+    });
+  }
+
+  // Shared by both order sources (dropped files, Genius tracklist): entries
+  // is [{artist, title}] in the desired final order. Matches them against the
+  // playlist's current tracks by normalizeKey, unmatched tracks keep their
+  // relative order at the end, then persists via VKD_REORDER_PLAYLIST.
+  async function applyPlaylistOrderFromEntries(box, entries, sourceLabel) {
+    const plInfo = getPlaylistInfoFromUrl() || lastEditPlaylistIds;
+    if (!plInfo) { showToast('Не удалось определить плейлист (ownerId/playlistId)', true); return; }
+
+    showProgressToast('Загружаю треки плейлиста…', { id: 'vmu-pl-sort' });
+    const trackRes = await fetchPlaylistTracksViaApi(plInfo);
+    if (!trackRes.ok) { showProgressToast('Ошибка: ' + (trackRes.error || '?'), { id: 'vmu-pl-sort', kind: 'error' }); return; }
+
+    const rows = trackRes.tracks;
+    if (!rows.length) { showToast('Не нашёл треки в плейлисте', true); return; }
+
+    // Title-first matching: different sources format multi-artist credits
+    // differently enough ("ЗАМАЙ, Слава КПСС" vs "ZAMAY & Слава КПСС") that
+    // requiring an exact artist match too would silently fail every track on
+    // collab albums. Artist only breaks ties between rows sharing the same
+    // normalized title (remixes, alternate versions, "feat." variants).
+    const wordsOf = s => normalizeNamePart(s).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    const rowMeta = rows.map(r => ({ row: r, titleKey: normalizeNamePart(r.title), artistWords: new Set(wordsOf(r.artist)) }));
+
+    const claimed = new Set();
+    const matchedOrder = [];
+    // Parallel to entries (same order, same length) — records whether each
+    // parsed entry found a track, for showParsedOrderPanel below. Kept
+    // regardless of whether anything ends up unmatched; cost is trivial.
+    const entryResults = [];
+    for (const en of entries) {
+      const titleKey = normalizeNamePart(en.title);
+      const artistWords = wordsOf(en.artist);
+      const candidates = rowMeta
+        .map((m, i) => ({ m, i }))
+        .filter(({ m, i }) => !claimed.has(i) && m.titleKey === titleKey);
+      if (!candidates.length) { entryResults.push({ artist: en.artist, title: en.title, matched: false }); continue; }
+      let best = candidates[0];
+      if (candidates.length > 1) {
+        let bestScore = -1;
+        for (const c of candidates) {
+          const score = artistWords.reduce((n, w) => n + (c.m.artistWords.has(w) ? 1 : 0), 0);
+          if (score > bestScore) { bestScore = score; best = c; }
+        }
+      }
+      claimed.add(best.i);
+      matchedOrder.push(best.m.row.numId);
+      entryResults.push({ artist: en.artist, title: en.title, matched: true });
+    }
+    const leftovers = rows.filter((r, i) => !claimed.has(i)).map(r => r.numId);
+    const finalOrder = [...matchedOrder, ...leftovers];
+    const unmatched = entries.length - matchedOrder.length;
+
+    const titleInput = box.querySelector('input.ape_pl_input');
+    const descInput = box.querySelector('textarea.ape_pl_input');
+    const discoverEl = box.querySelector('.ape_discover_checkbox');
+    const title = titleInput?.value || '';
+    const description = descInput?.value || '';
+    const noDiscover = !!discoverEl?.classList.contains('checked');
+
+    showProgressToast('Сортировка плейлиста…', { id: 'vmu-pl-sort' });
+
+    const done = new Promise(resolve => {
+      const h = e => {
+        if (e.source !== window || e.data?.type !== 'VKD_REORDER_PLAYLIST_DONE') return;
+        window.removeEventListener('message', h);
+        resolve(e.data);
+      };
+      window.addEventListener('message', h);
+    });
+    window.postMessage({
+      type: 'VKD_REORDER_PLAYLIST',
+      ownerId: plInfo.ownerId,
+      playlistId: plInfo.playlistId,
+      accessHash: plInfo.accessHash,
+      title, description, noDiscover,
+      orderedNumericIds: finalOrder,
+    }, '*');
+    const result = await done;
+
+    if (result.ok) {
+      showProgressToast(`Готово (${sourceLabel}): переставлено ${matchedOrder.length}, не сопоставлено: ${unmatched}`, { id: 'vmu-pl-sort', kind: 'done' });
+      await refreshPlaylistEditDialog();
+    } else {
+      showProgressToast('Ошибка сортировки: ' + (result.error || '?'), { id: 'vmu-pl-sort', kind: 'error' });
+    }
+
+    // The toast's bare "не сопоставлено: N" doesn't say WHICH tracks or why
+    // — surface the actual parsed order (Genius specifically, per its own
+    // toggle) so a mismatch (missing track, ё/е, script, punctuation) is
+    // visible without opening devtools.
+    if (sourceLabel === 'Genius' && unmatched > 0) {
+      showParsedOrderPanel(entryResults, sourceLabel);
+    }
+  }
+
+  // Draggable floating panel (same drag mechanics as the other panels —
+  // makePanelDraggable) listing the source tracklist in the order it was
+  // parsed, each row flagged matched/unmatched. Left-anchored (the other
+  // floating panels default to the right) so it doesn't stack on top of
+  // the cover editor if that's also open.
+  function showParsedOrderPanel(entryResults, sourceLabel) {
+    document.getElementById('vmu-parsedorder-panel')?.remove();
+
+    const unmatchedCount = entryResults.filter(e => !e.matched).length;
+    const panel = document.createElement('div');
+    panel.id = 'vmu-parsedorder-panel';
+    panel.className = 'vmu-bulkops-panel vmu-parsedorder-panel';
+    panel.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Треклист с ${escHtml(sourceLabel)} — не сопоставлено: ${unmatchedCount}</span>
+        <button type="button" class="vmu-check-close" id="vmu-parsedorder-close">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body">
+        <div class="vmu-parsedorder-list">
+          ${entryResults.map((e, i) => `
+            <div class="vmu-parsedorder-row ${e.matched ? '' : 'vmu-parsedorder-row-miss'}">
+              <span class="vmu-parsedorder-idx">${i + 1}</span>
+              <span class="vmu-parsedorder-text">${escHtml(e.artist)} — ${escHtml(e.title)}</span>
+              <span class="vmu-parsedorder-status" title="${e.matched ? 'Найден в плейлисте' : 'Не найден в плейлисте'}">${e.matched ? '✓' : '✕'}</span>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+    panel.querySelector('#vmu-parsedorder-close').addEventListener('click', () => panel.remove());
+  }
+
+  // reorderPlaylistViaApi goes straight through VK's audio.editPlaylist —
+  // the popup's own track-row list (React state, populated once when the
+  // dialog opened) never hears about it, so without this the rows stay in
+  // the pre-sort order even though the server-side order already changed
+  // (verified live: reload the page and the new order is there). DOM-level
+  // reordering of the rows themselves isn't an option — see the comment on
+  // fetchPlaylistTracksViaApi above for why that list is virtualized and
+  // only partially mounted. Closing and reopening the dialog is the
+  // reliable way to make VK refetch+re-render it with the real order.
+  async function refreshPlaylistEditDialog() {
+    const container = getEditPlaylistBox();
+    const closeBtn = container?.querySelector('.box_x_button');
+    if (!closeBtn) return;
+    closeBtn.click();
+    await sleep(400);
+    // Present when the edit box was opened from the playlist's own view
+    // popup (pencil icon) — closing edit mode drops back to that popup,
+    // which is still mounted underneath. If the edit box was reached some
+    // other way and nothing is left to click, this just leaves it closed;
+    // the reorder itself already succeeded and persisted regardless.
+    document.querySelector('[data-testid="Action_Edit"]')?.click();
+  }
+
+  async function applyPlaylistSortFromFiles(box, files) {
+    const entries = [];
+    for (const f of files) entries.push(await fileToCheckEntry(f));
+    return applyPlaylistOrderFromEntries(box, entries, 'файлы');
+  }
+
+  // ─── Genius tracklist order ─────────────────────────────────────────────────
+  function parseGeniusQueryFromTitle(titleText) {
+    let s = (titleText || '').trim();
+    const yearMatch = s.match(/\((\d{4})\)/);
+    const year = yearMatch ? yearMatch[1] : null;
+    if (yearMatch) s = (s.slice(0, yearMatch.index) + s.slice(yearMatch.index + yearMatch[0].length)).replace(/\s+/g, ' ').trim();
+    return { query: s, year };
+  }
+
+  function geniusMsg(type, payload) {
+    return new Promise(resolve => {
+      try { chrome.runtime.sendMessage({ type, ...payload }, res => resolve(res)); }
+      catch { resolve({ ok: false, error: 'extension context error' }); }
+    });
+  }
+
+  async function applyPlaylistSortFromGeniusAlbum(box, album) {
+    const res = await geniusMsg('VKD_GENIUS_TRACKS', { albumId: album.id, albumUrl: album.url });
+    if (!res?.ok) { showToast('Genius: ' + (res?.error || 'не удалось получить треклист'), true); return; }
+    const entries = res.tracks.map(t => ({ artist: stripGeniusTranslation(t.artist), title: stripGeniusTranslation(t.title) }));
+    return applyPlaylistOrderFromEntries(box, entries, 'Genius');
+  }
+
+  function injectPlaylistSortToggle(box) {
+    if (!box || box.dataset.vmuSortInjected) return;
+    const anchor = box.querySelector('.ape_search');
+    if (!anchor) return;
+    box.dataset.vmuSortInjected = '1';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'vmu-pl-sort-wrap';
+    wrap.innerHTML = `
+      <div class="vmu-pl-sort-row">
+        <span class="vmu-pl-sort-label">Сортировать как файлы${helpIcon('Включи и перетащи (или выбери) MP3-файлы в нужном порядке — расширение сопоставит их с треками плейлиста по имени и переставит треки в этом порядке. Несопоставленные треки остаются в конце, порядок между собой не меняют.')}</span>
+        <label class="vmu-toggle">
+          <input type="checkbox" id="vmu-pl-sort-toggle">
+          <span class="vmu-toggle-track"></span>
+        </label>
+      </div>
+      <div id="vmu-pl-sort-dz" class="vmu-pl-sort-dz" style="display:none">
+        <span class="vmu-pl-sort-dz-hint">Перетащи MP3 в нужном порядке</span>
+        <label class="vmu-pick-btn">
+          ${ICON_UPLOAD}
+          Выбрать файлы
+          <input type="file" class="vmu-pl-sort-input" accept=".mp3,audio/mpeg" multiple>
+        </label>
+      </div>
+      <div class="vmu-pl-sort-row">
+        <span class="vmu-pl-sort-label">Порядок с Genius${helpIcon('Ищет альбом на Genius по названию, исполнителю и году из строки названия плейлиста выше (можно поправить перед поиском) — либо вставь прямую ссылку на альбом genius.com/albums/... Клик по найденному альбому сразу подтягивает его треклист и переставляет треки плейлиста в этом порядке.')}</span>
+        <label class="vmu-toggle">
+          <input type="checkbox" id="vmu-pl-genius-toggle">
+          <span class="vmu-toggle-track"></span>
+        </label>
+      </div>
+      <div id="vmu-pl-genius-panel" class="vmu-pl-genius-panel" style="display:none">
+        <div class="vmu-pl-genius-searchrow">
+          <input type="text" id="vmu-pl-genius-q" class="vmu-pl-genius-input" placeholder="Исполнитель альбом, или ссылка genius.com/albums/...">
+          <button type="button" id="vmu-pl-genius-go" class="vmu-pick-btn">Искать</button>
+        </div>
+        <div id="vmu-pl-genius-results" class="vmu-pl-genius-results"></div>
+      </div>
+    `;
+    anchor.insertAdjacentElement('afterend', wrap);
+
+    const toggle = wrap.querySelector('#vmu-pl-sort-toggle');
+    const dz = wrap.querySelector('#vmu-pl-sort-dz');
+    const fileInput = wrap.querySelector('.vmu-pl-sort-input');
+
+    const handleFiles = files => {
+      const mp3s = [...files].filter(isMP3);
+      if (mp3s.length) applyPlaylistSortFromFiles(box, mp3s);
+    };
+
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('vmu-over'); });
+    dz.addEventListener('dragleave', e => { if (!dz.contains(e.relatedTarget)) dz.classList.remove('vmu-over'); });
+    dz.addEventListener('drop', e => {
+      e.preventDefault();
+      dz.classList.remove('vmu-over');
+      handleFiles(e.dataTransfer?.files || []);
+    });
+    fileInput.addEventListener('change', () => {
+      handleFiles(fileInput.files);
+      fileInput.value = '';
+    });
+    toggle.addEventListener('change', () => {
+      dz.style.display = toggle.checked ? '' : 'none';
+    });
+
+    // ── Genius block ──
+    const gToggle = wrap.querySelector('#vmu-pl-genius-toggle');
+    const gPanel = wrap.querySelector('#vmu-pl-genius-panel');
+    const gInput = wrap.querySelector('#vmu-pl-genius-q');
+    const gGo = wrap.querySelector('#vmu-pl-genius-go');
+    const gResults = wrap.querySelector('#vmu-pl-genius-results');
+    let gPrefilled = false;
+
+    const setGeniusStatus = text => {
+      gResults.innerHTML = text ? `<div class="vmu-pl-genius-status">${escHtml(text)}</div>` : '';
+    };
+
+    const renderGeniusResults = albums => {
+      gResults.innerHTML = albums.map((a, i) => `
+        <div class="vmu-pl-genius-result" data-idx="${i}">
+          ${a.cover ? `<img src="${escHtml(a.cover)}" alt="">` : ''}
+          <div class="vmu-pl-genius-result-info">
+            <span class="vmu-pl-genius-result-name">${escHtml(a.name)}</span>
+            <span class="vmu-pl-genius-result-meta">${escHtml(a.artist)}${a.release ? ' · ' + escHtml(a.release) : ''}</span>
+          </div>
+        </div>
+      `).join('');
+      gResults.querySelectorAll('.vmu-pl-genius-result').forEach(el => {
+        el.addEventListener('click', () => {
+          const album = albums[Number(el.dataset.idx)];
+          setGeniusStatus('Подтягиваем треклист…');
+          applyPlaylistSortFromGeniusAlbum(box, album);
+        });
+      });
+    };
+
+    const runGeniusSearch = async () => {
+      const raw = gInput.value.trim();
+      if (!raw) return;
+      if (/^https?:\/\/(www\.)?genius\.com\/albums\//i.test(raw)) {
+        setGeniusStatus('Подтягиваем треклист…');
+        await applyPlaylistSortFromGeniusAlbum(box, { url: raw });
+        return;
+      }
+      setGeniusStatus('Ищем на Genius…');
+      const res = await geniusMsg('VKD_GENIUS_SEARCH', { query: raw });
+      if (!res?.ok) { setGeniusStatus(res?.error || 'ничего не найдено'); return; }
+      renderGeniusResults(res.albums);
+    };
+
+    gGo.addEventListener('click', runGeniusSearch);
+    gInput.addEventListener('keydown', e => { if (e.key === 'Enter') runGeniusSearch(); });
+    gToggle.addEventListener('change', () => {
+      gPanel.style.display = gToggle.checked ? '' : 'none';
+      if (gToggle.checked && !gPrefilled) {
+        gPrefilled = true;
+        const titleInput = box.querySelector('input.ape_pl_input');
+        gInput.value = parseGeniusQueryFromTitle(titleInput?.value).query;
+      }
+    });
+  }
+
+  // ─── cover text-overlay editor: panel ───────────────────────────────────────────
+  // Small reusable "label + slider + live readout + reset" row — identical
+  // markup/classes to buildAudioFxPanel's limiterRow, so no new CSS is needed.
+  function vmuCoveredSliderRow(id, label, min, max, step, value, unit) {
+    return `
+      <div class="vmu-setting-row vmu-slider-row">
+        <div class="vmu-setting-info">
+          <span class="vmu-setting-label">${label}</span>
+        </div>
+        <div class="vmu-slider-wrap">
+          <input type="range" id="${id}" class="vmu-slider" min="${min}" max="${max}" step="${step}" value="${value}">
+          <span class="vmu-slider-value" id="${id}-val">${value}${unit}</span>
+          <button type="button" id="${id}-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
+        </div>
+      </div>`;
+  }
+
+  // Adds the "Обложка с текстом" trigger row into the edit-playlist dialog,
+  // right below the sort-toggle row injectPlaylistSortToggle already put
+  // there — same insertion pattern (own .vmu-pl-sort-wrap sibling, VK's own
+  // nodes untouched).
+  function injectCoverEditorRow(box) {
+    if (!box || box.dataset.vmuCoverInjected) return;
+    const anchor = box.querySelector('.vmu-pl-sort-wrap');
+    if (!anchor) return;
+    box.dataset.vmuCoverInjected = '1';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'vmu-pl-sort-wrap';
+    wrap.innerHTML = `
+      <div class="vmu-pl-sort-row">
+        <span class="vmu-pl-sort-label">Обложка с текстом${helpIcon('Подтянуть обложку альбома с Genius или выбрать файл, наложить текст (шрифт, цвет, обводка, позиция, поворот — как в отдельном редакторе обложек) и сразу поставить результат обложкой этого плейлиста.')}</span>
+        <button type="button" id="vmu-covered-open" class="vmu-pick-btn">Открыть</button>
+      </div>
+    `;
+    anchor.insertAdjacentElement('afterend', wrap);
+    wrap.querySelector('#vmu-covered-open').addEventListener('click', () => openCoverEditorPanel(box));
+  }
+
+  // Draggable floating panel: pick a source image (Genius album cover or a
+  // local file), live-preview a text overlay on it (JS port of
+  // text_overlay_app's render pipeline, see vmuBuildTextLayerPipeline
+  // above), then hand the composited 1000×1000 result to
+  // uploadCoverViaDialog — the same primitive the auto-playlist flow uses,
+  // which clicks .ape_cover, intercepts the file input VK opens, and
+  // confirms any crop step on its own. That's what makes "Применить" end
+  // with the playlist's cover already selected, no manual file dialog.
+  function openCoverEditorPanel(box) {
+    document.getElementById('vmu-covered-panel')?.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'vmu-covered-panel';
+    panel.className = 'vmu-bulkops-panel vmu-covered-panel';
+    panel.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Обложка с текстом</span>
+        <button type="button" class="vmu-check-close" id="vmu-covered-close">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body">
+      <div class="vmu-bulk-ops vmu-covered-body">
+        <div class="vmu-rename-block">
+          <span class="vmu-rename-block-label">Источник</span>
+          <div class="vmu-mode-switch" id="vmu-covered-src-switch">
+            <button type="button" data-src="genius" class="active">Genius</button>
+            <button type="button" data-src="file">Файл</button>
+          </div>
+        </div>
+        <div id="vmu-covered-genius-block">
+          <div class="vmu-pl-genius-searchrow">
+            <input type="text" id="vmu-covered-genius-q" class="vmu-pl-genius-input" placeholder="Исполнитель альбом">
+            <button type="button" id="vmu-covered-genius-go" class="vmu-pick-btn">Искать</button>
+          </div>
+          <div id="vmu-covered-genius-results" class="vmu-pl-genius-results"></div>
+        </div>
+        <div id="vmu-covered-file-block" style="display:none">
+          <div id="vmu-covered-dz" class="vmu-pl-sort-dz">
+            <span class="vmu-pl-sort-dz-hint">Перетащи картинку сюда</span>
+            <label class="vmu-pick-btn">
+              ${ICON_UPLOAD}
+              Выбрать файл
+              <input type="file" id="vmu-covered-file-input" accept="image/*" style="display:none">
+            </label>
+          </div>
+        </div>
+
+        <div id="vmu-covered-editor" style="display:none">
+          <div class="vmu-covered-canvas-wrap">
+            <canvas id="vmu-covered-canvas" width="300" height="300"></canvas>
+            <span class="vmu-covered-canvas-hint">Клик по обложке — своя позиция текста</span>
+          </div>
+
+          <textarea id="vmu-covered-text" class="vmu-covered-text" rows="2" placeholder="Текст на обложке">перезалито</textarea>
+
+          <div class="vmu-setting-row">
+            <span class="vmu-setting-label">Шрифт</span>
+            <select id="vmu-covered-font" class="vmu-covered-select">
+              ${VMU_COVER_FONTS.map(f => `<option value="${escHtml(f)}">${escHtml(f)}</option>`).join('')}
+            </select>
+          </div>
+
+          ${vmuCoveredSliderRow('vmu-covered-fontsize', 'Размер шрифта', 10, 300, 1, 72, '')}
+          ${vmuCoveredSliderRow('vmu-covered-outlinewidth', 'Толщина обводки', 0, 10, 1, 3, '')}
+
+          <div class="vmu-setting-row">
+            <span class="vmu-setting-label">Цвет текста</span>
+            <div class="vmu-covered-color-cell">
+              <input type="color" id="vmu-covered-textcolor" value="#ffffff" disabled>
+              <label class="vmu-rename-check"><input type="checkbox" id="vmu-covered-auto" checked><span>Авто</span></label>
+            </div>
+          </div>
+          <div class="vmu-setting-row">
+            <span class="vmu-setting-label">Цвет обводки</span>
+            <input type="color" id="vmu-covered-outlinecolor" value="#000000" disabled>
+          </div>
+
+          <div class="vmu-setting-row">
+            <span class="vmu-setting-label">Позиция</span>
+            <select id="vmu-covered-position" class="vmu-covered-select">
+              ${VMU_POSITION_LABELS.map(([label, key]) => `<option value="${key}">${escHtml(label)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="vmu-setting-row" id="vmu-covered-custom-row" style="display:none">
+            <span class="vmu-setting-label">Коорд. X / Y</span>
+            <div class="vmu-covered-xy">
+              <input type="number" id="vmu-covered-x" value="500">
+              <input type="number" id="vmu-covered-y" value="500">
+            </div>
+          </div>
+
+          ${vmuCoveredSliderRow('vmu-covered-rotation', 'Поворот, °', -180, 180, 1, 0, '')}
+          ${vmuCoveredSliderRow('vmu-covered-scale', 'Масштаб, %', 10, 500, 1, 100, '')}
+          ${vmuCoveredSliderRow('vmu-covered-opacity', 'Прозрачность', 0, 255, 1, 255, '')}
+
+          <div class="vmu-covered-info" id="vmu-covered-info"></div>
+
+          <div class="vmu-covered-actions">
+            <span class="vmu-covered-status" id="vmu-covered-status"></span>
+            <button type="button" id="vmu-covered-download" class="vmu-rename-cleanup-btn" title="Скачать PNG">Скачать</button>
+            <button type="button" id="vmu-covered-apply" class="vmu-pick-btn" disabled>Применить как обложку</button>
+          </div>
+        </div>
+      </div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+    panel.querySelector('#vmu-covered-close').addEventListener('click', () => panel.remove());
+
+    const BASE = 1000;
+    const state = { baseCanvas: null, resultCanvas: null, dominants: null, customX: 500, customY: 500, renderTimer: null };
+
+    const canvas = panel.querySelector('#vmu-covered-canvas');
+    const cctx = canvas.getContext('2d');
+    const DISPLAY = canvas.width;
+
+    const els = {
+      editor: panel.querySelector('#vmu-covered-editor'),
+      text: panel.querySelector('#vmu-covered-text'),
+      font: panel.querySelector('#vmu-covered-font'),
+      fontSize: panel.querySelector('#vmu-covered-fontsize'),
+      outlineWidth: panel.querySelector('#vmu-covered-outlinewidth'),
+      textColor: panel.querySelector('#vmu-covered-textcolor'),
+      outlineColor: panel.querySelector('#vmu-covered-outlinecolor'),
+      auto: panel.querySelector('#vmu-covered-auto'),
+      position: panel.querySelector('#vmu-covered-position'),
+      customRow: panel.querySelector('#vmu-covered-custom-row'),
+      x: panel.querySelector('#vmu-covered-x'),
+      y: panel.querySelector('#vmu-covered-y'),
+      rotation: panel.querySelector('#vmu-covered-rotation'),
+      scale: panel.querySelector('#vmu-covered-scale'),
+      opacity: panel.querySelector('#vmu-covered-opacity'),
+      info: panel.querySelector('#vmu-covered-info'),
+      apply: panel.querySelector('#vmu-covered-apply'),
+      download: panel.querySelector('#vmu-covered-download'),
+      status: panel.querySelector('#vmu-covered-status'),
+    };
+
+    for (const [id, def, unit] of [
+      ['vmu-covered-fontsize', 72, ''], ['vmu-covered-outlinewidth', 3, ''],
+      ['vmu-covered-rotation', 0, '°'], ['vmu-covered-scale', 100, '%'], ['vmu-covered-opacity', 255, ''],
+    ]) {
+      const input = panel.querySelector('#' + id);
+      const val = panel.querySelector('#' + id + '-val');
+      panel.querySelector('#' + id + '-reset').addEventListener('click', () => {
+        input.value = def; val.textContent = def + unit; scheduleRender();
+      });
+      input.addEventListener('input', () => { val.textContent = input.value + unit; scheduleRender(); });
+    }
+
+    function scheduleRender(immediate) {
+      if (state.renderTimer) clearTimeout(state.renderTimer);
+      state.renderTimer = setTimeout(render, immediate ? 0 : 30);
+    }
+
+    function setStatus(text, isError) {
+      els.status.textContent = text || '';
+      els.status.style.color = isError ? '#e64646' : '';
+    }
+
+    function updateInfo(textColor, outlineColor, ratio) {
+      if (!textColor) {
+        els.info.innerHTML = '<div class="vmu-covered-info-empty">Введите текст, чтобы увидеть подбор цвета и контраст</div>';
+        return;
+      }
+      const bg = vmuAverageColor(state.baseCanvas);
+      const mark = ok => ok ? '✅' : '❌';
+      els.info.innerHTML = `
+        <div class="vmu-covered-swatches">
+          <span class="vmu-covered-swatch" style="background:${vmuRgbToHex(bg)}" title="Фон"></span>
+          <span class="vmu-covered-swatch" style="background:${vmuRgbToHex(textColor)}" title="Текст"></span>
+          <span class="vmu-covered-swatch" style="background:${vmuRgbToHex(outlineColor)}" title="Обводка"></span>
+          <span class="vmu-covered-swatches-hex">${vmuRgbToHex(bg)} · ${vmuRgbToHex(textColor)} · ${vmuRgbToHex(outlineColor)}</span>
+        </div>
+        <div class="vmu-covered-contrast">Контраст текста: ${ratio.toFixed(2)} : 1 — AA ${mark(ratio >= VMU_WCAG_AA_NORMAL)} · AA крупный ${mark(ratio >= VMU_WCAG_AA_LARGE)} · AAA ${mark(ratio >= VMU_WCAG_AAA_NORMAL)}</div>
+      `;
+    }
+
+    function render() {
+      if (!state.baseCanvas) return;
+      if (!state.dominants) state.dominants = vmuDominantColors(state.baseCanvas);
+
+      const text = els.text.value;
+      const fontFamily = els.font.value;
+      const fontSize = Number(els.fontSize.value);
+      const outlineWidth = Number(els.outlineWidth.value);
+      const rotation = Number(els.rotation.value);
+      const scalePercent = Number(els.scale.value);
+      const opacity = Number(els.opacity.value);
+      const position = els.position.value;
+
+      let textColor, outlineColor, ratio = null;
+      if (els.auto.checked) {
+        const picked = vmuPickContrastingColor(state.dominants);
+        textColor = picked.color;
+        outlineColor = vmuOppositeNeutral(textColor);
+        ratio = picked.ratio;
+        els.textColor.value = vmuRgbToHex(textColor);
+        els.outlineColor.value = vmuRgbToHex(outlineColor);
+      } else {
+        textColor = vmuHexToRgb(els.textColor.value);
+        outlineColor = vmuHexToRgb(els.outlineColor.value);
+      }
+
+      let resultCanvas = state.baseCanvas;
+      if (text.trim() && fontFamily) {
+        const layer = vmuBuildTextLayerPipeline(
+          { text, fontFamily, fontSize, textColor, outlineColor, outlineWidth, opacity },
+          scalePercent, rotation
+        );
+        const [px, py] = vmuComputePosition([BASE, BASE], [layer.width, layer.height], position, [state.customX, state.customY]);
+        const out = document.createElement('canvas');
+        out.width = BASE; out.height = BASE;
+        const octx = out.getContext('2d');
+        octx.drawImage(state.baseCanvas, 0, 0);
+        octx.drawImage(layer, px, py);
+        resultCanvas = out;
+        if (ratio === null) ratio = vmuContrastRatio(textColor, vmuAverageColor(state.baseCanvas));
+        updateInfo(textColor, outlineColor, ratio);
+      } else {
+        updateInfo(null);
+      }
+
+      state.resultCanvas = resultCanvas;
+      cctx.clearRect(0, 0, DISPLAY, DISPLAY);
+      cctx.drawImage(resultCanvas, 0, 0, DISPLAY, DISPLAY);
+    }
+
+    function loadImageIntoBase(dataUrl) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          const c = document.createElement('canvas');
+          c.width = BASE; c.height = BASE;
+          c.getContext('2d').drawImage(img, 0, 0, BASE, BASE);
+          state.baseCanvas = c;
+          state.dominants = null;
+          resolve();
+        };
+        img.onerror = () => reject(new Error('не удалось загрузить изображение'));
+        img.src = dataUrl;
+      });
+    }
+
+    async function setSource(dataUrl) {
+      try {
+        setStatus('Загружаем…');
+        await loadImageIntoBase(dataUrl);
+        els.editor.style.display = '';
+        els.apply.disabled = false;
+        setStatus('');
+        scheduleRender(true);
+      } catch (err) {
+        setStatus(err.message || 'ошибка загрузки', true);
+      }
+    }
+
+    els.text.addEventListener('input', () => scheduleRender());
+    els.font.addEventListener('change', () => scheduleRender());
+    els.auto.addEventListener('change', () => {
+      const manual = !els.auto.checked;
+      els.textColor.disabled = !manual;
+      els.outlineColor.disabled = !manual;
+      scheduleRender();
+    });
+    els.textColor.addEventListener('input', () => scheduleRender());
+    els.outlineColor.addEventListener('input', () => scheduleRender());
+    els.position.addEventListener('change', () => {
+      els.customRow.style.display = els.position.value === 'custom' ? '' : 'none';
+      scheduleRender();
+    });
+    els.x.addEventListener('input', () => { state.customX = Number(els.x.value) || 0; scheduleRender(); });
+    els.y.addEventListener('input', () => { state.customY = Number(els.y.value) || 0; scheduleRender(); });
+
+    canvas.addEventListener('click', e => {
+      if (!state.baseCanvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.max(0, Math.min(BASE, (e.clientX - rect.left) * (BASE / rect.width)));
+      const y = Math.max(0, Math.min(BASE, (e.clientY - rect.top) * (BASE / rect.height)));
+      state.customX = Math.round(x); state.customY = Math.round(y);
+      els.x.value = state.customX; els.y.value = state.customY;
+      if (els.position.value !== 'custom') { els.position.value = 'custom'; els.customRow.style.display = ''; }
+      scheduleRender();
+    });
+
+    // ── source: Genius album cover ──
+    const srcSwitch = panel.querySelector('#vmu-covered-src-switch');
+    const geniusBlock = panel.querySelector('#vmu-covered-genius-block');
+    const fileBlock = panel.querySelector('#vmu-covered-file-block');
+    srcSwitch.addEventListener('click', e => {
+      const btn = e.target.closest('button[data-src]');
+      if (!btn) return;
+      srcSwitch.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+      const isFile = btn.dataset.src === 'file';
+      geniusBlock.style.display = isFile ? 'none' : '';
+      fileBlock.style.display = isFile ? '' : 'none';
+    });
+
+    const gInput = panel.querySelector('#vmu-covered-genius-q');
+    const gGo = panel.querySelector('#vmu-covered-genius-go');
+    const gResults = panel.querySelector('#vmu-covered-genius-results');
+    const titleInput = box?.querySelector('input.ape_pl_input');
+    if (titleInput?.value) gInput.value = parseGeniusQueryFromTitle(titleInput.value).query;
+
+    async function runGeniusSearch() {
+      const raw = gInput.value.trim();
+      if (!raw) return;
+      gResults.innerHTML = `<div class="vmu-pl-genius-status">Ищем на Genius…</div>`;
+      const res = await geniusMsg('VKD_GENIUS_SEARCH', { query: raw });
+      if (!res?.ok) { gResults.innerHTML = `<div class="vmu-pl-genius-status">${escHtml(res?.error || 'ничего не найдено')}</div>`; return; }
+      gResults.innerHTML = res.albums.map((a, i) => `
+        <div class="vmu-pl-genius-result" data-idx="${i}">
+          ${a.cover ? `<img src="${escHtml(a.cover)}" alt="">` : ''}
+          <div class="vmu-pl-genius-result-info">
+            <span class="vmu-pl-genius-result-name">${escHtml(a.name)}</span>
+            <span class="vmu-pl-genius-result-meta">${escHtml(a.artist)}${a.release ? ' · ' + escHtml(a.release) : ''}</span>
+          </div>
+        </div>
+      `).join('');
+      gResults.querySelectorAll('.vmu-pl-genius-result').forEach(el => {
+        el.addEventListener('click', async () => {
+          const album = res.albums[Number(el.dataset.idx)];
+          setStatus('Загружаем обложку…');
+          const img = await geniusMsg('VKD_FETCH_IMAGE', { url: album.coverFull || album.cover });
+          if (!img?.ok) { setStatus(img?.error || 'не удалось загрузить обложку', true); return; }
+          await setSource(img.dataUrl);
+        });
+      });
+    }
+    gGo.addEventListener('click', runGeniusSearch);
+    gInput.addEventListener('keydown', e => { if (e.key === 'Enter') runGeniusSearch(); });
+
+    // ── source: local file ──
+    const dz = panel.querySelector('#vmu-covered-dz');
+    const fileInput = panel.querySelector('#vmu-covered-file-input');
+    const handleImageFile = file => {
+      if (!file || !file.type.startsWith('image/')) return;
+      const r = new FileReader();
+      r.onload = () => setSource(r.result);
+      r.readAsDataURL(file);
+    };
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('vmu-over'); });
+    dz.addEventListener('dragleave', e => { if (!dz.contains(e.relatedTarget)) dz.classList.remove('vmu-over'); });
+    dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('vmu-over'); handleImageFile(e.dataTransfer?.files?.[0]); });
+    fileInput.addEventListener('change', () => { handleImageFile(fileInput.files?.[0]); fileInput.value = ''; });
+
+    // ── apply / download ──
+    els.apply.addEventListener('click', async () => {
+      const source = state.resultCanvas || state.baseCanvas;
+      if (!source) return;
+      const blob = await new Promise(res => source.toBlob(res, 'image/jpeg', 0.95));
+      if (!blob) { setStatus('не удалось собрать изображение', true); return; }
+      els.apply.disabled = true;
+      els.apply.textContent = 'Применяем…';
+      setStatus('Ставим обложку плейлиста…');
+      try {
+        await uploadCoverViaDialog(blob);
+        setStatus('✓ Обложка применена');
+        showToast('Обложка плейлиста обновлена');
+      } catch (err) {
+        setStatus(err.message || 'ошибка', true);
+      } finally {
+        els.apply.disabled = false;
+        els.apply.textContent = 'Применить как обложку';
+      }
+    });
+
+    els.download.addEventListener('click', () => {
+      const source = state.resultCanvas || state.baseCanvas;
+      if (!source) return;
+      source.toBlob(blob => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'cover.png';
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+      }, 'image/png');
+    });
+  }
+
   // Expand the playlist popup: click "Показать все" to load the first batch,
   // then scroll the page-level scroll container (VK lazy-loads more tracks as
   // its IntersectionObserver hits the bottom of the popup). Harvests every row
@@ -2790,13 +3839,21 @@
     return Number.isFinite(n) && n > 0 ? n : null;
   }
 
-  async function expandPlaylistModal(onProgress, isCancelled) {
-    const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-      .find(m => m.getBoundingClientRect().width > 0);
-    if (!modal) return [];
+  // Row selector shared by every modal-scan helper below.
+  const VMU_MODAL_ROW_SEL = '[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, [data-full-id]';
 
-    const declaredTotal = getPlaylistTotalFromModal(modal);
+  // Finds the currently-open playlist popup, if any.
+  function findOpenPlaylistModal() {
+    return [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+      .find(m => m.getBoundingClientRect().width > 0) || null;
+  }
 
+  // Switches the popup from its collapsed preview (first handful of tracks)
+  // into the full scrollable list — needed once regardless of whether the
+  // track data itself then comes from a DOM harvest or straight from the
+  // API, since click-to-jump still needs the popup in list mode to find or
+  // load any given row.
+  async function revealModalList(modal) {
     const showAll = modal.querySelector('[class*="showAll"], [class*="ShowAll"]')
       || [...modal.querySelectorAll('a, button, [role="button"], div, span')].find(el => {
         const t = (el.textContent || '').trim().toLowerCase();
@@ -2806,18 +3863,111 @@
       showAll.click();
       await sleep(900);
     }
+  }
 
-    // Find a scroller INSIDE the modal. Earlier versions fell back to
-    // document.scrollingElement (the audios- page underneath), but the new VK
-    // popup doesn't lazy-load on page scroll — it just scrolled the row list
-    // visibly under the modal, which the user (correctly) complained about.
-    // If the modal exposes no internal scroller, we drive lazy-loading by
-    // scrolling the LAST audio row into view: that pokes any IntersectionObserver
-    // sentinel without touching the underlying page scroll position.
-    const findInModalScroller = () => [...modal.querySelectorAll('*')].find(el => {
+  // Find a scroller INSIDE the modal. Earlier versions fell back to
+  // document.scrollingElement (the audios- page underneath), but the new VK
+  // popup doesn't lazy-load on page scroll — it just scrolled the row list
+  // visibly under the modal, which the user (correctly) complained about.
+  // If the modal exposes no internal scroller, we drive lazy-loading by
+  // scrolling the LAST audio row into view: that pokes any IntersectionObserver
+  // sentinel without touching the underlying page scroll position.
+  function findModalScroller(modal) {
+    return [...modal.querySelectorAll('*')].find(el => {
       const cs = getComputedStyle(el);
       return (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
     }) || null;
+  }
+
+  // Asks injected.js to invoke VK's own tail-fetch callback via React fiber
+  // props (VK's IntersectionObserver sentinel doesn't fire in the hybrid
+  // old-box-layer hosting of the new playlist modal). Resolves true when the
+  // callback exists — in that mode no scrolling is needed at all.
+  function requestPlaylistTailLoad() {
+    return new Promise(resolve => {
+      let done = false;
+      const finish = ok => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        window.removeEventListener('message', h);
+        resolve(ok);
+      };
+      const t = setTimeout(() => finish(false), 400);
+      const h = e => {
+        if (e.source !== window || e.data?.type !== 'VKD_PLAYLIST_TAIL_LOAD_DONE') return;
+        finish(!!e.data.ok);
+      };
+      window.addEventListener('message', h);
+      window.postMessage({ type: 'VKD_PLAYLIST_TAIL_LOAD' }, '*');
+    });
+  }
+
+  // Looks up an already-mounted popup row for trackId without scrolling.
+  function findModalRowByTrackId(modal, trackId) {
+    try {
+      const r = modal.querySelector(`[data-full-id="${CSS.escape(String(trackId))}"]`);
+      if (r) return r;
+    } catch {}
+    return [...modal.querySelectorAll('[data-vmu-track]')].find(r => {
+      try { return JSON.parse(r.dataset.vmuTrack).id === trackId; } catch { return false; }
+    }) || null;
+  }
+
+  // On-demand click-to-jump inside a playlist popup: scanForDuplicates now
+  // reads the playlist via the audio.get API first (loadPlaylistTracksViaAPI)
+  // instead of expanding the whole popup up front, so most rows a marker/list
+  // click targets aren't mounted into the popup's DOM yet. Runs the same
+  // tail-load/scroll dance expandPlaylistModal uses, but stops the moment the
+  // target row appears instead of walking the whole playlist.
+  async function scrollModalToTrackId(modal, trackId, onProgress) {
+    let row = findModalRowByTrackId(modal, trackId);
+    if (row) return row;
+
+    const modalScroller = findModalScroller(modal);
+    const MAX_ITER = 200;
+    const STABLE_LIMIT = 15, STABLE_LIMIT_FAST = 5;
+    let stable = 0, lastCount = modal.querySelectorAll(VMU_MODAL_ROW_SEL).length, loaderMode = false;
+
+    for (let i = 0; i < MAX_ITER && stable < (loaderMode ? STABLE_LIMIT_FAST : STABLE_LIMIT); i++) {
+      if (onProgress) onProgress(i);
+      loaderMode = await requestPlaylistTailLoad();
+      if (loaderMode) {
+        const startRows = modal.querySelectorAll(VMU_MODAL_ROW_SEL).length;
+        for (let w = 0; w < 12 && modal.querySelectorAll(VMU_MODAL_ROW_SEL).length === startRows; w++) {
+          await sleep(125);
+        }
+      } else {
+        if (modalScroller) {
+          if (i % 3 === 2) {
+            modalScroller.scrollTop = Math.max(0, modalScroller.scrollHeight - modalScroller.clientHeight - 800);
+            await sleep(120);
+          }
+          modalScroller.scrollTop = modalScroller.scrollHeight;
+        }
+        await sleep(450);
+        const rowsNow = modal.querySelectorAll(VMU_MODAL_ROW_SEL);
+        const lastRow = rowsNow[rowsNow.length - 1];
+        if (lastRow) {
+          lastRow.scrollIntoView({ block: i % 4 === 3 ? 'end' : 'nearest' });
+          await sleep(250);
+        }
+      }
+      await waitForMarkRows();
+      row = findModalRowByTrackId(modal, trackId);
+      if (row) return row;
+      const c = modal.querySelectorAll(VMU_MODAL_ROW_SEL).length;
+      if (c === lastCount) stable++; else { stable = 0; lastCount = c; }
+    }
+    return null;
+  }
+
+  async function expandPlaylistModal(onProgress, isCancelled) {
+    const modal = findOpenPlaylistModal();
+    if (!modal) return [];
+
+    const declaredTotal = getPlaylistTotalFromModal(modal);
+    await revealModalList(modal);
 
     const collected = new Map();
 
@@ -2849,7 +3999,7 @@
       }
     }
 
-    const modalScroller = findInModalScroller();
+    const modalScroller = findModalScroller(modal);
 
     await harvest();
     const reportProgress = () => {
@@ -2858,35 +4008,12 @@
     };
     reportProgress();
 
-    // Ask injected.js to invoke VK's own tail-fetch callback via React fiber
-    // props (VK's IntersectionObserver sentinel doesn't fire in the hybrid
-    // old-box-layer hosting of the new playlist modal). Resolves true when the
-    // callback exists — in that mode no scrolling is needed at all.
-    const requestTailLoad = () => new Promise(resolve => {
-      let done = false;
-      const finish = ok => {
-        if (done) return;
-        done = true;
-        clearTimeout(t);
-        window.removeEventListener('message', h);
-        resolve(ok);
-      };
-      const t = setTimeout(() => finish(false), 400);
-      const h = e => {
-        if (e.source !== window || e.data?.type !== 'VKD_PLAYLIST_TAIL_LOAD_DONE') return;
-        finish(!!e.data.ok);
-      };
-      window.addEventListener('message', h);
-      window.postMessage({ type: 'VKD_PLAYLIST_TAIL_LOAD' }, '*');
-    });
-
     // Harvest loop. Fast path drives VK's fetch callback directly and only
     // waits for rows to actually land (poll, not fixed sleeps), so each
     // ~20-track batch costs its network time — no scroll choreography.
     // Scroll-dance fallback for markups without the fiber callback: VK's
     // lazy-loader there needs *motion* between batches, not just being at
     // the bottom (jump up every 3rd iter, poke last row every 4th).
-    const ROW_SEL = '[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row, [data-full-id]';
     let stable = 0, lastSize = collected.size;
     const MAX_ITER = 200;
     const STABLE_LIMIT = 15;      // scroll fallback needs many "motion" retries
@@ -2894,10 +4021,10 @@
     let loaderMode = false;
     for (let i = 0; i < MAX_ITER && stable < (loaderMode ? STABLE_LIMIT_FAST : STABLE_LIMIT); i++) {
       if (isCancelled?.()) break;
-      loaderMode = await requestTailLoad();
+      loaderMode = await requestPlaylistTailLoad();
       if (loaderMode) {
-        const startRows = modal.querySelectorAll(ROW_SEL).length;
-        for (let w = 0; w < 12 && modal.querySelectorAll(ROW_SEL).length === startRows; w++) {
+        const startRows = modal.querySelectorAll(VMU_MODAL_ROW_SEL).length;
+        for (let w = 0; w < 12 && modal.querySelectorAll(VMU_MODAL_ROW_SEL).length === startRows; w++) {
           await sleep(125);
         }
       } else {
@@ -2912,7 +4039,7 @@
         // `end` actually scrolls the nearest scrollable ancestor when the row
         // is off-screen (which is when lazy-load needs to fire). `nearest`
         // bails out if the row is technically visible and skips the trigger.
-        const rowsNow = modal.querySelectorAll(ROW_SEL);
+        const rowsNow = modal.querySelectorAll(VMU_MODAL_ROW_SEL);
         const lastRow = rowsNow[rowsNow.length - 1];
         if (lastRow) {
           lastRow.scrollIntoView({ block: i % 4 === 3 ? 'end' : 'nearest' });
@@ -2953,7 +4080,10 @@
             artist: t.artist || '',
             duration: t.duration || 0,
             url: t.url || null,
-            isBlocked: false,
+            // Set by tryEmitTrackObj (audio.get path) from the url field;
+            // the legacy al_audio.php fallback doesn't carry this, so it's a
+            // best-effort guess, refined below by enrichBlockedFromDom.
+            isBlocked: !!t.isBlocked,
           });
           if (onProgress) onProgress(captured.size);
         }
@@ -2997,6 +4127,63 @@
     }
   }
 
+  // Shared by the playlist dupe/blocked scanner (scanForDuplicates) and the
+  // page-wide "Массовые операции" cleanup section — same grouping-by-key
+  // logic, same "first occurrence is the original, the rest are dupes" rule.
+  // tracks: [{artist, title, isBlocked, ...}]. Duplicate key ignores case and
+  // whitespace, same as normalizeKey elsewhere, but intentionally simpler
+  // (no bracket/feat. stripping) — this flags exact-metadata duplicates, not
+  // fuzzy title matches.
+  // Same artist+title isn't proof of the same recording — skits, freestyles
+  // and alternate versions legitimately reuse a title with a different
+  // length. Within each artist+title bucket, tracks only count as duplicates
+  // of each other if their duration also matches (a few seconds of slack for
+  // encoding/rounding differences between re-uploads of the same file).
+  const DUPE_DURATION_TOLERANCE_SEC = 2;
+
+  function findDuplicatesAndBlocked(tracks) {
+    const buckets = new Map();
+    for (let i = 0; i < tracks.length; i++) {
+      const track = tracks[i];
+      const key = `${track.artist}|||${track.title}`.toLowerCase().trim();
+      if (!key.includes('|||') || (!track.artist && !track.title)) continue;
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push({ index: i, track });
+    }
+
+    const dupes = [];
+    const dupeIndexSet = new Set();
+    const dupeGroups = [];
+    for (const bucket of buckets.values()) {
+      if (bucket.length < 2) continue;
+      const durGroups = [];
+      for (const entry of bucket) {
+        const dur = entry.track.duration || 0;
+        let g = durGroups.find(g => Math.abs(g.duration - dur) <= DUPE_DURATION_TOLERANCE_SEC);
+        if (!g) { g = { duration: dur, entries: [] }; durGroups.push(g); }
+        g.entries.push(entry);
+      }
+      for (const g of durGroups) {
+        if (g.entries.length < 2) continue;
+        const [orig, ...rest] = g.entries;
+        const label = `${orig.track.artist || ''}${orig.track.artist ? ' — ' : ''}${orig.track.title || ''}`.trim()
+          || `Трек ${orig.index + 1}`;
+        for (const entry of rest) {
+          dupes.push({ track: entry.track, original: orig.track });
+          dupeIndexSet.add(entry.index);
+        }
+        dupeIndexSet.add(orig.index);
+        dupeGroups.push({ label, indices: g.entries.map(e => e.index) });
+      }
+    }
+    dupeGroups.sort((a, b) => a.indices[0] - b.indices[0]);
+
+    const blockedIndices = [];
+    for (let i = 0; i < tracks.length; i++) if (tracks[i].isBlocked) blockedIndices.push(i);
+
+    return { dupes, dupeGroups, dupeIndexSet, blockedIndices };
+  }
+
   async function scanForDuplicates(plInfoArg, statusCallback, cancelToken) {
     const pl = plInfoArg || getPlaylistInfoFromUrl();
     const report = statusCallback || ((msg, isError, progress) => setPlaylistStatus(msg, isError, progress));
@@ -3013,12 +4200,9 @@
     try {
       // Primary path: expand the playlist popup (click "Показать все") and
       // drive VK's lazy-loader until it stops yielding new rows. This mounts
-      // every row into VK's own DOM/React state — required for both the
-      // in-popup highlight and the click-to-jump markers below, which can
-      // only scroll to a row that actually exists. The faster audio.get API
-      // path (used for playlist download, where no row needs to be visible)
-      // fetches data only and mounts nothing, so it can't drive those two
-      // features — it stays a fallback for when the modal can't be expanded.
+      // every row into VK's own DOM/React state, which the in-popup
+      // highlight and the click-to-jump markers below both need — they can
+      // only scroll to a row that actually exists.
       let tracks = await expandPlaylistModal((loaded, total) => {
         if (total) report(`Раскрываем плейлист… ${loaded} / ${total}`, false, { loaded, total });
         else report(`Раскрываем плейлист… ${loaded}`);
@@ -3048,39 +4232,11 @@
         return;
       }
 
-      // Mark blocked tracks from any currently-visible popup rows (best-effort).
-      // API path doesn't carry isBlocked; this fills it for the rows we can see.
+      // Mark blocked tracks from any currently-visible popup rows (best-effort
+      // on top of the API's own url-based isBlocked guess — see tryEmitTrackObj).
       enrichBlockedFromDom(tracks);
 
-      const seen = new Map();
-      const dupes = [];
-      const dupeIndexSet = new Set();
-      const groupsByKey = new Map();
-      for (let i = 0; i < tracks.length; i++) {
-        const track = tracks[i];
-        const key = `${track.artist}|||${track.title}`.toLowerCase().trim();
-        if (!key.includes('|||') || (!track.artist && !track.title)) continue;
-        if (seen.has(key)) {
-          const orig = seen.get(key);
-          dupes.push({ track, original: orig.track });
-          dupeIndexSet.add(i);
-          dupeIndexSet.add(orig.index);
-          let g = groupsByKey.get(key);
-          if (!g) {
-            const label = `${orig.track.artist || ''}${orig.track.artist ? ' — ' : ''}${orig.track.title || ''}`.trim()
-              || `Трек ${orig.index + 1}`;
-            g = { label, indices: [orig.index] };
-            groupsByKey.set(key, g);
-          }
-          g.indices.push(i);
-        } else {
-          seen.set(key, { track, index: i });
-        }
-      }
-      const dupeGroups = [...groupsByKey.values()].sort((a, b) => a.indices[0] - b.indices[0]);
-
-      const blockedIndices = [];
-      for (let i = 0; i < tracks.length; i++) if (tracks[i].isBlocked) blockedIndices.push(i);
+      const { dupes, dupeGroups, dupeIndexSet, blockedIndices } = findDuplicatesAndBlocked(tracks);
 
       const scannedNote = wasCancelled ? ` (остановлено, проверено ${tracks.length})` : '';
 
@@ -3159,16 +4315,34 @@
   }
 
   // Helper: scroll a popup row into view and flash it. Used by both the
-  // minimap markers and the blocked-list entries.
-  function focusModalRowByTrackId(modal, trackId) {
-    let row = null;
-    try { row = modal.querySelector(`[data-full-id="${CSS.escape(String(trackId))}"]`); } catch {}
+  // minimap markers and the blocked-list entries. expandPlaylistModal
+  // already mounts every row during scanForDuplicates' scan, so this is
+  // usually the fast lookup below; scrollModalToTrackId is the fallback for
+  // whatever wasn't (a row virtualized back out, etc).
+  async function focusModalRowByTrackId(modal, trackId) {
+    // The row may already be mounted (user scrolled past it, or a previous
+    // scan loaded it) but not yet stamped with data-vmu-track — markRowTrackData
+    // only stamps on request, not on every DOM change. Ask for a fresh stamp
+    // pass first so an already-there row is found instantly instead of
+    // falling through to the scroll hunt for no reason.
+    await waitForMarkRows();
+    let row = findModalRowByTrackId(modal, trackId);
     if (!row) {
-      row = [...modal.querySelectorAll('[data-vmu-track]')].find(r => {
-        try { return JSON.parse(r.dataset.vmuTrack).id === trackId; } catch { return false; }
-      }) || null;
+      const toastId = 'vmu-jump-toast';
+      showProgressToast('Ищем трек в плейлисте…', { kind: 'progress', id: toastId });
+      try {
+        row = await scrollModalToTrackId(modal, trackId, n => {
+          showProgressToast(`Ищем трек в плейлисте… (${n})`, { kind: 'progress', id: toastId });
+        });
+      } catch (e) {
+        console.warn('[vmu] scrollModalToTrackId failed:', e.message);
+      }
+      if (!row) {
+        showProgressToast('Трек не найден в плейлисте', { kind: 'error', id: toastId });
+        return;
+      }
+      document.getElementById(toastId)?.remove();
     }
-    if (!row) return;
     row.scrollIntoView({ behavior: 'smooth', block: 'center' });
     row.classList.remove('vmu-dupe-flash');
     void row.offsetWidth;
@@ -3183,8 +4357,7 @@
   function buildIssuePanel(tracks, dupeIndices, blockedIndices, dupeGroups) {
     dupeGroups = dupeGroups || [];
     document.getElementById('vmu-issue-panel')?.remove();
-    const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-      .find(m => m.getBoundingClientRect().width > 0);
+    const modal = findOpenPlaylistModal();
     if (!modal || (!dupeIndices.length && !blockedIndices.length)) return;
 
     const hasListContent = blockedIndices.length > 0 || dupeGroups.length > 0;
@@ -3350,6 +4523,41 @@
 
     document.body.appendChild(panel);
 
+    // expandPlaylistModal already mounted every flagged row during the scan,
+    // so this mostly just applies once — kept as a live watcher too in case
+    // anything mounts later (Fallback A/B paths, or VK re-rendering a row),
+    // so the amber/red highlight stays correct without a full re-scan.
+    const dupeTrackIds = new Set();
+    for (const idx of dupeIndices) {
+      const t = tracks[idx];
+      if (t?.fullId) dupeTrackIds.add(t.fullId);
+      if (t?.id) dupeTrackIds.add(String(t.id));
+    }
+    const blockedTrackIds = new Set();
+    for (const idx of blockedIndices) {
+      const t = tracks[idx];
+      if (t?.fullId) blockedTrackIds.add(t.fullId);
+      if (t?.id) blockedTrackIds.add(String(t.id));
+    }
+    async function reapplyIssueHighlights() {
+      // Newly-mounted rows aren't stamped with data-vmu-track until asked —
+      // request a fresh stamp pass first so rows that just landed actually
+      // pick up the highlight this tick instead of waiting for some later,
+      // unrelated stamp trigger.
+      await waitForMarkRows();
+      const rows = modal.querySelectorAll('[data-full-id], [data-vmu-track], [data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .audio_row');
+      for (const row of rows) {
+        let rowId = row.dataset?.fullId || null;
+        if (!rowId && row.dataset?.vmuTrack) {
+          try { rowId = JSON.parse(row.dataset.vmuTrack).id; } catch {}
+        }
+        if (!rowId) continue;
+        if (dupeTrackIds.has(rowId)) row.classList.add('vmu-dupe-highlight');
+        if (blockedTrackIds.has(rowId)) row.classList.add('vmu-blocked-highlight');
+      }
+    }
+    reapplyIssueHighlights();
+
     const positionPanel = () => {
       const r = modal.getBoundingClientRect();
       if (r.width === 0) return;
@@ -3362,11 +4570,16 @@
     ro.observe(modal);
     window.addEventListener('resize', positionPanel);
     window.addEventListener('scroll', positionPanel, true);
+    let reapplyScheduled = false;
     const mo = new MutationObserver(() => {
       if (!document.body.contains(modal) || modal.getBoundingClientRect().width === 0) {
         panel._vmuCleanup?.();
         panel.remove();
+        return;
       }
+      if (reapplyScheduled) return;
+      reapplyScheduled = true;
+      requestAnimationFrame(() => { reapplyScheduled = false; reapplyIssueHighlights(); });
     });
     mo.observe(document.body, { childList: true, subtree: true });
     panel._vmuCleanup = () => {
@@ -4108,19 +5321,60 @@
   // present on the page and which are missing.
   let checkModeRunning = false;
 
-  function normalizeKey(artist, title) {
-    const norm = s => String(s || '')
+  // Whole-title aliases across scripts — deliberately just the handful of
+  // near-universal, unambiguous album-structure track names where a
+  // Latin-alphabet spelling and a Cyrillic one are equally common in the
+  // wild and nothing else could plausibly share that (short, one-word)
+  // name. Not a general transliterator: real title words have too many
+  // valid many-to-one romanizations to guess safely (e.g. "Интро" could in
+  // principle transliterate several ways — this table only maps the one
+  // spelling that's actually standard for each).
+  const NAME_TRANSLIT_ALIASES = {
+    intro: 'интро',
+    outro: 'аутро',
+    skit: 'скит',
+  };
+
+  function normalizeNamePart(s) {
+    const norm = String(s || '')
+      // Genius titles sometimes arrive Unicode-decomposed (e.g. "й" as base
+      // "и" + combining breve U+0306) while VK titles are precomposed —
+      // verified live: "другой" from Genius silently failed to match VK's
+      // "другой" despite being visually identical, because the raw strings
+      // differed byte-for-byte. NFC folds both to the same composed form.
+      .normalize('NFC')
       .toLowerCase()
+      // ё vs е is treated as the same letter almost everywhere in casual
+      // Russian typing — verified live: "ребёнок" (VK title) silently
+      // failed to match Genius's "ребенок" over exactly this one letter.
+      .replace(/ё/g, 'е')
       .replace(/[–—]/g, '-')
       // strip square/curly bracket tags like "[vk.com/reuploadunder]" or "(Live)"
       .replace(/[\[\{].*?[\]\}]/g, ' ')
       .replace(/\([^)]*\)\s*$/g, ' ')
-      // drop "feat. X" / "ft. X" suffixes so credits don't break matching
-      .replace(/\s+(?:feat\.?|ft\.?|при\s+участии)\s+.*$/i, '')
+      // drop "feat. X" / "ft. X" / "при участии X" suffixes so credits don't
+      // break matching. [\s(]+ (not just \s+) before the keyword also
+      // rescues a malformed credits parenthetical — e.g. "(при участии A,
+      // B (2000) и C" with no final ")", verified live on a real reuploaded
+      // track — where a nested "(...)" inside the credits list steals the
+      // real closing paren, so the trailing-paren strip above only eats the
+      // innermost group and leaves "(при участии ..." dangling with a "("
+      // immediately before it instead of whitespace.
+      .replace(/[\s(]+(?:feat\.?|ft\.?|при\s+участии)\s+.*$/i, '')
       .replace(/[«»"'`’]/g, '')
+      // Trailing "?"/"!" is often present on only one side of a match —
+      // Genius keeps title punctuation, reuploaded filenames routinely drop
+      // it — so ignore it rather than let it block an otherwise-exact match.
+      .replace(/[?!]+\s*$/g, '')
       .replace(/\s+/g, ' ')
       .trim();
-    return norm(artist) + '|||' + norm(title);
+    // Canonicalize to the Cyrillic spelling so "Intro" and "Интро" (either
+    // order, either source) land on the same key regardless of which side
+    // used which script.
+    return NAME_TRANSLIT_ALIASES[norm] || norm;
+  }
+  function normalizeKey(artist, title) {
+    return normalizeNamePart(artist) + '|||' + normalizeNamePart(title);
   }
 
   async function fileToCheckEntry(f) {
@@ -4177,19 +5431,107 @@
   // limit = null → full page until lazy-load stops yielding more rows
   // limit = N    → stop after collecting N tracks (no scrolling beyond what
   //                is already loaded; the page renders ~100 rows on open)
-  async function harvestPageTracks(onProgress, limit) {
-    const collected = new Map();
-
-    // Scope to the "Треки" section specifically. The /audios overview page
-    // also renders "Недавно прослушанные" and other preview widgets using
-    // the exact same MusicTrackRow markup — scanning the whole document
-    // pulled those in as false "already on the page" matches. Falls back to
-    // the whole document on markups where this section isn't present.
-    // VK renamed the testid from AudioCatalog_SectionTracks to
-    // AudioCatalog_BlockMusicAudiosList; keep both so either markup works.
-    const scanRoot = document.querySelector(
+  // Scope to the "Треки" section specifically. The /audios overview page
+  // also renders "Недавно прослушанные" and other preview widgets using
+  // the exact same MusicTrackRow markup — scanning the whole document
+  // pulled those in as false "already on the page" matches. Falls back to
+  // the whole document on markups where this section isn't present.
+  // VK renamed the testid from AudioCatalog_SectionTracks to
+  // AudioCatalog_BlockMusicAudiosList; keep both so either markup works.
+  // Shared by harvestPageTracks (full scan) and scrollPageToTrackId
+  // (on-demand click-to-jump scroll).
+  function getPageScanRoot() {
+    return document.querySelector(
       '[data-testid="AudioCatalog_BlockMusicAudiosList"], [data-testid="AudioCatalog_SectionTracks"]'
     ) || document;
+  }
+
+  // Finds VK's real scrollable container for the audios page. Shared by
+  // harvestPageTracks (full scan) and scrollPageToTrackId (on-demand
+  // click-to-jump scroll) — both need to drive VK's lazy-loader.
+  function findPageScroller() {
+    const candidates = [...document.querySelectorAll('*')].filter(el => {
+      // Exclude our own injected UI (results panel from a previous check,
+      // settings/EQ panels, toasts, ...). A leftover scrollable panel like
+      // #vmu-check-panel's track list sorts earlier in document order than
+      // VK's real scroller, so it used to get picked here — the scroll dance
+      // below then scrolled OUR panel instead of the page, and VK's
+      // lazy-loader never fired past the first batch (page pagination
+      // appeared "broken" whenever a previous check panel was still open).
+      if (el.closest('[id^="vmu-"], [class*="vmu-"]')) return false;
+      const cs = getComputedStyle(el);
+      return (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
+    });
+    return candidates[0] || document.scrollingElement;
+  }
+
+  // Looks up an already-mounted page row for trackId without scrolling.
+  // Shared by focusPageRowByTrackId's fast path and scrollPageToTrackId's
+  // per-iteration check.
+  function findPageRowByTrackId(trackId, scanRoot) {
+    const rows = (scanRoot || getPageScanRoot()).querySelectorAll('[data-vmu-track]');
+    for (const row of rows) {
+      const fastId = row.dataset?.vmuId;
+      if (fastId && fastId !== trackId) continue;
+      try {
+        const t = JSON.parse(row.dataset.vmuTrack);
+        if (t?.id === trackId) return row;
+      } catch {}
+    }
+    return null;
+  }
+
+  // On-demand click-to-jump: harvestPageTracks (below) already mounts every
+  // row during its own full scan, so most clicks find their row instantly
+  // via the fast path above. This is the fallback for the rest — a reopened
+  // panel, a row that got virtualized back out, etc. Drives the same "wake
+  // VK's lazy-loader" scroll dance harvestPageTracks uses, but stops the
+  // moment the target row shows up instead of walking the whole page.
+  async function scrollPageToTrackId(trackId, onProgress) {
+    const scanRoot = getPageScanRoot();
+    let row = findPageRowByTrackId(trackId, scanRoot);
+    if (row) return row;
+
+    const sc = findPageScroller();
+    const initialTop = sc ? sc.scrollTop : 0;
+
+    const MAX_ITER = 120;
+    const STABLE_LIMIT = 15;
+    let stable = 0, lastHeight = sc ? sc.scrollHeight : 0;
+
+    for (let i = 0; i < MAX_ITER && stable < STABLE_LIMIT; i++) {
+      if (onProgress) onProgress(i);
+      if (sc) {
+        if (i % 3 === 2) {
+          sc.scrollTop = Math.max(0, sc.scrollHeight - sc.clientHeight - 1000);
+          await sleep(120);
+        }
+        sc.scrollTop = sc.scrollHeight;
+      }
+      await sleep(450);
+      if (i % 4 === 3) {
+        const rows = scanRoot.querySelectorAll('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]');
+        const lastRow = rows[rows.length - 1];
+        if (lastRow) lastRow.scrollIntoView({ block: 'end' });
+        await sleep(300);
+      }
+      await waitForMarkRows();
+      row = findPageRowByTrackId(trackId, scanRoot);
+      if (row) return row;
+      const h = sc ? sc.scrollHeight : 0;
+      if (h === lastHeight) stable++; else { stable = 0; lastHeight = h; }
+    }
+
+    // Not found even after the lazy-loader stopped yielding new rows —
+    // restore where the user was instead of leaving them scrolled to the
+    // bottom of the page for nothing.
+    if (sc) sc.scrollTop = initialTop;
+    return null;
+  }
+
+  async function harvestPageTracks(onProgress, limit) {
+    const collected = new Map();
+    const scanRoot = getPageScanRoot();
 
     function pull() {
       const uploadBox = getUploadDialog();
@@ -4212,22 +5554,7 @@
       }
     }
 
-    const findScroller = () => {
-      const candidates = [...document.querySelectorAll('*')].filter(el => {
-        // Exclude our own injected UI (results panel from a previous check,
-        // settings/EQ panels, toasts, ...). A leftover scrollable panel like
-        // #vmu-check-panel's track list sorts earlier in document order than
-        // VK's real scroller, so it used to get picked here — the scroll dance
-        // below then scrolled OUR panel instead of the page, and VK's
-        // lazy-loader never fired past the first batch (page pagination
-        // appeared "broken" whenever a previous check panel was still open).
-        if (el.closest('[id^="vmu-"], [class*="vmu-"]')) return false;
-        const cs = getComputedStyle(el);
-        return (cs.overflowY === 'auto' || cs.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 10;
-      });
-      return candidates[0] || document.scrollingElement;
-    };
-    const sc = findScroller();
+    const sc = findPageScroller();
     const initialTop = sc ? sc.scrollTop : 0;
 
     async function refreshStamps() {
@@ -4314,7 +5641,8 @@
 
       // Drop any results panel left over from a previous check run — besides
       // being stale, its scrollable track list would otherwise be a candidate
-      // for harvestPageTracks' findScroller() below.
+      // for findPageScroller() (used by harvestPageTracks below and by
+      // scrollPageToTrackId's on-demand click-to-jump).
       document.getElementById('vmu-check-panel')?._vmuCleanup?.();
       document.getElementById('vmu-check-panel')?.remove();
 
@@ -4325,9 +5653,9 @@
       const pageMap = await harvestPageTracks(n => {
         showProgressToast(`Сверка: считываем треки страницы (${n}${limitTxt})…`, { kind: 'progress', id: 'vmu-check-toast' });
       }, limit);
+      const pageTracks = [...pageMap.values()];
 
       // 4) build lookup by normalized key, also track ids for click-to-jump
-      const pageTracks = [...pageMap.values()];
       const pageKeyToTrack = new Map();
       pageTracks.forEach((t, index) => {
         const k = normalizeKey(t.artist, t.title);
@@ -4354,27 +5682,837 @@
   }
 
   // Scroll the audios page to a row matching trackId and flash it. Used by
-  // both minimap markers and clickable "present" list items.
-  function focusPageRowByTrackId(trackId) {
-    const rows = document.querySelectorAll('[data-vmu-track]');
-    let target = null;
-    for (const row of rows) {
-      try {
-        const t = JSON.parse(row.dataset.vmuTrack);
-        if (t.id === trackId) { target = row; break; }
-      } catch {}
-    }
+  // both minimap markers and clickable "present" list items. harvestPageTracks
+  // mounts every row during the scan that produced these results, so this is
+  // usually just the fast lookup below; scrollPageToTrackId is the fallback
+  // for whatever wasn't (a reopened panel, a row virtualized back out).
+  async function focusPageRowByTrackId(trackId) {
+    // The row may already be mounted (user scrolled past it earlier, or VK
+    // loaded it as part of the normal page render) but not yet stamped with
+    // data-vmu-track — markRowTrackData only stamps on request. Ask for a
+    // fresh stamp pass first so an already-there row is found instantly
+    // instead of falling through to the scroll hunt for no reason.
+    await waitForMarkRows();
+    let target = findPageRowByTrackId(trackId);
     if (!target) {
-      // Row likely virtualized out — scroll roughly to its expected position
-      // by finding any audio row index match via VKD_MARK_ROWS refresh
-      window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
-      return;
+      const toastId = 'vmu-jump-toast';
+      showProgressToast('Ищем трек на странице…', { kind: 'progress', id: toastId });
+      try {
+        target = await scrollPageToTrackId(trackId, n => {
+          showProgressToast(`Ищем трек на странице… (${n})`, { kind: 'progress', id: toastId });
+        });
+      } catch (e) {
+        console.warn('[vmu] scrollPageToTrackId failed:', e.message);
+      }
+      if (!target) {
+        showProgressToast('Трек не найден на странице', { kind: 'error', id: toastId });
+        return;
+      }
+      document.getElementById(toastId)?.remove();
     }
     target.scrollIntoView({ behavior: 'smooth', block: 'center' });
     target.classList.remove('vmu-dupe-flash');
     void target.offsetWidth;
     target.classList.add('vmu-dupe-flash');
     setTimeout(() => target.classList.remove('vmu-dupe-flash'), 1400);
+  }
+
+  // Shared by bulk-ops (and could replace the reorder feature's inline copy,
+  // left as-is since it's already proven live) — title-first matching, artist
+  // only as a tiebreaker between rows sharing the same normalized title. See
+  // applyPlaylistOrderFromEntries's comment: different sources format
+  // multi-artist credits too differently for exact artist matching to work.
+  function matchByTitleThenArtist(entries, candidates) {
+    const wordsOf = s => normalizeNamePart(s).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    const meta = candidates.map(c => ({ titleKey: normalizeNamePart(c.title), artistWords: new Set(wordsOf(c.artist)) }));
+    const claimed = new Set();
+    const matches = [];
+    entries.forEach((en, ei) => {
+      const titleKey = normalizeNamePart(en.title);
+      const artistWords = wordsOf(en.artist);
+      const cands = meta.map((m, i) => ({ m, i })).filter(({ m, i }) => !claimed.has(i) && m.titleKey === titleKey);
+      if (!cands.length) return;
+      let best = cands[0];
+      if (cands.length > 1) {
+        let bestScore = -1;
+        for (const c of cands) {
+          const score = artistWords.reduce((n, w) => n + (c.m.artistWords.has(w) ? 1 : 0), 0);
+          if (score > bestScore) { bestScore = score; best = c; }
+        }
+      }
+      claimed.add(best.i);
+      matches.push({ entryIndex: ei, candidateIndex: best.i });
+    });
+    return matches;
+  }
+
+  // This group's own uploads all carry a trailing "[vk.com/reuploadunder]"-
+  // style watermark that neither Genius nor local files know about — syncing
+  // title verbatim from either source would silently strip it. Reappend the
+  // current title's trailing bracket tag onto the new title unless the new
+  // title already ends with one of its own.
+  function preserveBracketTag(oldTitle, newTitle) {
+    const m = (oldTitle || '').match(/\s*(\[[^\]]*\])\s*$/);
+    if (!m) return newTitle;
+    if (/\]\s*$/.test((newTitle || '').trim())) return newTitle;
+    return `${newTitle} ${m[1]}`;
+  }
+
+  // Genius annotates every non-English name/title with a parenthesized
+  // English transliteration right after it — "Слава КПСС (Slava KPSS)",
+  // "ЗАМАЙ (ZAMAY) & Слава КПСС (Slava KPSS)", "Двуглавый орёл (Double-headed
+  // Eagle)" — useful for their own search, not something that belongs in a
+  // VK title/artist field when synced. Strips every "(...)" group, not just
+  // a trailing one (artist strings can have one per name).
+  function stripGeniusTranslation(s) {
+    return String(s || '').replace(/\s*\([^)]*\)/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  // Makes a fixed-position panel draggable by a handle inside it (its header,
+  // typically) — pointer events so mouse and touch both work with one
+  // listener set. Switches the panel from whatever positioning it started
+  // with (e.g. `right`-anchored) to an explicit left/top pair on first drag,
+  // clamped so it can't be dragged fully off-screen. A click on a button/link
+  // inside the handle (the panel's own close button) starts no drag.
+  function makePanelDraggable(panel, handle) {
+    let startX = 0, startY = 0, startLeft = 0, startTop = 0, dragging = false;
+    handle.addEventListener('pointerdown', e => {
+      if (e.button !== 0 || e.target.closest('button, a, input')) return;
+      dragging = true;
+      const r = panel.getBoundingClientRect();
+      startLeft = r.left; startTop = r.top;
+      startX = e.clientX; startY = e.clientY;
+      panel.style.left = startLeft + 'px';
+      panel.style.top = startTop + 'px';
+      panel.style.right = 'auto';
+      handle.setPointerCapture(e.pointerId);
+      handle.classList.add('vmu-dragging');
+    });
+    handle.addEventListener('pointermove', e => {
+      if (!dragging) return;
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      const maxLeft = Math.max(0, window.innerWidth - 60);
+      const maxTop = Math.max(0, window.innerHeight - 40);
+      panel.style.left = Math.min(Math.max(0, startLeft + dx), maxLeft) + 'px';
+      panel.style.top = Math.min(Math.max(0, startTop + dy), maxTop) + 'px';
+    });
+    const stopDrag = e => {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove('vmu-dragging');
+      try { handle.releasePointerCapture(e.pointerId); } catch {}
+    };
+    handle.addEventListener('pointerup', stopDrag);
+    handle.addEventListener('pointercancel', stopDrag);
+  }
+
+  // Inline "are you sure" step for a mass edit/delete apply button — swaps
+  // the button out for a message + Да/Отмена pair in place, rather than a
+  // native confirm() (blockable, and looks out of place next to the rest of
+  // the panel). Resolves true only on an explicit "Да" click; restores the
+  // trigger button either way.
+  function vmuConfirmBulkAction(actionsEl, triggerBtn, message, confirmLabel) {
+    return new Promise(resolve => {
+      triggerBtn.style.display = 'none';
+      const bar = document.createElement('div');
+      bar.className = 'vmu-bulk-confirm';
+      bar.innerHTML = `
+        <span class="vmu-bulk-confirm-msg">${escHtml(message)}</span>
+        <button type="button" class="vmu-bulk-confirm-yes">${escHtml(confirmLabel)}</button>
+        <button type="button" class="vmu-bulk-confirm-no">Отмена</button>
+      `;
+      actionsEl.appendChild(bar);
+      const cleanup = ok => {
+        bar.remove();
+        triggerBtn.style.display = '';
+        resolve(ok);
+      };
+      bar.querySelector('.vmu-bulk-confirm-yes').addEventListener('click', () => cleanup(true));
+      bar.querySelector('.vmu-bulk-confirm-no').addEventListener('click', () => cleanup(false));
+    });
+  }
+
+  // Standalone panel — doesn't need a prior "Проверка" file-drop scan.
+  // Triggered from the floating button injected by injectBulkOpsButton()
+  // (present on any audios page). Scans the page itself the moment it opens.
+  let _bulkOpsCancelled = false;
+  async function openBulkOpsPanel() {
+    const oldPanel = document.getElementById('vmu-bulkops-panel');
+    oldPanel?._vmuCleanup?.();
+    oldPanel?.remove();
+    _bulkOpsCancelled = false;
+
+    const panel = document.createElement('div');
+    panel.id = 'vmu-bulkops-panel';
+    panel.className = 'vmu-bulkops-panel';
+    panel.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Массовые операции</span>
+        <button type="button" class="vmu-check-close" id="vmu-bulkops-close" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body">
+        <div class="vmu-bulkops-scan-status">Сканируем страницу…</div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    panel.querySelector('#vmu-bulkops-close').addEventListener('click', () => {
+      _bulkOpsCancelled = true;
+      panel._vmuCleanup?.();
+      panel.remove();
+    });
+    makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+
+    const bodyEl = panel.querySelector('.vmu-bulkops-body');
+    const statusEl = panel.querySelector('.vmu-bulkops-scan-status');
+    // Always the whole page here, regardless of the "Проверка" full-page
+    // setting — a bulk operation that silently only considered the first 100
+    // of e.g. 983 tracks looks exactly like "didn't process all the tracks".
+    const pageMap = await harvestPageTracks(n => {
+      if (statusEl.isConnected) statusEl.textContent = `Сканируем страницу… (${n})`;
+    }, null);
+    if (_bulkOpsCancelled) return;
+
+    const pageTracks = [...pageMap.values()];
+    bodyEl.innerHTML = `<div class="vmu-bulkops-scan-status">Треков на странице: ${pageTracks.length}</div>`;
+    buildDupesCleanupSection(bodyEl, pageTracks, panel);
+    buildBulkOpsSection(bodyEl, { pageTracks, entries: [] });
+  }
+
+  // Small floating "are you sure" popup anchored under the mass-ops button —
+  // the panel it opens can rename or delete a lot of tracks in one go, so a
+  // stray click on the button shouldn't drop straight into it. Custom-styled
+  // (not native confirm(), same reasoning as vmuConfirmBulkAction) so it
+  // looks like part of the extension instead of a browser dialog.
+  function vmuConfirmMassOpsLaunch(anchorBtn) {
+    return new Promise(resolve => {
+      document.getElementById('vmu-massop-confirm')?.remove();
+      const rect = anchorBtn.getBoundingClientRect();
+      const pop = document.createElement('div');
+      pop.id = 'vmu-massop-confirm';
+      pop.className = 'vmu-massop-confirm';
+      pop.style.top = `${rect.bottom + 8}px`;
+      pop.style.right = `${Math.max(8, window.innerWidth - rect.right)}px`;
+      pop.innerHTML = `
+        <div class="vmu-massop-confirm-msg">Открыть массовые операции? Там можно разом переименовать или удалить много треков.</div>
+        <div class="vmu-massop-confirm-actions">
+          <button type="button" class="vmu-massop-confirm-no">Отмена</button>
+          <button type="button" class="vmu-massop-confirm-yes">Да, открыть</button>
+        </div>
+      `;
+      document.body.appendChild(pop);
+
+      const cleanup = ok => {
+        document.removeEventListener('mousedown', onOutside, true);
+        document.removeEventListener('keydown', onKey, true);
+        pop.remove();
+        resolve(ok);
+      };
+      const onOutside = e => {
+        if (pop.contains(e.target) || e.target === anchorBtn) return;
+        cleanup(false);
+      };
+      const onKey = e => { if (e.key === 'Escape') cleanup(false); };
+      pop.querySelector('.vmu-massop-confirm-yes').addEventListener('click', () => cleanup(true));
+      pop.querySelector('.vmu-massop-confirm-no').addEventListener('click', () => cleanup(false));
+      document.addEventListener('mousedown', onOutside, true);
+      document.addEventListener('keydown', onKey, true);
+    });
+  }
+
+  // Real button, inserted as a sibling into VK's own button group next to
+  // "Загрузить аудиозапись" (not a clone of VK's node — appending a fresh
+  // element into a container React already owns is the same safe pattern
+  // injectSingleDlBtn already uses elsewhere; cloning/mutating VK's own node
+  // risks React's reconciliation fighting us on the next re-render).
+  function injectBulkOpsButton() {
+    if (document.getElementById('vmu-bulkops-btn')) return;
+    const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
+    const group = uploadBtn?.parentElement;
+    if (!group) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vmu-bulkops-btn';
+    btn.className = uploadBtn.className;
+    btn.setAttribute('aria-label', 'Массовые операции');
+    btn.title = 'Массовые операции (переименование/артист по Genius или файлам)';
+    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h14M3 10h10M3 14h6"/></svg>`;
+    btn.addEventListener('click', async () => {
+      if (document.getElementById('vmu-massop-confirm')) return;
+      const confirmed = await vmuConfirmMassOpsLaunch(btn);
+      if (confirmed) openBulkOpsPanel();
+    });
+    group.insertBefore(btn, uploadBtn);
+  }
+  new MutationObserver(() => injectBulkOpsButton()).observe(document.body, { childList: true, subtree: true });
+  injectBulkOpsButton();
+
+  function buildBulkOpsSection(list, { pageTracks, entries }) {
+    const wrap = document.createElement('div');
+    wrap.className = 'vmu-bulk-ops';
+    wrap.innerHTML = `
+      <div class="vmu-rename-block">
+        <span class="vmu-rename-block-label">Источник</span>
+        <div class="vmu-mode-switch" id="vmu-bulk-source-switch" role="tablist">
+          <button type="button" data-src="files" class="active">Файлы</button>
+          <button type="button" data-src="genius">Genius</button>
+        </div>
+      </div>
+      <div id="vmu-bulk-files-block">
+        <div id="vmu-bulk-files-dz" class="vmu-pl-sort-dz">
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v9M6.5 6.5L10 3l3.5 3.5"/><path d="M4 13.5v1.5A1.5 1.5 0 0 0 5.5 16.5h9a1.5 1.5 0 0 0 1.5-1.5v-1.5"/></svg>
+          <span class="vmu-pl-sort-dz-hint">Перетащи MP3 сюда</span>
+          <label class="vmu-pick-btn">
+            ${ICON_UPLOAD}
+            Выбрать файлы
+            <input type="file" id="vmu-bulk-files-input" class="vmu-pl-sort-input" accept=".mp3,audio/mpeg" multiple>
+          </label>
+        </div>
+      </div>
+      <div id="vmu-bulk-genius-block" style="display:none">
+        <div class="vmu-pl-genius-searchrow">
+          <input type="text" id="vmu-bulk-genius-q" class="vmu-pl-genius-input" placeholder="Исполнитель альбом, или ссылка genius.com/albums/...">
+          <button type="button" id="vmu-bulk-genius-go" class="vmu-pick-btn">Искать</button>
+        </div>
+        <div id="vmu-bulk-genius-results" class="vmu-pl-genius-results"></div>
+      </div>
+      <div class="vmu-rename-block">
+        <span class="vmu-rename-block-label">Синхронизировать</span>
+        <div class="vmu-rename-checks">
+          <label class="vmu-rename-check">
+            <input type="checkbox" id="vmu-bulk-op-artist" checked>
+            <span>Исполнителя</span>
+          </label>
+          <label class="vmu-rename-check">
+            <input type="checkbox" id="vmu-bulk-op-title">
+            <span>Название</span>
+          </label>
+        </div>
+      </div>
+      <div class="vmu-bulk-source-hint" id="vmu-bulk-source-hint"></div>
+      <div class="vmu-rename-actions">
+        <button type="button" id="vmu-bulk-preview-btn" class="vmu-rename-preview-btn" disabled>
+          <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2 10s3-5.5 8-5.5S18 10 18 10s-3 5.5-8 5.5S2 10 2 10z"/><circle cx="10" cy="10" r="2.3"/></svg>
+          Показать превью
+        </button>
+        <button type="button" id="vmu-bulk-cleanup-btn" class="vmu-rename-cleanup-btn" title="Очистить «(транскрипцию)» в скобках у уже переименованных треков">
+          <svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.7 3.5a2 2 0 0 1 2.8 0l1.2 1.2a2 2 0 0 1 0 2.8L9.2 16H4v-5.2L13.7 3.5z"/><path d="M7 16h9M11.2 5.5l4.3 4.3"/></svg>
+          Скобки
+        </button>
+      </div>
+      <div id="vmu-bulk-preview"></div>
+    `;
+    list.appendChild(wrap);
+
+    let sourceEntries = entries.length ? entries : null;
+    let sourceLabel = 'файлы';
+    const hintEl = wrap.querySelector('#vmu-bulk-source-hint');
+    const previewBtn = wrap.querySelector('#vmu-bulk-preview-btn');
+    const previewHost = wrap.querySelector('#vmu-bulk-preview');
+
+    function updateHint() {
+      previewHost.innerHTML = '';
+      if (!sourceEntries || !sourceEntries.length) {
+        hintEl.textContent = 'Источник не выбран';
+        previewBtn.disabled = true;
+        return;
+      }
+      hintEl.textContent = `${sourceLabel}: ${sourceEntries.length} записей`;
+      previewBtn.disabled = false;
+    }
+    updateHint();
+
+    wrap.querySelector('#vmu-bulk-source-switch').addEventListener('click', e => {
+      const btn = e.target.closest('button[data-src]');
+      if (!btn) return;
+      wrap.querySelectorAll('#vmu-bulk-source-switch button').forEach(b => b.classList.toggle('active', b === btn));
+      const isGenius = btn.dataset.src === 'genius';
+      wrap.querySelector('#vmu-bulk-genius-block').style.display = isGenius ? '' : 'none';
+      wrap.querySelector('#vmu-bulk-files-block').style.display = isGenius ? 'none' : '';
+      if (!isGenius) { sourceEntries = entries.length ? entries : null; sourceLabel = 'файлы'; }
+      else { sourceEntries = null; sourceLabel = 'Genius'; }
+      updateHint();
+    });
+
+    const filesDz = wrap.querySelector('#vmu-bulk-files-dz');
+    const filesInput = wrap.querySelector('#vmu-bulk-files-input');
+    const handleBulkFiles = async files => {
+      const mp3s = [...files].filter(isMP3);
+      if (!mp3s.length) return;
+      const parsed = [];
+      for (const f of mp3s) parsed.push(await fileToCheckEntry(f));
+      sourceEntries = parsed;
+      sourceLabel = 'файлы';
+      updateHint();
+    };
+    filesDz.addEventListener('dragover', e => { e.preventDefault(); filesDz.classList.add('vmu-over'); });
+    filesDz.addEventListener('dragleave', e => { if (!filesDz.contains(e.relatedTarget)) filesDz.classList.remove('vmu-over'); });
+    filesDz.addEventListener('drop', e => {
+      e.preventDefault();
+      filesDz.classList.remove('vmu-over');
+      handleBulkFiles(e.dataTransfer?.files || []);
+    });
+    filesInput.addEventListener('change', () => { handleBulkFiles(filesInput.files); filesInput.value = ''; });
+
+    const gInput = wrap.querySelector('#vmu-bulk-genius-q');
+    const gResults = wrap.querySelector('#vmu-bulk-genius-results');
+    const setGStatus = t => { gResults.innerHTML = t ? `<div class="vmu-pl-genius-status">${escHtml(t)}</div>` : ''; };
+    const renderGResults = albums => {
+      gResults.innerHTML = albums.map((a, i) => `
+        <div class="vmu-pl-genius-result" data-idx="${i}">
+          ${a.cover ? `<img src="${escHtml(a.cover)}" alt="">` : ''}
+          <div class="vmu-pl-genius-result-info">
+            <span class="vmu-pl-genius-result-name">${escHtml(a.name)}</span>
+            <span class="vmu-pl-genius-result-meta">${escHtml(a.artist)}${a.release ? ' · ' + escHtml(a.release) : ''}</span>
+          </div>
+        </div>`).join('');
+      gResults.querySelectorAll('.vmu-pl-genius-result').forEach(el => {
+        el.addEventListener('click', async () => {
+          const album = albums[Number(el.dataset.idx)];
+          setGStatus('Подтягиваем треклист…');
+          const res = await geniusMsg('VKD_GENIUS_TRACKS', { albumId: album.id, albumUrl: album.url });
+          if (!res?.ok) { setGStatus(res?.error || 'ошибка'); return; }
+          sourceEntries = res.tracks.map(t => ({ artist: stripGeniusTranslation(t.artist), title: stripGeniusTranslation(t.title) }));
+          sourceLabel = 'Genius: ' + album.name;
+          setGStatus(`Загружено ${sourceEntries.length} треков`);
+          updateHint();
+        });
+      });
+    };
+    const runGSearch = async () => {
+      const raw = gInput.value.trim();
+      if (!raw) return;
+      if (/^https?:\/\/(www\.)?genius\.com\/albums\//i.test(raw)) {
+        setGStatus('Подтягиваем треклист…');
+        const res = await geniusMsg('VKD_GENIUS_TRACKS', { albumUrl: raw });
+        if (!res?.ok) { setGStatus(res?.error || 'ошибка'); return; }
+        sourceEntries = res.tracks.map(t => ({ artist: stripGeniusTranslation(t.artist), title: stripGeniusTranslation(t.title) }));
+        sourceLabel = 'Genius';
+        setGStatus(`Загружено ${sourceEntries.length} треков`);
+        updateHint();
+        return;
+      }
+      setGStatus('Ищем на Genius…');
+      const res = await geniusMsg('VKD_GENIUS_SEARCH', { query: raw });
+      if (!res?.ok) { setGStatus(res?.error || 'ничего не найдено'); return; }
+      renderGResults(res.albums);
+    };
+    wrap.querySelector('#vmu-bulk-genius-go').addEventListener('click', runGSearch);
+    gInput.addEventListener('keydown', e => { if (e.key === 'Enter') runGSearch(); });
+
+    previewBtn.addEventListener('click', () => {
+      if (!sourceEntries || !sourceEntries.length) return;
+      const opArtist = wrap.querySelector('#vmu-bulk-op-artist').checked;
+      const opTitle = wrap.querySelector('#vmu-bulk-op-title').checked;
+      if (!opArtist && !opTitle) { previewHost.innerHTML = '<div class="vmu-check-empty">Выбери хотя бы одну операцию</div>'; return; }
+
+      const matches = matchByTitleThenArtist(sourceEntries, pageTracks);
+      const changes = [];
+      for (const { entryIndex, candidateIndex } of matches) {
+        const en = sourceEntries[entryIndex];
+        const tr = pageTracks[candidateIndex];
+        const newArtist = opArtist ? en.artist : tr.artist;
+        const newTitle = opTitle ? preserveBracketTag(tr.title, en.title) : tr.title;
+        if (newArtist === tr.artist && newTitle === tr.title) continue;
+        changes.push({ track: tr, oldArtist: tr.artist, oldTitle: tr.title, newArtist, newTitle });
+      }
+
+      if (!changes.length) {
+        previewHost.innerHTML = `<div class="vmu-check-empty">Изменений нет (сопоставлено ${matches.length} из ${sourceEntries.length})</div>`;
+        return;
+      }
+
+      renderQueue(changes);
+    });
+
+    // Self-referential cleanup: no source needed, just strips leftover
+    // Genius-style "(English transcription)" parens from whatever pageTracks
+    // already have — for tracks a bulk sync applied before this stripping
+    // existed. [vk.com/...] uses square brackets, untouched by this.
+    wrap.querySelector('#vmu-bulk-cleanup-btn').addEventListener('click', () => {
+      const changes = [];
+      for (const tr of pageTracks) {
+        const newArtist = stripGeniusTranslation(tr.artist);
+        const newTitle = stripGeniusTranslation(tr.title);
+        if (newArtist === tr.artist && newTitle === tr.title) continue;
+        changes.push({ track: tr, oldArtist: tr.artist, oldTitle: tr.title, newArtist, newTitle });
+      }
+      if (!changes.length) {
+        previewHost.innerHTML = '<div class="vmu-check-empty">Скобок с транскрипцией не найдено</div>';
+        return;
+      }
+      renderQueue(changes);
+    });
+
+    // Renders the change list as a real queue: every row gets a live status
+    // (waiting → applying → done/error) as VKD_BULK_EDIT_PROGRESS comes in,
+    // per item — not just an aggregate "N ok / M failed" toast, so it's
+    // obvious which specific tracks need a retry rather than a vague "some
+    // didn't go through". "Применить" only (re-)sends rows still pending or
+    // errored — already-done rows are left alone, so a retry after a partial
+    // run doesn't redo work that already succeeded.
+    function renderQueue(changes) {
+      previewHost.innerHTML = `
+        <div class="vmu-bulk-preview-summary" id="vmu-bulk-summary">Изменится: ${changes.length}</div>
+        <div class="vmu-bulk-preview-list" id="vmu-bulk-preview-list">
+          ${changes.map((c, i) => `
+            <div class="vmu-bulk-preview-item" data-idx="${i}" data-status="pending">
+              <span class="vmu-bulk-status-dot" title="В очереди"></span>
+              <div class="vmu-bulk-preview-text">
+                <div class="vmu-bulk-preview-old">${escHtml(c.oldArtist)} — ${escHtml(c.oldTitle)}</div>
+                <div class="vmu-bulk-preview-new">${escHtml(c.newArtist)} — ${escHtml(c.newTitle)}</div>
+              </div>
+            </div>`).join('')}
+        </div>
+        <div class="vmu-bulk-preview-actions">
+          <button type="button" id="vmu-bulk-apply-btn" class="vmu-pick-btn">Применить (${changes.length})</button>
+        </div>
+      `;
+      const listEl = previewHost.querySelector('#vmu-bulk-preview-list');
+      const summaryEl = previewHost.querySelector('#vmu-bulk-summary');
+      const applyBtn = previewHost.querySelector('#vmu-bulk-apply-btn');
+
+      const setRowStatus = (i, status, title) => {
+        const row = listEl.querySelector(`[data-idx="${i}"]`);
+        if (!row) return;
+        row.dataset.status = status;
+        const dot = row.querySelector('.vmu-bulk-status-dot');
+        if (title) dot.title = title;
+      };
+
+      applyBtn.addEventListener('click', async () => {
+        const pending = changes
+          .map((c, i) => ({ c, i }))
+          .filter(({ i }) => listEl.querySelector(`[data-idx="${i}"]`)?.dataset.status !== 'done');
+        if (!pending.length) return;
+
+        const actionsEl = previewHost.querySelector('.vmu-bulk-preview-actions');
+        const confirmed = await vmuConfirmBulkAction(
+          actionsEl, applyBtn,
+          'Точно начать? Изменения уйдут в ВК сразу, без предпросмотра результата.',
+          'Да, применить'
+        );
+        if (!confirmed) return;
+
+        // ownerId is per track, not shared for the whole batch — a group's
+        // own "Треки" listing mixes tracks it actually owns with ones added
+        // from other owners, and audio.edit needs the correct pairing per item.
+        const edits = [];
+        const editIdxMap = [];
+        for (const { c, i } of pending) {
+          const parts = String(c.track.id).split('_');
+          if (parts.length < 2) continue;
+          edits.push({ ownerId: parts[0], audioId: Number(parts[1]), artist: c.newArtist, title: c.newTitle });
+          editIdxMap.push(i);
+          setRowStatus(i, 'pending', 'В очереди');
+        }
+        if (!edits.length) { showToast('Не удалось определить owner_id/audio_id', true); return; }
+
+        applyBtn.disabled = true;
+        applyBtn.textContent = `Применяем 0/${edits.length}…`;
+
+        const onProgress = e => {
+          if (e.source !== window || e.data?.type !== 'VKD_BULK_EDIT_PROGRESS') return;
+          applyBtn.textContent = `Применяем ${e.data.done}/${e.data.total}…`;
+          const rowIdx = editIdxMap[e.data.index];
+          if (rowIdx != null) setRowStatus(rowIdx, e.data.itemOk ? 'done' : 'error', e.data.itemOk ? 'Готово' : (e.data.error || 'Ошибка'));
+        };
+        window.addEventListener('message', onProgress);
+
+        const done = new Promise(resolve => {
+          const h = e => {
+            if (e.source !== window || e.data?.type !== 'VKD_BULK_EDIT_DONE') return;
+            window.removeEventListener('message', h);
+            resolve(e.data);
+          };
+          window.addEventListener('message', h);
+        });
+        window.postMessage({ type: 'VKD_BULK_EDIT', edits }, '*');
+        const result = await done;
+        window.removeEventListener('message', onProgress);
+
+        const failCount = listEl.querySelectorAll('[data-status="error"]').length;
+        if (result.ok) {
+          summaryEl.textContent = failCount
+            ? `Применено: ${changes.length - failCount} из ${changes.length}, ошибок: ${failCount}`
+            : `Готово: применено ${changes.length} из ${changes.length}`;
+        } else {
+          summaryEl.textContent = 'Ошибка запроса: ' + (result.error || '?');
+        }
+        applyBtn.disabled = false;
+        applyBtn.textContent = failCount ? `Повторить неудачные (${failCount})` : `Применить (${changes.length})`;
+        if (!failCount) applyBtn.style.display = 'none';
+      });
+    }
+  }
+
+  // Reuses findDuplicatesAndBlocked (same detection as the playlist dupe/
+  // blocked scanner) against the page-wide harvest. Presentation mirrors
+  // buildIssuePanel's grouped list (label + all positions per duplicate set,
+  // not one flat row per track) since that's clearer than a flat list once
+  // there are more than a couple of duplicate pairs — same reason it already
+  // looks better for playlists. Duplicate groups keep their first
+  // occurrence; only later copies (and blocked tracks) are queued for
+  // removal via bulkDeleteTracks (audio.delete).
+  function buildDupesCleanupSection(list, pageTracks, panel) {
+    const wrap = document.createElement('div');
+    wrap.className = 'vmu-cleanup';
+    list.appendChild(wrap);
+
+    // Persistent amber/red highlight directly on the page — same treatment
+    // scanForDuplicates already gives the playlist popup. harvestPageTracks
+    // already mounted every row by the time this runs, but reapplying on
+    // mutation is cheap insurance against anything that mounts later (a
+    // manual scroll, VK re-rendering a section) — torn down when the panel
+    // closes (wired through panel._vmuCleanup below).
+    function watchPageHighlights(dupes, blockedIndices) {
+      // Newly-mounted rows aren't stamped with data-vmu-track until asked —
+      // request a fresh stamp pass before each reapply so rows VK just added
+      // actually pick up the highlight instead of waiting for some later,
+      // unrelated stamp trigger.
+      const reapply = async () => {
+        await waitForMarkRows();
+        if (dupes.length) highlightDuplicateTracks(dupes);
+        if (blockedIndices.length) highlightBlockedTracks(pageTracks, blockedIndices);
+      };
+      reapply();
+      let scheduled = false;
+      const mo = new MutationObserver(() => {
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(() => { scheduled = false; reapply(); });
+      });
+      mo.observe(getPageScanRoot(), { childList: true, subtree: true });
+      return () => {
+        mo.disconnect();
+        document.querySelectorAll('.vmu-dupe-highlight, .vmu-blocked-highlight').forEach(el => {
+          el.classList.remove('vmu-dupe-highlight');
+          el.classList.remove('vmu-blocked-highlight');
+        });
+      };
+    }
+
+    function render() {
+      panel._vmuCleanup?.();
+      panel._vmuCleanup = null;
+
+      const { dupes, dupeGroups, blockedIndices } = findDuplicatesAndBlocked(pageTracks);
+
+      if (!dupes.length && !blockedIndices.length) {
+        wrap.innerHTML = `<div class="vmu-bulkops-scan-status">Дубликатов и заблокированных не найдено</div>`;
+        return;
+      }
+
+      // Same removal set as before — first occurrence of each duplicate
+      // group is kept, the rest (plus every blocked track) are queued.
+      const toRemove = new Map();
+      for (const d of dupes) {
+        if (!d.track?.id) continue;
+        toRemove.set(d.track.id, d.track);
+      }
+      for (const i of blockedIndices) {
+        const t = pageTracks[i];
+        if (t?.id) toRemove.set(t.id, t);
+      }
+      const removeItems = [...toRemove.values()];
+
+      wrap.innerHTML = `
+        <div class="vmu-cleanup-stats">
+          ${blockedIndices.length ? `
+            <span class="vmu-cleanup-stat vmu-cleanup-stat-blocked">
+              <svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="10" cy="10" r="7.3"/><path d="M5.2 5.2l9.6 9.6" stroke-linecap="round"/></svg>
+              ${blockedIndices.length} недоступно
+            </span>` : ''}
+          ${dupes.length ? `
+            <span class="vmu-cleanup-stat vmu-cleanup-stat-dupes">
+              <svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="10" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>
+              ${dupes.length} дублей
+            </span>` : ''}
+          <button class="vmu-cleanup-copy" type="button" title="Скопировать список">
+            <svg width="13" height="13" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="12" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>
+          </button>
+        </div>
+        <div class="vmu-cleanup-list" id="vmu-bulk-dupes-list"></div>
+        <div class="vmu-cleanup-actions">
+          <button type="button" id="vmu-bulk-dupes-apply-btn" class="vmu-cleanup-delete-btn">
+            <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h12M8 6V4.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V6m2 0-.6 10.2a1.5 1.5 0 0 1-1.5 1.3H7.1a1.5 1.5 0 0 1-1.5-1.3L5 6"/></svg>
+            <span class="vmu-cleanup-delete-btn-label">Удалить (${removeItems.length})</span>
+          </button>
+        </div>
+      `;
+      const listEl = wrap.querySelector('#vmu-bulk-dupes-list');
+      const blockedLines = [];
+
+      if (blockedIndices.length) {
+        const sectionHead = document.createElement('div');
+        sectionHead.className = 'vmu-cleanup-section-head is-blocked';
+        sectionHead.innerHTML = `Недоступные <span class="vmu-cleanup-count-sub">· ${blockedIndices.length}</span>`;
+        listEl.appendChild(sectionHead);
+        const cards = document.createElement('div');
+        cards.className = 'vmu-cleanup-cards';
+        for (const idx of blockedIndices) {
+          const t = pageTracks[idx] || {};
+          const label = `${t.artist || ''}${t.artist ? ' — ' : ''}${t.title || ''}`.trim() || `Трек ${idx + 1}`;
+          blockedLines.push(label);
+          const row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'vmu-cleanup-card';
+          row.title = 'Перейти к треку · будет удалён';
+          if (t.id) row.dataset.trackId = t.id;
+          const rowText = document.createElement('span');
+          rowText.className = 'vmu-cleanup-card-text';
+          rowText.textContent = label;
+          const tag = document.createElement('span');
+          tag.className = 'vmu-cleanup-card-tag';
+          tag.textContent = 'удалить';
+          row.append(rowText, tag);
+          row.addEventListener('click', () => { if (t.id) focusPageRowByTrackId(t.id); });
+          cards.appendChild(row);
+        }
+        listEl.appendChild(cards);
+      }
+
+      if (dupeGroups.length) {
+        const sectionHead = document.createElement('div');
+        sectionHead.className = 'vmu-cleanup-section-head is-dupes';
+        sectionHead.innerHTML = `Дубликаты <span class="vmu-cleanup-count-sub">· ${dupeGroups.length} ${dupeGroups.length === 1 ? 'группа' : 'групп'}</span>`;
+        listEl.appendChild(sectionHead);
+        const groupsWrap = document.createElement('div');
+        groupsWrap.className = 'vmu-cleanup-cards';
+        for (const g of dupeGroups) {
+          const group = document.createElement('div');
+          group.className = 'vmu-cleanup-group';
+
+          const title = document.createElement('div');
+          title.className = 'vmu-cleanup-group-head';
+          title.title = g.label;
+          const nameSpan = document.createElement('span');
+          nameSpan.className = 'vmu-cleanup-group-name';
+          nameSpan.textContent = g.label;
+          const countSpan = document.createElement('span');
+          countSpan.className = 'vmu-cleanup-group-count';
+          countSpan.textContent = '×' + g.indices.length;
+          title.append(nameSpan, countSpan);
+          group.appendChild(title);
+
+          const positions = document.createElement('div');
+          positions.className = 'vmu-cleanup-positions';
+          g.indices.forEach((idx, gi) => {
+            const t = pageTracks[idx] || {};
+            const kept = gi === 0;
+            const pos = document.createElement('button');
+            pos.type = 'button';
+            pos.className = 'vmu-cleanup-pos ' + (kept ? 'vmu-cleanup-pos-kept' : 'vmu-cleanup-pos-remove');
+            pos.textContent = `#${idx + 1}`;
+            pos.title = kept ? `${g.label} · оригинал, останется` : `${g.label} · будет удалён`;
+            if (!kept && t.id) pos.dataset.trackId = t.id;
+            pos.addEventListener('click', () => { if (t.id) focusPageRowByTrackId(t.id); });
+            positions.appendChild(pos);
+          });
+          group.appendChild(positions);
+          groupsWrap.appendChild(group);
+        }
+        listEl.appendChild(groupsWrap);
+      }
+
+      const copyBtn = wrap.querySelector('.vmu-cleanup-copy');
+      const copyText = blockedLines.length
+        ? blockedLines.join('\n')
+        : dupeGroups.map(g => `${g.label} (×${g.indices.length}: ${g.indices.map(i => '#' + (i + 1)).join(', ')})`).join('\n');
+      copyBtn.addEventListener('click', () => {
+        navigator.clipboard.writeText(copyText).then(() => {
+          copyBtn.classList.add('vmu-cleanup-copy-ok');
+          copyBtn.title = '✓ Скопировано';
+          setTimeout(() => {
+            if (!copyBtn.isConnected) return;
+            copyBtn.classList.remove('vmu-cleanup-copy-ok');
+            copyBtn.title = 'Скопировать список';
+          }, 1400);
+        }).catch(() => {});
+      });
+
+      const applyBtn = wrap.querySelector('#vmu-bulk-dupes-apply-btn');
+      const applyBtnLabel = applyBtn.querySelector('.vmu-cleanup-delete-btn-label');
+      const setItemStatus = (trackId, status, title) => {
+        listEl.querySelectorAll(`[data-track-id="${trackId}"]`).forEach(el => {
+          el.dataset.status = status;
+          el.title = title;
+        });
+      };
+
+      applyBtn.addEventListener('click', async () => {
+        const pending = removeItems.filter(t => listEl.querySelector(`[data-track-id="${t.id}"]`)?.dataset.status !== 'done');
+        if (!pending.length) return;
+
+        const actionsEl = wrap.querySelector('.vmu-cleanup-actions');
+        const confirmed = await vmuConfirmBulkAction(
+          actionsEl, applyBtn,
+          'Точно начать? Удаление из ВК необратимо.',
+          'Да, удалить'
+        );
+        if (!confirmed) return;
+
+        const toDelete = [];
+        const idOfIndex = [];
+        for (const t of pending) {
+          const parts = String(t.id).split('_');
+          if (parts.length < 2) continue;
+          toDelete.push({ ownerId: parts[0], audioId: Number(parts[1]) });
+          idOfIndex.push(t.id);
+          setItemStatus(t.id, 'pending', 'В очереди');
+        }
+        if (!toDelete.length) { showToast('Не удалось определить owner_id/audio_id', true); return; }
+
+        applyBtn.disabled = true;
+        applyBtnLabel.textContent = `Удаляем 0/${toDelete.length}…`;
+
+        const onProgress = e => {
+          if (e.source !== window || e.data?.type !== 'VKD_BULK_DELETE_PROGRESS') return;
+          applyBtnLabel.textContent = `Удаляем ${e.data.done}/${e.data.total}…`;
+          const trackId = idOfIndex[e.data.index];
+          if (trackId) setItemStatus(trackId, e.data.itemOk ? 'done' : 'error', e.data.itemOk ? 'Удалено' : (e.data.error || 'Ошибка'));
+        };
+        window.addEventListener('message', onProgress);
+
+        const done = new Promise(resolve => {
+          const h = e => {
+            if (e.source !== window || e.data?.type !== 'VKD_BULK_DELETE_DONE') return;
+            window.removeEventListener('message', h);
+            resolve(e.data);
+          };
+          window.addEventListener('message', h);
+        });
+        window.postMessage({ type: 'VKD_BULK_DELETE', items: toDelete }, '*');
+        const result = await done;
+        window.removeEventListener('message', onProgress);
+
+        if (!result.ok) {
+          showToast('Ошибка запроса: ' + (result.error || '?'), true);
+          applyBtn.disabled = false;
+          applyBtnLabel.textContent = `Удалить (${pending.length})`;
+          return;
+        }
+
+        const failCount = idOfIndex.filter(id => listEl.querySelector(`[data-track-id="${id}"]`)?.dataset.status === 'error').length;
+        if (!failCount) {
+          // Drop successfully-deleted tracks from pageTracks in place — the
+          // rename section below shares this same array — then re-scan the
+          // page-local dupe/blocked state fresh (groups can shift once
+          // members are removed).
+          const removedIds = new Set(idOfIndex);
+          for (let k = pageTracks.length - 1; k >= 0; k--) {
+            if (removedIds.has(pageTracks[k].id)) pageTracks.splice(k, 1);
+          }
+          render();
+          return;
+        }
+        applyBtn.disabled = false;
+        applyBtnLabel.textContent = `Повторить неудачные (${failCount})`;
+      });
+
+      panel._vmuCleanup = watchPageHighlights(dupes, blockedIndices);
+    }
+
+    render();
   }
 
   function buildCheckResultPanel({ entries, present, missing, pageTracks }) {
@@ -6107,6 +8245,24 @@
         clearTimeout(_modalDlTimer1); clearTimeout(_modalDlTimer2);
         _modalDlTimer1 = setTimeout(markAndInjectAll, 400);
         _modalDlTimer2 = setTimeout(() => { markAndInjectAll(); attachModalInnerObserver(modalNode); }, 900);
+      }
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+
+  // "Редактирование плейлиста" popup — old .audio_pl_edit_box markup (see
+  // getEditPlaylistBox). Runs on a delay since the track rows underneath it
+  // mount slightly after the box itself.
+  new MutationObserver(muts => {
+    for (const mut of muts) {
+      for (const node of mut.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        const hasEditBox = node.matches?.('.audio_pl_edit_box') || node.querySelector?.('.audio_pl_edit_box');
+        if (!hasEditBox) continue;
+        setTimeout(() => {
+          const editBox = getEditPlaylistBox();
+          injectPlaylistSortToggle(editBox);
+          injectCoverEditorRow(editBox);
+        }, 250);
       }
     }
   }).observe(document.body, { childList: true, subtree: true });

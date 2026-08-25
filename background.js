@@ -42,6 +42,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'VKD_GENIUS_SEARCH') {
+    geniusSearch(msg.query)
+      .then(sendResponse)
+      .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === 'VKD_GENIUS_TRACKS') {
+    geniusAlbumTracks(msg.albumId, msg.albumUrl)
+      .then(sendResponse)
+      .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
+  if (msg.type === 'VKD_FETCH_IMAGE') {
+    fetchImageAsDataUrl(msg.url)
+      .then(sendResponse)
+      .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
   return false;
 });
 
@@ -219,4 +240,129 @@ async function resolveSoundCloud(rawUrl) {
     return { ok: false, error: failed[0]?.error || 'не удалось получить ни одного трека' };
   }
   return { ok: true, tracks, failedCount: failed.length };
+}
+
+// ─── Genius (playlist "sort as Genius tracklist" source) ────────────────────
+// Genius's own site talks to its unofficial genius.com/api/* endpoints
+// (distinct from the documented, API-key-gated api.genius.com) — same calls
+// the album page's own React app makes, unauthenticated, no key needed.
+
+async function geniusSearch(query) {
+  if (!query || !query.trim()) return { ok: false, error: 'пустой запрос' };
+  const res = await fetch('https://genius.com/api/search/album?q=' + encodeURIComponent(query), { credentials: 'omit' });
+  if (!res.ok) return { ok: false, error: 'Genius API вернул ' + res.status };
+  const data = await res.json();
+  const hits = data?.response?.sections?.[0]?.hits || [];
+  const albums = hits
+    .filter(h => h.type === 'album' && h.result)
+    .map(h => ({
+      id: h.result.id,
+      name: h.result.name || '',
+      artist: h.result.artist?.name || '',
+      release: h.result.release_date_for_display || '',
+      cover: h.result.cover_art_thumbnail_url || h.result.cover_art_url || null,
+      // Full-res variant for the cover-text-overlay editor (vs. the thumbnail
+      // above, used for the small result-list icon) — falls back to the
+      // thumbnail if Genius didn't send a separate full-size URL.
+      coverFull: h.result.cover_art_url || h.result.cover_art_thumbnail_url || null,
+      url: h.result.url,
+    }));
+  if (!albums.length) return { ok: false, error: 'ничего не найдено на Genius' };
+  return { ok: true, albums };
+}
+
+// Genius's album pages hydrate a Redux store from a single inline script:
+//   window.__PRELOADED_STATE__ = JSON.parse('...escaped JSON...');
+// We only have the raw HTML (no DOM/JS engine in a service worker), so the
+// single-quoted JS string literal is decoded by hand — not eval'd, since
+// this is third-party page content. state.islands.album.id is the numeric
+// id genius.com/api/albums/{id}/tracks needs.
+function extractSingleQuotedLiteral(str, marker) {
+  const start = str.indexOf(marker);
+  if (start === -1) return null;
+  let i = start + marker.length;
+  const bodyStart = i;
+  while (i < str.length) {
+    if (str[i] === '\\') { i += 2; continue; }
+    if (str[i] === "'") break;
+    i++;
+  }
+  return str.slice(bodyStart, i);
+}
+
+function decodeJsSingleQuotedLiteral(body) {
+  let out = '';
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === '\\') {
+      const next = body[++i];
+      switch (next) {
+        case 'n': out += '\n'; break;
+        case 't': out += '\t'; break;
+        case 'r': out += '\r'; break;
+        case '\\': out += '\\'; break;
+        case "'": out += "'"; break;
+        case '"': out += '"'; break;
+        case '/': out += '/'; break;
+        case 'u': { out += String.fromCharCode(parseInt(body.slice(i + 1, i + 5), 16)); i += 4; break; }
+        default: out += next;
+      }
+    } else out += c;
+  }
+  return out;
+}
+
+async function geniusAlbumIdFromUrl(url) {
+  const res = await fetch(url, { credentials: 'omit' });
+  if (!res.ok) throw new Error('страница недоступна (' + res.status + ')');
+  const html = await res.text();
+  const body = extractSingleQuotedLiteral(html, "window.__PRELOADED_STATE__ = JSON.parse('");
+  if (!body) throw new Error('не нашёл данные альбома на странице');
+  const state = JSON.parse(decodeJsSingleQuotedLiteral(body));
+  const id = state?.islands?.album?.id;
+  if (!id) throw new Error('не нашёл id альбома');
+  return id;
+}
+
+async function geniusAlbumTracks(albumId, albumUrl) {
+  const id = albumId || await geniusAlbumIdFromUrl(albumUrl);
+  const out = [];
+  let nextPage = 1;
+  let guard = 0;
+  while (nextPage && guard++ < 10) {
+    const res = await fetch(`https://genius.com/api/albums/${id}/tracks?page=${nextPage}`, { credentials: 'omit' });
+    if (!res.ok) break;
+    const data = await res.json();
+    const tracks = data?.response?.tracks || [];
+    for (const t of tracks) out.push({ number: t.number || 0, title: t.song?.title || '', artist: t.song?.artist_names || '' });
+    nextPage = data?.response?.next_page || null;
+  }
+  if (!out.length) return { ok: false, error: 'треклист альбома пуст' };
+  out.sort((a, b) => a.number - b.number);
+  return { ok: true, tracks: out };
+}
+
+// Fetches an image cross-origin and hands it back to content.js as a data:
+// URL — used by the cover-text-overlay editor to load a Genius cover onto a
+// <canvas>. Drawing a cross-origin <img> straight onto canvas taints it
+// (getImageData/toBlob throw) unless the remote server opts in with CORS
+// headers, which Genius's image CDN doesn't reliably do. Fetching here in
+// the service worker sidesteps that: with host_permissions for the target
+// origin, the extension's own fetch isn't subject to the page's CORS
+// restrictions. Returned as a data: URL (base64 string) rather than the raw
+// ArrayBuffer since that's guaranteed to survive chrome.runtime.sendMessage
+// without relying on structured-clone support for binary payloads.
+async function fetchImageAsDataUrl(url) {
+  if (!url) return { ok: false, error: 'пустой URL' };
+  const res = await fetch(url, { credentials: 'omit' });
+  if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
+  const buf = await res.arrayBuffer();
+  const mime = res.headers.get('content-type') || 'image/jpeg';
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return { ok: true, dataUrl: `data:${mime};base64,${btoa(binary)}` };
 }

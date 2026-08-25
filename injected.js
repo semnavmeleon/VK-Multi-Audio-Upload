@@ -684,6 +684,20 @@
   // user clicked ✕ on instead of whatever happens to be "current".
   window.__vmuCurrentUploads = window.__vmuCurrentUploads || new Map();
 
+  // playlists_edit_data carries owner_id/playlist_id for the "Редактирование
+  // плейлиста" popup — the only place the sort-toggle feature can learn them
+  // when the popup was opened by clicking a card rather than a ?z=audio_playlist-…
+  // deep link (no ids in location.href then). Read off VK's own outgoing
+  // request instead of guessing from the DOM.
+  function relayEditPlaylistIds(bodyStr) {
+    try {
+      const params = new URLSearchParams(bodyStr || '');
+      const ownerId = params.get('owner_id');
+      const playlistId = params.get('playlist_id');
+      if (ownerId && playlistId) window.postMessage({ type: 'VKD_EDIT_PLAYLIST_IDS', ownerId, playlistId }, '*');
+    } catch {}
+  }
+
   // ── XHR interceptor ──────────────────────────────────────────────────────────
   const origOpen = XMLHttpRequest.prototype.open;
   const origSend = XMLHttpRequest.prototype.send;
@@ -745,6 +759,7 @@
       const act = extractAct(bStr, url);
       const hash = extractHash(bStr);
       if (hash) { window.__vmuHashes[act || '_page'] = hash; window.__vmuHashes._page = hash; }
+      if (act === 'playlists_edit_data') relayEditPlaylistIds(bStr);
 
       const xhr = this;
       this.addEventListener('load', () => {
@@ -820,6 +835,7 @@
       const act = extractAct(bStr, url);
       const hash = extractHash(bStr);
       if (hash) { window.__vmuHashes[act || '_page'] = hash; window.__vmuHashes._page = hash; }
+      if (act === 'playlists_edit_data') relayEditPlaylistIds(bStr);
 
       result.clone().text().then(text => {
         if ((act === 'save_playlist' || act === 'playlists_edit_data') && __savePlaylistCapture) {
@@ -932,7 +948,9 @@
     if (_dlSeen.has(trackId)) return true;
     _dlSeen.add(trackId);
     const cs = s => typeof s === 'string' ? s.replace(/<[^>]+>/g, '').trim() : String(s || '').trim();
-    window.postMessage({ type: 'VKD_TRACK', track: { id: trackId, title: cs(title), artist: cs(artist), duration: obj.duration || 0, url: obj.url || null } }, '*');
+    // No explicit "blocked" flag in audio.get's response — same signal the
+    // React-fiber DOM read uses elsewhere (entity.data.url === null).
+    window.postMessage({ type: 'VKD_TRACK', track: { id: trackId, title: cs(title), artist: cs(artist), duration: obj.duration || 0, url: obj.url || null, isBlocked: !obj.url } }, '*');
     return true;
   }
 
@@ -1179,6 +1197,42 @@
         loadPlaylistSections(ownerId, playlistId, accessHash);
         break;
       }
+
+      case 'VKD_BULK_EDIT': {
+        const { edits } = e.data;
+        bulkEditTracks(edits)
+          .then(r => window.postMessage({ type: 'VKD_BULK_EDIT_DONE', ok: true, okCount: r.ok, failCount: r.fail }, '*'))
+          .catch(err => window.postMessage({ type: 'VKD_BULK_EDIT_DONE', ok: false, error: String(err?.message || err) }, '*'));
+        break;
+      }
+
+      case 'VKD_BULK_DELETE': {
+        const { items } = e.data;
+        bulkDeleteTracks(items)
+          .then(r => window.postMessage({ type: 'VKD_BULK_DELETE_DONE', ok: true, okCount: r.ok, failCount: r.fail }, '*'))
+          .catch(err => window.postMessage({ type: 'VKD_BULK_DELETE_DONE', ok: false, error: String(err?.message || err) }, '*'));
+        break;
+      }
+
+      case 'VKD_REORDER_PLAYLIST': {
+        const { ownerId, playlistId, accessHash, title, description, noDiscover, orderedNumericIds } = e.data;
+        reorderPlaylistViaApi(ownerId, playlistId, accessHash, title, description, noDiscover, orderedNumericIds)
+          .then(r => window.postMessage({ type: 'VKD_REORDER_PLAYLIST_DONE', ok: true, count: r.count }, '*'))
+          .catch(err => window.postMessage({ type: 'VKD_REORDER_PLAYLIST_DONE', ok: false, error: String(err?.message || err) }, '*'));
+        break;
+      }
+
+      case 'VKD_GET_PLAYLIST_TRACKS': {
+        const { ownerId, playlistId, accessHash } = e.data;
+        fetchFullPlaylistItems(ownerId, playlistId, accessHash)
+          .then(items => window.postMessage({
+            type: 'VKD_GET_PLAYLIST_TRACKS_DONE', ok: true,
+            tracks: items.map(it => ({ numId: it.id, artist: it.artist || '', title: it.title || '' })),
+          }, '*'))
+          .catch(err => window.postMessage({ type: 'VKD_GET_PLAYLIST_TRACKS_DONE', ok: false, error: String(err?.message || err) }, '*'));
+        break;
+      }
+
 
       case 'VKD_EXTRACT_DOM': {
         const tracks = extractTracksFromFiber();
@@ -1695,7 +1749,7 @@
   // O(newly-added rows) — flat instead of quadratic over the whole scan.
   function markRowTrackData() {
     let marked = 0;
-    const rows = document.querySelectorAll('[data-testid$="MusicTrackRow"]:not([data-vmu-id]), [class*="vkitAudioRow__root"]:not([data-vmu-id]), .AudioRow:not([data-vmu-id])');
+    const rows = document.querySelectorAll('[data-testid$="MusicTrackRow"]:not([data-vmu-id]), [class*="vkitAudioRow__root"]:not([data-vmu-id]), .AudioRow:not([data-vmu-id]), [data-sortable-id]:not([data-vmu-id])');
     for (const row of rows) {
       try {
         const entity = findTrackEntityFromFiber(row);
@@ -1720,6 +1774,8 @@
           artist,
           url: getEntityUrl(entity),
           isBlocked: !!(entity.data?.isBlocked) || entity.data?.url === null,
+          accessKey: identity?.accessKey || null,
+          duration: entity.duration || 0,
         });
         marked++;
       } catch {}
@@ -1873,6 +1929,22 @@
     return null;
   }
 
+  // The anchor elements resolveApiClient looks for (and the React fiber
+  // that carries the API client) can take a beat to mount right after the
+  // page/dialog has just opened — a bare resolveApiClient() call right then
+  // finds nothing and the reorder flow throws "no_api_client", even though
+  // the exact same playlist works fine a few seconds later with no other
+  // change (verified live). Poll instead of failing on the first check.
+  async function waitForApiClient(maxWaitMs = 2500) {
+    const start = Date.now();
+    let client = resolveApiClient();
+    while (!client && Date.now() - start < maxWaitMs) {
+      await pause(200);
+      client = resolveApiClient();
+    }
+    return client;
+  }
+
   async function loadPlaylistViaAudioGet(ownerId, playlistId, accessHash) {
     const client = resolveApiClient();
     if (!client) return false;
@@ -1900,6 +1972,213 @@
       datas.forEach(items => items.forEach(tryEmitTrackObj));
     }
     return true;
+  }
+
+  // Fetches a playlist's full current track list via VK's own internal API
+  // client (resolveApiClient), paginating audio.get 250 at a time. Used both
+  // to resolve access_key per track for reordering and, standalone, to read
+  // the playlist's track list/order without touching the edit popup's DOM —
+  // see fetchPlaylistTracksViaApi's comment for why the DOM path isn't
+  // reliable there.
+  async function fetchFullPlaylistItems(ownerId, playlistId, accessHash) {
+    const client = await waitForApiClient();
+    if (!client) throw new Error('no_api_client');
+
+    const base = { owner_id: ownerId, playlist_id: playlistId, count: 250, offset: 0 };
+    if (accessHash) base.access_key = accessHash;
+    const items = [];
+    let first;
+    try { first = await client.request('audio.get', base); }
+    catch (e) { throw new Error('audio.get failed: ' + (e?.message || e)); }
+    if (first && Array.isArray(first.items)) items.push(...first.items);
+    const total = first?.count || items.length;
+    for (let off = 250; off < total; off += 250) {
+      try {
+        const page = await client.request('audio.get', { ...base, offset: off });
+        if (page && Array.isArray(page.items)) items.push(...page.items);
+      } catch {}
+    }
+    return items;
+  }
+
+  // Reorders a playlist without touching the drag UI at all: native HTML5
+  // drag on VK's row list only responds to trusted (real OS) input — verified
+  // live, synthetic dragstart/pointer/mouse sequences with correct
+  // movementX/Y all leave the row order untouched — so a content-script-driven
+  // drag can't work here. Real VK drag persists via a plain
+  // audio.editPlaylist call carrying the FULL new track order (audio_ids,
+  // comma-joined `ownerId_audioId_accessKey`), captured live from network
+  // traffic — so we just call that same method directly through VK's own
+  // internal API client (resolveApiClient), title/description/no_discover
+  // resent unchanged to avoid wiping them. audio.get supplies the access_key
+  // per track since neither DOM row variant (vkit data-sortable-id nor old
+  // .audio_row data-full-id) exposes it directly.
+  async function reorderPlaylistViaApi(ownerId, playlistId, accessHash, title, description, noDiscover, orderedNumericIds) {
+    const client = await waitForApiClient();
+    if (!client) throw new Error('no_api_client');
+
+    const items = await fetchFullPlaylistItems(ownerId, playlistId, accessHash);
+    const byId = new Map(items.map(it => [it.id, it]));
+    const audioIds = [];
+    for (const numId of orderedNumericIds) {
+      const it = byId.get(numId);
+      if (!it) continue;
+      audioIds.push(it.access_key ? `${it.owner_id}_${it.id}_${it.access_key}` : `${it.owner_id}_${it.id}`);
+    }
+    if (!audioIds.length) throw new Error('no_matching_tracks');
+
+    const res = await client.request('audio.editPlaylist', {
+      playlist_id: playlistId,
+      owner_id: ownerId,
+      title: title || '',
+      description: description || '',
+      no_discover: noDiscover ? 1 : 0,
+      audio_ids: audioIds.join(','),
+    });
+    return { count: audioIds.length, response: res };
+  }
+
+  // Bulk metadata edit (title/artist) for the page-scan "Массовые операции"
+  // feature. audio.edit requires ALL fields on every call — omitting genre_id
+  // silently resets it to VK's default (verified live: REGGAE → POP just from
+  // leaving it out) — so each track's current genre_id is fetched via
+  // audio.getById right before editing it. no_search isn't returned by
+  // getById at all (write-only from what we can see), so it's always resent
+  // as 0 — a real limitation: a track deliberately hidden from search will
+  // become searchable again after a bulk edit.
+  // edits: [{ownerId, audioId, artist, title}] — ownerId is PER TRACK, not
+  // one shared value for the whole batch. Verified live this matters: a
+  // group's own "Треки" listing mixes tracks it actually owns with ones
+  // added/reposted from other owners, and audio.edit rejects the wrong
+  // owner_id/audio_id pairing with "Access denied: no access to audio" —
+  // an earlier version passed a single ownerId for everything and silently
+  // mis-attributed most of a batch to it.
+  async function bulkEditTracks(edits) {
+    const tokenKey = Object.keys(localStorage).find(k => /:web_token:login:auth$/.test(k));
+    if (!tokenKey) throw new Error('no_token');
+    const clientId = tokenKey.split(':')[0];
+    const { access_token } = JSON.parse(localStorage.getItem(tokenKey) || '{}');
+    if (!access_token) throw new Error('no_access_token');
+
+    // A single bad audio.getById chunk used to throw and abort the ENTIRE
+    // batch before a single audio.edit ran — that's very likely what "didn't
+    // process all tracks" was: one flaky chunk killed everything after it.
+    // Each chunk now fails independently; tracks whose genre lookup failed
+    // just get skipped individually below (reported per-item, not fatal).
+    // Keyed by the full "ownerId_audioId" pair, not audio_id alone — plain
+    // numeric audio_id collides across different owners.
+    const genreByFullId = new Map();
+    for (let i = 0; i < edits.length; i += 100) {
+      const chunk = edits.slice(i, i + 100);
+      const audios = chunk.map(e => `${e.ownerId}_${e.audioId}`).join(',');
+      try {
+        const res = await fetch(`https://web.api.vk.ru/method/audio.getById?v=5.285&client_id=${clientId}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ audios, access_token }).toString(),
+        });
+        const json = await res.json();
+        if (json.error) throw new Error(json.error.error_msg || 'audio.getById failed');
+        for (const it of (json.response || [])) genreByFullId.set(`${it.owner_id}_${it.id}`, it.genre_id);
+      } catch (err) {
+        console.warn('[vmu] bulk audio.getById chunk failed — its tracks will be skipped:', err);
+      }
+      if (i + 100 < edits.length) await new Promise(r => setTimeout(r, 250));
+    }
+
+    // Firing audio.edit back-to-back with zero pacing tripped VK's flood
+    // control after ~15 calls — verified live: a call that failed with
+    // "Access denied: no access to audio" inside the tight loop succeeded
+    // seconds later with the exact same params, run standalone. VK maps its
+    // abuse throttling onto that permission-denied-shaped message here
+    // rather than a distinct rate-limit error, so it's indistinguishable
+    // from a real denial except by retrying after a pause. 350ms pacing with
+    // 1-2.5s retries still only got ~20 through before the wall — the quota
+    // window is longer than that, so retries need to actually outlast it
+    // rather than nudge it.
+    const pause = ms => new Promise(r => setTimeout(r, ms));
+    const PACING_MS = 1200;
+    const RETRY_DELAYS = [5000, 15000, 30000];
+
+    let ok = 0, fail = 0;
+    for (let i = 0; i < edits.length; i++) {
+      const e = edits[i];
+      const fullId = `${e.ownerId}_${e.audioId}`;
+      const genreId = genreByFullId.get(fullId);
+      let itemOk = false, error = null;
+      if (genreId == null) {
+        error = 'не удалось получить текущий жанр трека';
+      } else {
+        const body = new URLSearchParams({
+          owner_id: String(e.ownerId),
+          audio_id: String(e.audioId),
+          artist: e.artist,
+          title: e.title,
+          genre_id: String(genreId),
+          no_search: '0',
+          access_token,
+        }).toString();
+        for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
+          try {
+            const res = await fetch(`https://web.api.vk.ru/method/audio.edit?v=5.285&client_id=${clientId}`, {
+              method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
+            });
+            const json = await res.json();
+            if (json.error) error = json.error.error_msg || 'audio.edit failed';
+            else { itemOk = true; error = null; }
+          } catch (err) { error = String(err?.message || err); }
+          if (itemOk || attempt === RETRY_DELAYS.length) break;
+          await pause(RETRY_DELAYS[attempt]);
+        }
+      }
+      if (itemOk) ok++; else fail++;
+      window.postMessage({ type: 'VKD_BULK_EDIT_PROGRESS', done: i + 1, total: edits.length, index: i, itemOk, error }, '*');
+      if (i < edits.length - 1) await pause(PACING_MS);
+    }
+    return { ok, fail };
+  }
+
+  // Bulk delete (duplicates/blocked cleanup) for the "Массовые операции"
+  // panel. Same pacing/retry shape as bulkEditTracks — audio.delete sits on
+  // the same flood-control bucket verified there (~15 calls before VK starts
+  // throwing), so reusing untested pacing here would just rediscover it the
+  // hard way. items: [{ownerId, audioId}].
+  async function bulkDeleteTracks(items) {
+    const tokenKey = Object.keys(localStorage).find(k => /:web_token:login:auth$/.test(k));
+    if (!tokenKey) throw new Error('no_token');
+    const clientId = tokenKey.split(':')[0];
+    const { access_token } = JSON.parse(localStorage.getItem(tokenKey) || '{}');
+    if (!access_token) throw new Error('no_access_token');
+
+    const pause = ms => new Promise(r => setTimeout(r, ms));
+    const PACING_MS = 1200;
+    const RETRY_DELAYS = [5000, 15000, 30000];
+
+    let ok = 0, fail = 0;
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const body = new URLSearchParams({
+        owner_id: String(it.ownerId),
+        audio_id: String(it.audioId),
+        access_token,
+      }).toString();
+      let itemOk = false, error = null;
+      for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
+        try {
+          const res = await fetch(`https://web.api.vk.ru/method/audio.delete?v=5.285&client_id=${clientId}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
+          });
+          const json = await res.json();
+          if (json.error) error = json.error.error_msg || 'audio.delete failed';
+          else { itemOk = true; error = null; }
+        } catch (err) { error = String(err?.message || err); }
+        if (itemOk || attempt === RETRY_DELAYS.length) break;
+        await pause(RETRY_DELAYS[attempt]);
+      }
+      if (itemOk) ok++; else fail++;
+      window.postMessage({ type: 'VKD_BULK_DELETE_PROGRESS', done: i + 1, total: items.length, index: i, itemOk, error }, '*');
+      if (i < items.length - 1) await pause(PACING_MS);
+    }
+    return { ok, fail };
   }
 
   async function loadPlaylistSections(ownerId, playlistId, accessHash) {
@@ -2056,48 +2335,57 @@
           descEl.blur();
         }
 
-        // Inject cover via .ape_cover click-intercept
+        // Inject cover via direct file-input assignment — see injectCoverFile
+        // for why: .ape_cover only mounts an <input type=file> once its slot
+        // is empty (true here, right after creating a brand-new playlist),
+        // and clicking the thumbnail itself does nothing, so the previous
+        // click-and-intercept-HTMLInputElement.prototype.click approach
+        // always timed out silently, leaving the playlist coverless.
         if (window.__vmuPendingCover) {
           const coverEl = dialog.querySelector('.ape_cover, ._ape_cover');
           if (coverEl) {
             const coverFile = window.__vmuPendingCover;
             window.__vmuPendingCover = null;
             await new Promise((res) => {
-              let intercepted = false;
-              const origClick = HTMLInputElement.prototype.click;
-              HTMLInputElement.prototype.click = function () {
-                if (!intercepted && this.type === 'file') {
-                  intercepted = true;
-                  HTMLInputElement.prototype.click = origClick;
-                  const dt = new DataTransfer();
-                  dt.items.add(coverFile);
-                  this.files = dt.files;
-                  this.dispatchEvent(new Event('change', { bubbles: true }));
-                  // Wait for crop dialog and confirm it
-                  let n = 0;
-                  const t = setInterval(() => {
-                    const cropBtn = findCropSaveBtn();
-                    if (cropBtn) {
-                      cropBtn.click();
-                      clearInterval(t);
-                      // Wait for crop to apply and cover thumbnail to update
-                      let waitN = 0;
-                      const waitT = setInterval(() => {
-                        const coverImg = dialog.querySelector('.ape_cover img, .ape_cover [style*="background"]');
-                        if (coverImg || ++waitN >= 10) { clearInterval(waitT); res(); }
-                      }, 500);
-                      return;
-                    }
-                    if (++n >= 30) { clearInterval(t); res(); }
-                  }, 400);
-                  return;
-                }
-                return origClick.call(this);
+              const afterFileSet = () => {
+                // Wait for crop dialog and confirm it
+                let n = 0;
+                const t = setInterval(() => {
+                  const cropBtn = findCropSaveBtn();
+                  if (cropBtn) {
+                    cropBtn.click();
+                    clearInterval(t);
+                    // Wait for crop to apply and cover thumbnail to update
+                    let waitN = 0;
+                    const waitT = setInterval(() => {
+                      const coverImg = dialog.querySelector('.ape_cover img, .ape_cover [style*="background"]');
+                      if (coverImg || ++waitN >= 10) { clearInterval(waitT); res(); }
+                    }, 500);
+                    return;
+                  }
+                  if (++n >= 30) { clearInterval(t); res(); }
+                }, 400);
               };
-              coverEl.click();
-              setTimeout(() => {
-                if (!intercepted) { HTMLInputElement.prototype.click = origClick; res(); }
-              }, 8000);
+              const setFile = input => {
+                const dt = new DataTransfer();
+                dt.items.add(coverFile);
+                input.files = dt.files;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                afterFileSet();
+              };
+
+              const existingInput = coverEl.querySelector('input[type="file"]');
+              if (existingInput) { setFile(existingInput); return; }
+
+              const deleteBtn = coverEl.querySelector('button');
+              if (!deleteBtn) { res(); return; }
+              deleteBtn.click();
+              let tries = 0;
+              const waitInput = setInterval(() => {
+                const input = coverEl.querySelector('input[type="file"]');
+                if (input) { clearInterval(waitInput); setFile(input); return; }
+                if (++tries >= 20) { clearInterval(waitInput); res(); }
+              }, 200);
             });
             await pause(1000);
           } else {
@@ -2527,31 +2815,41 @@
     });
   }
 
-  // ── Cover upload via file input intercept ─────────────────────────────────────
+  // ── Cover upload via direct file-input assignment ──────────────────────────────
+  // .ape_cover's "redesigned" markup (ape_cover_redesigned) only mounts an
+  // actual <input type=file> (inside a <label>, native label-activation —
+  // clicking it never goes through the input's own JS-visible .click(),
+  // which is why the old click-and-intercept-HTMLInputElement.prototype.click
+  // approach silently timed out) when the cover slot is EMPTY. With a cover
+  // already set, that slot instead shows the image + its own delete ("x")
+  // button and no input exists yet — clicking the thumbnail itself does
+  // nothing (verified live). So: use the input directly if present, else
+  // click the delete button first and wait for the input to mount.
   function injectCoverFile(coverFile) {
     const coverEl = document.querySelector('.ape_cover');
     if (!coverEl) { window.postMessage({ type: 'VK_COVER_DONE', ok: false, error: 'ape_cover не найден' }, '*'); return; }
 
-    let intercepted = false;
-    const origClick = HTMLInputElement.prototype.click;
-    HTMLInputElement.prototype.click = function () {
-      if (!intercepted && this.type === 'file') {
-        intercepted = true;
-        HTMLInputElement.prototype.click = origClick;
-        const dt = new DataTransfer();
-        dt.items.add(coverFile);
-        this.files = dt.files;
-        this.dispatchEvent(new Event('change', { bubbles: true }));
-        watchCropAndConfirm();
-        return;
-      }
-      return origClick.call(this);
+    const setFile = input => {
+      const dt = new DataTransfer();
+      dt.items.add(coverFile);
+      input.files = dt.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      watchCropAndConfirm();
     };
 
-    coverEl.click();
-    setTimeout(() => {
-      if (!intercepted) { HTMLInputElement.prototype.click = origClick; window.postMessage({ type: 'VK_COVER_DONE', ok: false, error: 'input не появился' }, '*'); }
-    }, 4000);
+    const existingInput = coverEl.querySelector('input[type="file"]');
+    if (existingInput) { setFile(existingInput); return; }
+
+    const deleteBtn = coverEl.querySelector('button');
+    if (!deleteBtn) { window.postMessage({ type: 'VK_COVER_DONE', ok: false, error: 'кнопка удаления обложки не найдена' }, '*'); return; }
+    deleteBtn.click();
+
+    let tries = 0;
+    const waitT = setInterval(() => {
+      const input = coverEl.querySelector('input[type="file"]');
+      if (input) { clearInterval(waitT); setFile(input); return; }
+      if (++tries >= 20) { clearInterval(waitT); window.postMessage({ type: 'VK_COVER_DONE', ok: false, error: 'input не появился после удаления обложки' }, '*'); }
+    }, 200);
   }
 
   function watchCropAndConfirm() {

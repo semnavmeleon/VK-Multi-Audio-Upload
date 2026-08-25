@@ -8,7 +8,8 @@
     "https://soundcloud.com/*",
     "https://*.soundcloud.com/*",
     "https://snd.sc/*",
-    "https://*.sndcdn.com/*"
+    "https://*.sndcdn.com/*",
+    "https://*.genius.com/*"
   ],
   "action": {
     "default_title": "VK Multi Audio Upload"
