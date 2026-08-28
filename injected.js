@@ -1148,13 +1148,17 @@
 
       case 'VK_CREATE_PLAYLIST': {
         const { title, description, trackNames, coverBuf } = e.data;
-        // Store cover as a File object so the dialog can inject it
-        window.__vmuPendingCover = coverBuf
+        // Cover as a File object, passed straight through the call chain
+        // (not a shared window global) — two overlapping VK_CREATE_PLAYLIST
+        // calls used to clobber each other's window.__vmuPendingCover, so
+        // whichever call's cover-injection step ran second could silently
+        // steal or blank out the other's cover.
+        const coverFile = coverBuf
           ? new File([coverBuf], 'cover.jpg', { type: 'image/jpeg' })
           : null;
-        createPlaylistViaUI(title, description, trackNames || [])
+        createPlaylistViaUI(title, description, trackNames || [], coverFile)
           .then(r => window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: true, ...r }, '*'))
-          .catch(err => { window.__vmuPendingCover = null; window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: false, error: err.message }, '*'); });
+          .catch(err => { window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: false, error: err.message }, '*'); });
         break;
       }
 
@@ -2305,7 +2309,17 @@
 
   // PHASE 1: Create empty playlist (title + description + cover, no tracks)
   // PHASE 2: Open edit dialog on new playlist — ._ape_audio_item items are directly visible there
-  async function createPlaylistViaUI(title, description, trackNames) {
+  async function createPlaylistViaUI(title, description, trackNames, coverFile) {
+    // Snapshot playlist cells that exist BEFORE creation — title-prefix
+    // matching below must never resolve to one of these, or an upload whose
+    // generated title happens to share a prefix with an older playlist
+    // (e.g. two different releases both titled "Легенды Про...CENTR ...")
+    // ends up dumping the new tracks into that unrelated old playlist.
+    const preExistingIds = new Set(
+      [...document.querySelectorAll('[data-testid="MusicPlaylistItem_Cell"][data-id]')]
+        .map(c => c.getAttribute('data-id'))
+    );
+
     const createBtn = await waitForCreateBtn(8000);
 
     const responseText = await new Promise((resolve, reject) => {
@@ -2341,11 +2355,9 @@
         // and clicking the thumbnail itself does nothing, so the previous
         // click-and-intercept-HTMLInputElement.prototype.click approach
         // always timed out silently, leaving the playlist coverless.
-        if (window.__vmuPendingCover) {
+        if (coverFile) {
           const coverEl = dialog.querySelector('.ape_cover, ._ape_cover');
           if (coverEl) {
-            const coverFile = window.__vmuPendingCover;
-            window.__vmuPendingCover = null;
             await new Promise((res) => {
               const afterFileSet = () => {
                 // Wait for crop dialog and confirm it
@@ -2388,8 +2400,6 @@
               }, 200);
             });
             await pause(1000);
-          } else {
-            window.__vmuPendingCover = null;
           }
         }
 
@@ -2402,11 +2412,13 @@
       })();
     });
 
-    // Get playlist ID: primary = find by title in DOM (data-id attr),
-    // fallback = parse from network response.
+    // Get playlist ID: primary = parse from the save-request's own network
+    // response (authoritative, immune to title collisions), fallback =
+    // find by title in DOM (data-id attr), restricted to cells that weren't
+    // already there before we started (see preExistingIds above).
     let result = null;
     for (let i = 0; i < 12; i++) {
-      result = findPlaylistInDOMByTitle(title) || parsePlaylistIdFromResponse(responseText);
+      result = parsePlaylistIdFromResponse(responseText) || findPlaylistInDOMByTitle(title, preExistingIds);
       if (result) break;
       await pause(500);
     }
@@ -2429,8 +2441,9 @@
   // Find edit button near a playlist cell element
   function findEditBtnInCell(cell) {
     if (!cell) return null;
-    // data-testid variant (new VK)
-    let btn = cell.querySelector('[data-testid="MusicPlaylistItem_OpenEditing"]');
+    // data-testid variant (new VK) — VK renamed MusicPlaylistItem_OpenEditing to
+    // MusicPlaylist_OpenEditing (dropped "Item"); match by suffix so either survives.
+    let btn = cell.querySelector('[data-testid$="OpenEditing"]');
     if (btn) return btn;
     // Class-based variants
     btn = cell.querySelector('.audio_pl__edit, .audio_pl_actions__edit, [class*="edit"]');
@@ -2450,21 +2463,24 @@
     for (let i = 0; i < 20; i++) {
       await pause(600);
 
-      // Find by title text
+      // Primary: match by the exact playlist ID we already got back from
+      // creation — unambiguous, unlike title text which can collide with an
+      // older playlist that happens to share the same name prefix (e.g. two
+      // releases both titled "Легенды Про...CENTR ...").
+      for (const link of document.querySelectorAll('[data-id$="_' + playlistId + '"], [href*="_' + playlistId + '"]')) {
+        const cell = link.closest('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl') || link.parentElement?.parentElement;
+        const btn = findEditBtnInCell(cell);
+        if (btn) { editBtn = btn; break; }
+      }
+      if (editBtn) break;
+
+      // Fallback: match by title text (only reached if ID-based lookup found nothing)
       for (const el of document.querySelectorAll('[data-testid="MusicPlaylistItem_Title"], .audio_pl__title, .audio_pl_item__title')) {
         if (el.textContent?.trim().includes(playlistTitle.substring(0, 8))) {
           const cell = el.closest('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl') || el.parentElement?.parentElement;
           const btn = findEditBtnInCell(cell);
           if (btn) { editBtn = btn; break; }
         }
-      }
-      if (editBtn) break;
-
-      // Fallback: find by playlist ID in any link/href
-      for (const link of document.querySelectorAll('[href*="_' + playlistId + '"]')) {
-        const cell = link.closest('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl') || link.parentElement?.parentElement;
-        const btn = findEditBtnInCell(cell);
-        if (btn) { editBtn = btn; break; }
       }
       if (editBtn) break;
     }
@@ -2701,15 +2717,15 @@
 
   // Primary: find newly created playlist by title in DOM.
   // MusicPlaylistItem_Cell has data-id="ownerId_playlistId" (e.g. "-206614096_32").
-  function findPlaylistInDOMByTitle(title) {
+  function findPlaylistInDOMByTitle(title, excludeIds) {
     if (!title) return null;
     const prefix = title.substring(0, 12).toLowerCase();
-    const ownerMatch = location.href.match(/audios(-?\d+)/);
-    const ownerId = ownerMatch ? ownerMatch[1] : String(window.vk?.id || '');
     for (const cell of document.querySelectorAll('[data-testid="MusicPlaylistItem_Cell"][data-id]')) {
+      const id = cell.getAttribute('data-id');
+      if (excludeIds && excludeIds.has(id)) continue; // pre-dates this creation — never a match
       const cellTitle = cell.querySelector('[data-testid="MusicPlaylistItem_Title"]')?.textContent?.trim().toLowerCase() || '';
       if (cellTitle.includes(prefix)) {
-        const m = cell.getAttribute('data-id')?.match(/^([-\d]+)_(\d+)$/);
+        const m = id?.match(/^([-\d]+)_(\d+)$/);
         if (m) return { ownerId: m[1], playlistId: parseInt(m[2]) };
       }
     }
@@ -2736,10 +2752,10 @@
       const playlistId = findById(Array.isArray(p1) ? p1[0] : p1);
       if (playlistId) return { playlistId, ownerId };
     } catch {}
-    // Last resort: find newest cell in DOM
-    const first = document.querySelector('[data-testid="MusicPlaylistItem_Cell"][data-id]');
-    const m = first?.getAttribute('data-id')?.match(/^([-\d]+)_(\d+)$/);
-    if (m) return { ownerId: m[1], playlistId: parseInt(m[2]) };
+    // No blind "grab the first DOM cell" fallback here — that cell could be
+    // any pre-existing playlist. Let the caller fall through to
+    // findPlaylistInDOMByTitle(title, preExistingIds) instead, which at
+    // least checks the title and excludes playlists that predate creation.
     return null;
   }
 

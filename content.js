@@ -2430,6 +2430,11 @@
   }
 
   // ─── cover compositor ─────────────────────────────────────────────────────────
+  // Same text-layer pipeline as the "Обложка с текстом" editor
+  // (vmuBuildTextLayerPipeline/vmuComputePosition below), fixed to that
+  // panel's default params — Impact/176/outline 3/red-on-white/center/
+  // 37°/115% — so the auto-playlist cover matches what the manual editor
+  // produces instead of the old separate Georgia/-45°/no-outline look.
   function makePerezalitoCover(coverDataUrl) {
     return new Promise(resolve => {
       const canvas = document.createElement('canvas');
@@ -2438,17 +2443,17 @@
       const img = new Image();
       img.onload = () => {
         ctx.drawImage(img, 0, 0, 1000, 1000);
-        ctx.save();
-        ctx.translate(500, 500);
-        ctx.rotate(-Math.PI / 4);
-        ctx.font = 'bold italic 132px Georgia,"Times New Roman",serif';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.shadowColor = 'rgba(0,0,0,0.55)';
-        ctx.shadowBlur = 12;
-        ctx.fillStyle = 'rgba(230,0,0,0.92)';
-        ctx.fillText('перезалито', 0, 0);
-        ctx.restore();
+        const layer = vmuBuildTextLayerPipeline({
+          text: 'перезалито',
+          fontFamily: 'Impact',
+          fontSize: 176,
+          textColor: [255, 0, 0],
+          outlineColor: [255, 255, 255],
+          outlineWidth: 3,
+          opacity: 255,
+        }, 115, 37);
+        const [px, py] = vmuComputePosition([1000, 1000], [layer.width, layer.height], 'center');
+        ctx.drawImage(layer, px, py);
         canvas.toBlob(resolve, 'image/jpeg', 0.92);
       };
       img.onerror = () => resolve(null);
@@ -2834,6 +2839,42 @@
     } else if (progWrap) {
       progWrap.style.display = 'none';
     }
+  }
+
+  // VK's upload transport doesn't reliably let us correlate a done_add
+  // response back to a specific filename anymore (see NATIVE_HANDOFF_ONLY) —
+  // "fileName: null" comes back for native-handoff uploads, which is exactly
+  // why the old per-file queue/auto-playlist trigger was frozen. Rather than
+  // fight the network layer, watch the DOM instead: the page header's own
+  // "N треков · M плейлиста" count is what VK's own UI trusts, and it updates
+  // the moment a track actually attaches to the library, regardless of
+  // transport. Scoped to AudioCatalog_BlockMusicOwner (verified live)
+  // so it can't accidentally match an unrelated count elsewhere on the page.
+  function getPageTrackCount() {
+    const el = document.querySelector('[data-testid="AudioCatalog_BlockMusicOwner"]');
+    const text = el?.textContent || '';
+    const m = text.match(/([\d\s ]+)\s*(?:треков|трека|трек)(?![а-яёА-ЯЁ])/);
+    if (!m) return null;
+    const n = parseInt(m[1].replace(/[\s ]/g, ''), 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Polls until the page's track count rises by `expected` (or times out).
+  // Returns however many net new tracks actually showed up — 0 if none did,
+  // which callers treat as "upload didn't really go through, don't create a
+  // playlist for nothing".
+  function waitForTrackCountIncrease(startCount, expected, timeoutMs) {
+    timeoutMs = timeoutMs || Math.max(20000, expected * 8000);
+    return new Promise(resolve => {
+      const deadline = Date.now() + timeoutMs;
+      const tick = () => {
+        const now = getPageTrackCount();
+        const gained = now == null ? 0 : Math.max(0, now - startCount);
+        if (gained >= expected || Date.now() >= deadline) { resolve(gained); return; }
+        setTimeout(tick, 1000);
+      };
+      tick();
+    });
   }
 
   // ─── auto-playlist flow ───────────────────────────────────────────────────────
@@ -3491,19 +3532,19 @@
             </select>
           </div>
 
-          ${vmuCoveredSliderRow('vmu-covered-fontsize', 'Размер шрифта', 10, 300, 1, 72, '')}
+          ${vmuCoveredSliderRow('vmu-covered-fontsize', 'Размер шрифта', 10, 300, 1, 176, '')}
           ${vmuCoveredSliderRow('vmu-covered-outlinewidth', 'Толщина обводки', 0, 10, 1, 3, '')}
 
           <div class="vmu-setting-row">
             <span class="vmu-setting-label">Цвет текста</span>
             <div class="vmu-covered-color-cell">
-              <input type="color" id="vmu-covered-textcolor" value="#ffffff" disabled>
-              <label class="vmu-rename-check"><input type="checkbox" id="vmu-covered-auto" checked><span>Авто</span></label>
+              <input type="color" id="vmu-covered-textcolor" value="#ff0000">
+              <label class="vmu-rename-check"><input type="checkbox" id="vmu-covered-auto"><span>Авто</span></label>
             </div>
           </div>
           <div class="vmu-setting-row">
             <span class="vmu-setting-label">Цвет обводки</span>
-            <input type="color" id="vmu-covered-outlinecolor" value="#000000" disabled>
+            <input type="color" id="vmu-covered-outlinecolor" value="#ffffff">
           </div>
 
           <div class="vmu-setting-row">
@@ -3520,8 +3561,8 @@
             </div>
           </div>
 
-          ${vmuCoveredSliderRow('vmu-covered-rotation', 'Поворот, °', -180, 180, 1, 0, '')}
-          ${vmuCoveredSliderRow('vmu-covered-scale', 'Масштаб, %', 10, 500, 1, 100, '')}
+          ${vmuCoveredSliderRow('vmu-covered-rotation', 'Поворот, °', -180, 180, 1, 37, '')}
+          ${vmuCoveredSliderRow('vmu-covered-scale', 'Масштаб, %', 10, 500, 1, 115, '')}
           ${vmuCoveredSliderRow('vmu-covered-opacity', 'Прозрачность', 0, 255, 1, 255, '')}
 
           <div class="vmu-covered-info" id="vmu-covered-info"></div>
@@ -3569,8 +3610,8 @@
     };
 
     for (const [id, def, unit] of [
-      ['vmu-covered-fontsize', 72, ''], ['vmu-covered-outlinewidth', 3, ''],
-      ['vmu-covered-rotation', 0, '°'], ['vmu-covered-scale', 100, '%'], ['vmu-covered-opacity', 255, ''],
+      ['vmu-covered-fontsize', 176, ''], ['vmu-covered-outlinewidth', 3, ''],
+      ['vmu-covered-rotation', 37, '°'], ['vmu-covered-scale', 115, '%'], ['vmu-covered-opacity', 255, ''],
     ]) {
       const input = panel.querySelector('#' + id);
       const val = panel.querySelector('#' + id + '-val');
@@ -5265,12 +5306,30 @@
   // hidden native file input (see VK_HANDOFF_FILES in injected.js) and lets
   // VK's own dialog do the rest — no progress/status tracking on our side.
   async function handoffFilesNatively(files) {
+    // Claim the auto-playlist slot synchronously, before any `await` below —
+    // if addFiles() ever fires twice for what's really one upload action
+    // (observed live: two near-identical empty playlists both created from
+    // the same drop), the old code only checked !autoPlaylistRunning AFTER
+    // the whole ID3-reading loop, which is full of await points. Both
+    // concurrent calls would sail through that check while the flag was
+    // still false and each create their own playlist. Checking-and-setting
+    // here, with no await in between, closes that race (single-threaded JS
+    // runs this synchronous prefix to completion before yielding).
+    const shouldTrackPlaylist = settings.autoPlaylist && !autoPlaylistRunning;
+    if (shouldTrackPlaylist) autoPlaylistRunning = true;
+    const startCountEarly = shouldTrackPlaylist ? getPageTrackCount() : null;
+
     const items = [];
+    const batchItems = [];
     for (const f of files) {
       let file = f;
+      // Read unconditionally (not just under autoMeta) — auto-playlist needs
+      // these tags for its title/description/track-order logic below even
+      // when the user doesn't want tags rewritten into the file itself.
+      let tags = {};
+      try { tags = await readID3(f); } catch {}
       if (settings.autoMeta) {
         try {
-          const tags = await readID3(f);
           const artistSplit = splitTrailingTagJunk(tags.TPE1 || tags.TPE2);
           const titleSplit = splitTrailingTagJunk(tags.TIT2);
           const hasArtist = !!(tags.TPE1 || tags.TPE2) && !!artistSplit.core;
@@ -5285,12 +5344,26 @@
       }
       const buffer = await file.arrayBuffer();
       items.push({ name: file.name, mimeType: file.type || 'audio/mpeg', buffer });
+      batchItems.push({ file, tags, status: 'done' });
     }
     // Optimistic count — without per-file confirmation from VK we can't know
     // exactly how many actually landed, only how many we handed off. Close
     // enough for the "you're approaching VK's 70/day cap" warning this is for.
     for (let i = 0; i < items.length; i++) bumpTodayUploadCount();
+
     window.postMessage({ type: 'VK_HANDOFF_FILES', items }, '*', items.map(i => i.buffer));
+
+    const startCount = startCountEarly;
+    if (startCount != null) {
+      setPlaylistStatus('Ждём подтверждения загрузки…');
+      waitForTrackCountIncrease(startCount, items.length)
+        .then(gained => {
+          if (gained > 0) return runAutoPlaylist(batchItems);
+          setPlaylistStatus('Ошибка: загрузка не подтвердилась, плейлист не создан', true);
+        })
+        .catch(err => setPlaylistStatus(`Ошибка: ${translateError(err.message)}`, true))
+        .finally(() => { autoPlaylistRunning = false; });
+    }
   }
 
   function addFiles(files) {
