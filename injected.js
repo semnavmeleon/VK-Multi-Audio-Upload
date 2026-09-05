@@ -1182,13 +1182,14 @@
         break;
       }
 
-      // Fallback: add via al_audio.php (for editing existing playlists)
-      case 'VK_ADD_TO_PLAYLIST': {
-        const { ownerId, playlistId, audioIds } = e.data;
-        callAlAudio('add_to_playlist', {
-          owner_id: ownerId, playlist_id: playlistId, audio_ids: audioIds.join(',')
-        }).then(d => window.postMessage({ type: 'VK_ADD_PLAYLIST_DONE', ok: d?.payload?.[0] === 0, data: JSON.stringify(d?.payload?.[1]).substring(0,100) }, '*'))
-          .catch(err => window.postMessage({ type: 'VK_ADD_PLAYLIST_DONE', ok: false, error: err.message }, '*'));
+      // Adds tracks to an already-existing playlist via VK's own edit-UI —
+      // see addTracksToExistingPlaylistViaUI below for why this drives the
+      // real dialog instead of calling an API directly.
+      case 'VK_ADD_TRACKS_TO_PLAYLIST': {
+        const { ownerId, playlistId, trackNames, reqId } = e.data;
+        addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames || [])
+          .then(selectedCount => window.postMessage({ type: 'VK_ADD_TRACKS_TO_PLAYLIST_DONE', ok: true, reqId, selectedCount }, '*'))
+          .catch(err => window.postMessage({ type: 'VK_ADD_TRACKS_TO_PLAYLIST_DONE', ok: false, reqId, error: err.message }, '*'));
         break;
       }
 
@@ -2594,6 +2595,115 @@
       await reorderPlaylistTracks(ownerId, playlistId, editPlaylistBody, playlistTitle, playlistDescription, trackNames);
       await pause(1000);
     }
+  }
+
+  // Adds tracks to an ALREADY-EXISTING playlist ("дозаливка" — the album's
+  // playlist is already there, the user just uploaded the tracks they
+  // missed the first time). Deliberately goes through the same real
+  // edit-dialog UI as addTracksViaEditDialog above (open → "Добавить
+  // аудиозаписи" → tick matches by name → click VK's own Save), NOT a
+  // direct audio.editPlaylist call: that method replaces the WHOLE track
+  // list and requires title/description/no_discover resent every time or
+  // VK blanks them (see reorderPlaylistViaApi's comment) — a caller here
+  // only knows the playlist's title (scraped off a grid cell), not its
+  // description or no_discover, so building that call ourselves would risk
+  // silently wiping them. Driving Save instead means VK resends its own
+  // live form state, so nothing we don't touch can be corrupted.
+  //
+  // Skips the reorder step addTracksViaEditDialog does after saving —
+  // that reorder places tracks matching `trackNames` FIRST and shoves every
+  // non-matching (i.e. every pre-existing) track after them. Fine for a
+  // brand-new playlist (there's nothing to shove), wrong here: it would
+  // silently rearrange a playlist the user didn't ask to reorder.
+  //
+  // Returns the number of tracks VK's own picker actually matched and
+  // ticked. 0 is a real "nothing was added" outcome — the caller must treat
+  // it as failure, not success.
+  async function addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames) {
+    // Same "APE state" staleness createPlaylistViaUI already works around
+    // before its own addTracksViaEditDialog call: VK's "Добавить
+    // аудиозаписи" picker reads an in-memory audio list that doesn't yet
+    // include tracks uploaded moments ago until the SPA refreshes — skip
+    // this and selectTracksFromCommunityList scans a stale list that will
+    // never contain the new tracks, no matter how long it scrolls. This is
+    // exactly the "doesn't find the track in time" race.
+    if (typeof window.nav?.reload === 'function') {
+      window.nav.reload();
+      await pause(3000);
+    }
+
+    let editBtn = null;
+    for (let i = 0; i < 20 && !editBtn; i++) {
+      if (i > 0) await pause(600);
+      for (const link of document.querySelectorAll('[data-id$="_' + playlistId + '"], [href*="_' + playlistId + '"]')) {
+        const cell = link.closest('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl') || link.parentElement?.parentElement;
+        const btn = findEditBtnInCell(cell);
+        if (btn) { editBtn = btn; break; }
+      }
+    }
+    if (!editBtn) throw new Error('edit_button_not_found');
+
+    editBtn.click();
+    const dialog = await waitForEl('.audio_pl_edit_box', 4000);
+    if (!dialog) throw new Error('dialog_not_opened');
+
+    // Give VK time to attach event handlers to the dialog
+    await pause(1000);
+
+    // ._ape_audio_item is NOT unique to the "add tracks" picker — verified
+    // live: the edit dialog's default view already renders the playlist's
+    // OWN current tracks using that exact same class, so it's always
+    // present from the moment the dialog opens, well before "Добавить
+    // аудиозаписи" is ever clicked. Treating its presence as "the picker is
+    // already open" (an earlier version of this code did, to avoid
+    // re-toggling an already-expanded panel shut) instead skipped the click
+    // outright every time, then immediately concluded no tracks matched
+    // against the playlist's own existing tracks and closed the dialog —
+    // exactly the "collapses before I can pick anything" symptom this is
+    // fixing. The dialog fully unmounts on close (verified live — a fresh
+    // editBtn.click() always starts from the collapsed view), so an
+    // unconditional click here is safe; no need to guard against
+    // re-collapsing a panel that's already open.
+    const baselineCount = dialog.querySelectorAll('._ape_audio_item').length;
+    const addAudiosBtn = dialog.querySelector('.ape_add_audios_btn');
+    if (!addAudiosBtn) throw new Error('add_audios_btn_not_found');
+    addAudiosBtn.click();
+
+    // The real "picker is open and loaded" signal is this search-view-only
+    // marker (verified live — absent in the default view, present the
+    // moment the picker renders) PLUS the item count actually growing past
+    // whatever the playlist's own existing tracks contributed to
+    // baselineCount — either alone can be misleading (the marker can mount
+    // a beat before the list finishes populating).
+    const opened = await (async () => {
+      const deadline = Date.now() + 6000;
+      while (Date.now() < deadline) {
+        const hasMarker = !!dialog.querySelector('[data-testid="MusicPlaylist_EditModal_SearchTracks"]');
+        const grew = dialog.querySelectorAll('._ape_audio_item').length > baselineCount;
+        if (hasMarker && grew) return true;
+        await pause(150);
+      }
+      return false;
+    })();
+    if (!opened) throw new Error('audio_item_list_not_found');
+
+    const selectedCount = await selectTracksFromCommunityList(dialog, trackNames);
+    await pause(300);
+
+    const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
+    if (!selectedCount) {
+      // Nothing matched — close without saving rather than leave VK's own
+      // dialog sitting open unattended, or save a no-op edit.
+      (boxLayout || dialog).querySelector('.box_x_button')?.click();
+      return 0;
+    }
+
+    const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
+    if (!saveBtn) throw new Error('save_btn_not_found');
+    saveBtn.click();
+    await pause(1500);
+
+    return selectedCount;
   }
 
   function normalizeStr(s) {

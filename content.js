@@ -188,7 +188,7 @@
   // (freq) / wheel (q, bandwidth).
   const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   const EQ_DEFAULT_Q = 1.41; // RBJ-cookbook default — matches BiquadFilterNode's own peaking-EQ default
-  let settings = { autoPlaylist: false, dupPlaylistCheck: true, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  let settings = { autoPlaylist: false, dupPlaylistCheck: true, autoAddToExistingPlaylist: true, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -266,6 +266,7 @@
       const out = {
         autoPlaylist: settings.autoPlaylist,
         dupPlaylistCheck: settings.dupPlaylistCheck,
+        autoAddToExistingPlaylist: settings.autoAddToExistingPlaylist,
         coverDataUrl: settings.coverDataUrl,
         autoMeta: settings.autoMeta,
         autoCoverFromId3: settings.autoCoverFromId3,
@@ -2787,7 +2788,10 @@
     return null;
   }
 
-  async function scanAllOwnerPlaylistTitles() {
+  // Returns [{id: "ownerId_playlistId", title}] — the id is what the
+  // auto-add-to-existing-playlist feature needs to actually add tracks
+  // (VK_ADD_TRACKS_TO_PLAYLIST), not just detect a name collision.
+  async function scanAllOwnerPlaylists() {
     const CELL_SEL = '[data-testid="MusicPlaylistItem_Cell"]';
     const TITLE_SEL = '[data-testid="MusicPlaylistItem_Title"]';
 
@@ -2814,15 +2818,18 @@
     }
 
     return [...document.querySelectorAll(CELL_SEL)]
-      .map(cell => cell.querySelector(TITLE_SEL)?.textContent?.trim() || '')
-      .filter(Boolean);
+      .map(cell => ({
+        id: cell.getAttribute('data-id') || '',
+        title: cell.querySelector(TITLE_SEL)?.textContent?.trim() || '',
+      }))
+      .filter(p => p.id && p.title);
   }
 
   if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg?.type === 'VMU_SCAN_PLAYLISTS') {
-        scanAllOwnerPlaylistTitles()
-          .then(titles => sendResponse({ ok: true, titles }))
+        scanAllOwnerPlaylists()
+          .then(playlists => sendResponse({ ok: true, playlists }))
           .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
         return true;
       }
@@ -2926,6 +2933,48 @@
     });
   }
 
+  // Adds the just-uploaded tracks to an existing playlist (the "дозаливка"
+  // case: the album already has a playlist, the user just uploaded the
+  // tracks they missed the first time). `playlist.id` is
+  // "ownerId_playlistId" as scanned off MusicPlaylistItem_Cell's own
+  // data-id.
+  //
+  // This goes through VK's own edit-playlist UI (open the playlist's edit
+  // dialog → "Добавить аудиозаписи" → tick the matching tracks by name →
+  // click VK's own Save button), the exact same path createPlaylistViaUI
+  // already uses to populate a brand-new playlist — NOT a direct
+  // audio.editPlaylist call. That matters: audio.editPlaylist replaces the
+  // playlist's entire track list AND requires title/description/no_discover
+  // resent on every call or VK blanks them (see reorderPlaylistViaApi's own
+  // comment) — a background call built from a title we scraped off a grid
+  // cell would have no real description/no_discover to send and would risk
+  // silently wiping them. Driving VK's own Save button instead means VK
+  // resends its own live form state, so existing metadata is never at risk
+  // from us. Returns false (never throws) so callers fall back to the
+  // normal duplicate-playlist prompt — including when VK's picker found no
+  // matching tracks, which is a real "nothing was added" outcome, not
+  // success.
+  async function addTracksToExistingPlaylist(playlist, trackNames) {
+    const [ownerIdStr, playlistIdStr] = (playlist.id || '').split('_');
+    const playlistId = parseInt(playlistIdStr, 10);
+    if (!ownerIdStr || !Number.isFinite(playlistId)) return false;
+    try {
+      // Generous timeout: matching tracks means scrolling the owner's own
+      // catalog list (selectTracksFromCommunityList in injected.js) until
+      // either every track is found or the whole thing is exhausted — for a
+      // large library that can take a while even though the common case
+      // (just-uploaded tracks sort newest-first) resolves in a few seconds.
+      const res = await pageCall('VK_ADD_TRACKS_TO_PLAYLIST', 'VK_ADD_TRACKS_TO_PLAYLIST_DONE', {
+        reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        ownerId: ownerIdStr, playlistId, trackNames,
+      }, 120000, 'reqId');
+      return !!res.ok && res.selectedCount > 0;
+    } catch (err) {
+      console.warn('[VK Multi Upload] addTracksToExistingPlaylist failed:', err);
+      return false;
+    }
+  }
+
   // ─── auto-playlist flow ───────────────────────────────────────────────────────
   async function runAutoPlaylist(uploadedItems) {
     const done = uploadedItems.filter(i => i.status === 'done');
@@ -2956,14 +3005,28 @@
       // Description: название + подпись
       const description = title + '\nчеловек паук поможет каждому [vk.com/reuploadunder]';
 
+      // Build track names list for matching in the edit dialog (in upload
+      // order) — needed both for populating a brand-new playlist below AND
+      // for the duplicate-check's auto-add-to-existing path just above it.
+      const trackNames = done.map(i => {
+        const tags = i.tags || {};
+        const tagArtist = tags.TPE1 || tags.TPE2 || '';
+        const tagTitle = tags.TIT2 || '';
+        if (tagArtist && tagTitle) return { artist: tagArtist, title: tagTitle };
+        const name = i.file.name.replace(/\.mp3$/i, '');
+        const parts = name.split(/\s*[-–—]\s*/);
+        if (parts.length >= 2) return { artist: parts[0].trim(), title: parts.slice(1).join(' - ').trim() };
+        return { artist: '', title: name };
+      });
+
       // Duplicate check: ask before creating a second playlist with the same
       // title. Checked against the owner's REAL playlist list, scraped the
       // same way a person checking by hand would: background.js opens
       // /audios<ownerId> in a hidden, minimized window, our own content.js
       // auto-runs there (manifest content_scripts, no extra permission
       // needed), clicks "Показать все" and scrolls the catalog until every
-      // playlist is mounted, then reports the titles back — see
-      // scanAllOwnerPlaylistTitles above and scanPlaylistsInHiddenTab in
+      // playlist is mounted, then reports {id, title} pairs back — see
+      // scanAllOwnerPlaylists above and scanPlaylistsInHiddenTab in
       // background.js. Replaced the old audio.getPlaylists API call, which
       // had to hand-parse a token out of localStorage and finish an entire
       // paginated fetch inside one 15s window — fragile for any account with
@@ -2982,14 +3045,30 @@
           });
           if (!scanRes?.ok) throw new Error(scanRes?.error || 'scan failed');
           const norm = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
-          const isDupe = (scanRes.titles || []).some(t => norm(t) === norm(title));
-          if (isDupe) {
+          const match = (scanRes.playlists || []).find(p => norm(p.title) === norm(title));
+          if (match) {
+            // "Дозаливка" scenario: the album/playlist already exists and
+            // the user is just uploading the tracks they missed the first
+            // time — merge into it instead of asking to make a duplicate.
+            // Falls through to the usual create-duplicate prompt if this is
+            // off, or if the add itself fails for any reason.
+            if (settings.autoAddToExistingPlaylist) {
+              showProgressToast(`Плейлист «${title.slice(0,30)}» уже есть — добавляем треки…`, { id: 'vmu-autoplaylist' });
+              const added = await addTracksToExistingPlaylist(match, trackNames);
+              if (added) {
+                showProgressToast(`Добавлено в «${title.slice(0,30)}»`, { id: 'vmu-autoplaylist', kind: 'done' });
+                return;
+              }
+              console.warn('[VK Multi Upload] auto-add to existing playlist failed, falling back to duplicate prompt');
+            }
             const choice = await showDupPlaylistPrompt(title);
             if (choice.dontAskAgain) {
               settings.dupPlaylistCheck = false;
               saveSettings();
               const dupToggle = document.getElementById('vmu-dupcheck-toggle');
               if (dupToggle) dupToggle.checked = false;
+              const autoAddRow = document.getElementById('vmu-autoadd-row');
+              if (autoAddRow) autoAddRow.classList.add('vmu-row-disabled');
             }
             if (!choice.create) {
               showProgressToast(`Отменено: плейлист «${title.slice(0,30)}» уже есть`, { id: 'vmu-autoplaylist', kind: 'error' });
@@ -3006,18 +3085,6 @@
           await sleep(2000);
         }
       }
-
-      // Build track names list for matching in the edit dialog (in upload order)
-      const trackNames = done.map(i => {
-        const tags = i.tags || {};
-        const tagArtist = tags.TPE1 || tags.TPE2 || '';
-        const tagTitle = tags.TIT2 || '';
-        if (tagArtist && tagTitle) return { artist: tagArtist, title: tagTitle };
-        const name = i.file.name.replace(/\.mp3$/i, '');
-        const parts = name.split(/\s*[-–—]\s*/);
-        if (parts.length >= 2) return { artist: parts[0].trim(), title: parts.slice(1).join(' - ').trim() };
-        return { artist: '', title: name };
-      });
 
       // Prepare cover blob BEFORE opening the dialog (inject it during creation).
       // Priority: user-set base cover from settings → if the "Обложка из ID3"
@@ -3060,7 +3127,7 @@
         coverBuf: coverBlob ? await coverBlob.arrayBuffer() : null,
       }, 60000, 'reqId');
 
-      showProgressToast(`✓ Плейлист «${title.slice(0,30)}» создан!`, { id: 'vmu-autoplaylist', kind: 'done' });
+      showProgressToast(`Плейлист «${title.slice(0,30)}» создан!`, { id: 'vmu-autoplaylist', kind: 'done' });
     } catch (err) {
       showProgressToast(`Ошибка: ${translateError(err.message)}`, { id: 'vmu-autoplaylist', kind: 'error' });
       console.error('[VK Multi Upload]', err);
@@ -5017,6 +5084,17 @@
             </label>
           </div>
 
+          <div class="vmu-setting-row ${settings.autoPlaylist && settings.dupPlaylistCheck ? '' : 'vmu-row-disabled'}" id="vmu-autoadd-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Авто-добавление в существующий плейлист</span>
+              <span class="vmu-setting-hint">Если плейлист с таким названием уже есть — добавить в него дозалитые треки вместо вопроса о дубликате</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-autoadd-toggle" ${settings.autoAddToExistingPlaylist ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+
           <div id="vmu-cover-row" class="vmu-setting-row vmu-setting-row-wide ${settings.autoPlaylist ? '' : 'vmu-row-disabled'}">
             <div class="vmu-setting-info">
               <span class="vmu-setting-label">Обложка</span>
@@ -5195,6 +5273,8 @@
         if (id3Row) id3Row.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && !settings.coverDataUrl));
         const dupRow = document.getElementById('vmu-dupcheck-row');
         if (dupRow) dupRow.classList.toggle('vmu-row-disabled', !settings.autoPlaylist);
+        const autoAddRow = document.getElementById('vmu-autoadd-row');
+        if (autoAddRow) autoAddRow.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && settings.dupPlaylistCheck));
       });
     }
 
@@ -5202,6 +5282,16 @@
     if (dupCheckToggle) {
       dupCheckToggle.addEventListener('change', () => {
         settings.dupPlaylistCheck = dupCheckToggle.checked;
+        saveSettings();
+        const autoAddRow = document.getElementById('vmu-autoadd-row');
+        if (autoAddRow) autoAddRow.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && settings.dupPlaylistCheck));
+      });
+    }
+
+    const autoAddToggle = document.getElementById('vmu-autoadd-toggle');
+    if (autoAddToggle) {
+      autoAddToggle.addEventListener('change', () => {
+        settings.autoAddToExistingPlaylist = autoAddToggle.checked;
         saveSettings();
       });
     }

@@ -1,7 +1,7 @@
 // Service worker — handles chrome.downloads calls for playlist download feature,
 // and resolving SoundCloud links to direct, downloadable audio URLs.
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === 'VKD_DOWNLOAD') {
     let { url, filename, folder } = msg;
 
@@ -64,7 +64,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === 'VKD_SCAN_PLAYLISTS') {
-    scanPlaylistsInHiddenTab(msg.url)
+    scanPlaylistsInHiddenTab(msg.url, sender.tab?.windowId)
       .then(sendResponse)
       .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
     return true;
@@ -343,17 +343,30 @@ function sendMessageWithRetry(tabId, message, timeoutMs) {
   });
 }
 
-async function scanPlaylistsInHiddenTab(url) {
+async function scanPlaylistsInHiddenTab(url, originalWindowId) {
   if (!url) throw new Error('scan_no_url');
-  const win = await chrome.windows.create({ url, focused: false, state: 'minimized', type: 'popup' });
-  await chrome.windows.update(win.id, { state: 'minimized', focused: false }).catch(() => {});
+  // Chrome flatly rejects a window placed fully off-screen ("Bounds must be
+  // at least 50% within visible screen space" — verified live), so
+  // state:'minimized' is the only way to keep this window out of the user's
+  // way. Minimizing on creation shuffles the OS-level window stack on
+  // Windows (verified live) and can surface some OTHER unrelated
+  // recently-used window/tab instead of leaving the user's actual
+  // foreground tab alone — so immediately after creating it, explicitly
+  // re-focus whatever window the request actually came from, undoing
+  // whatever the OS did in between regardless of the exact mechanism.
+  const win = await chrome.windows.create({
+    url, focused: false, state: 'minimized', type: 'popup',
+  });
+  if (originalWindowId != null) {
+    chrome.windows.update(originalWindowId, { focused: true }).catch(() => {});
+  }
   const tabId = win.tabs?.[0]?.id;
   try {
     if (!tabId) throw new Error('scan_window_no_tab');
     await waitForTabComplete(tabId, 20000);
     const result = await sendMessageWithRetry(tabId, { type: 'VMU_SCAN_PLAYLISTS' }, 30000);
     if (!result.ok) throw new Error(result.error || 'scan_failed');
-    return { ok: true, titles: result.titles || [] };
+    return { ok: true, playlists: result.playlists || [] };
   } finally {
     chrome.windows.remove(win.id).catch(() => {});
   }
