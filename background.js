@@ -63,6 +63,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'VKD_SCAN_PLAYLISTS') {
+    scanPlaylistsInHiddenTab(msg.url)
+      .then(sendResponse)
+      .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
   return false;
 });
 
@@ -272,7 +279,7 @@ function waitForTabComplete(tabId, timeoutMs = 15000) {
         if (id === tabId && info.status === 'complete') finish(resolve);
       };
       chrome.tabs.onUpdated.addListener(listener);
-      const timer = setTimeout(() => finish(() => reject(new Error('genius_page_load_timeout'))), timeoutMs);
+      const timer = setTimeout(() => finish(() => reject(new Error('hidden_page_load_timeout'))), timeoutMs);
     });
   });
 }
@@ -297,6 +304,56 @@ async function runInGeniusPage(url, func, args = []) {
     if (!value) throw new Error('genius_no_result');
     if (!value.ok) throw new Error(value.error || 'genius_page_failed');
     return value.data;
+  } finally {
+    chrome.windows.remove(win.id).catch(() => {});
+  }
+}
+
+// ─── Playlist duplicate check: scan the real playlist list in a hidden tab ──
+// audio.getPlaylists (VK's internal web API) required hand-parsing the
+// access_token out of localStorage and reconstructing the client_id, and the
+// whole paginated fetch had to finish inside one 15s window — fragile for any
+// account with a lot of playlists, and any failure (timeout, token hiccup)
+// silently proceeded as "no duplicate found" with zero feedback. Instead of
+// calling the API, open the owner's own /audios page in a background window
+// (same trick as runInGeniusPage above) and let our own content.js — already
+// auto-injected there via manifest content_scripts, no extra host permission
+// needed — click "Показать все" and scroll the catalog list until every
+// playlist cell is mounted, then read titles straight off the DOM: exactly
+// what a user would see if they checked by hand.
+// content.js's VMU_SCAN_PLAYLISTS listener is registered once the content
+// script runs, which races the window's 'complete' status slightly (SPA
+// hydration, document_idle timing) — retry on "no receiving end" instead of
+// failing on the first attempt.
+function sendMessageWithRetry(tabId, message, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const attempt = () => {
+      chrome.tabs.sendMessage(tabId, message, res => {
+        const err = chrome.runtime.lastError;
+        if (err || !res) {
+          if (Date.now() >= deadline) { reject(new Error(err?.message || 'scan_timeout')); return; }
+          setTimeout(attempt, 400);
+          return;
+        }
+        resolve(res);
+      });
+    };
+    attempt();
+  });
+}
+
+async function scanPlaylistsInHiddenTab(url) {
+  if (!url) throw new Error('scan_no_url');
+  const win = await chrome.windows.create({ url, focused: false, state: 'minimized', type: 'popup' });
+  await chrome.windows.update(win.id, { state: 'minimized', focused: false }).catch(() => {});
+  const tabId = win.tabs?.[0]?.id;
+  try {
+    if (!tabId) throw new Error('scan_window_no_tab');
+    await waitForTabComplete(tabId, 20000);
+    const result = await sendMessageWithRetry(tabId, { type: 'VMU_SCAN_PLAYLISTS' }, 30000);
+    if (!result.ok) throw new Error(result.error || 'scan_failed');
+    return { ok: true, titles: result.titles || [] };
   } finally {
     chrome.windows.remove(win.id).catch(() => {});
   }

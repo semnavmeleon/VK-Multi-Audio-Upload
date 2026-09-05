@@ -2758,6 +2758,78 @@
     return null;
   }
 
+  // ─── Playlist duplicate check: DOM scan (runs when background.js opens this
+  // page in a hidden window and asks) ─────────────────────────────────────────
+  // Reads the owner's real playlist titles the same way a user checking by
+  // hand would: click the "Плейлисты" section's own "Показать все" then
+  // scroll to the bottom repeatedly — that's what drives the catalog's lazy
+  // loading — until the mounted count stops growing.
+  //
+  // "Показать все" isn't unique by itself: on the current user's own
+  // /audios?section=all every block (Недавно прослушанные, Плейлисты,
+  // Музыканты, Музыка друзей) has one, all sharing the same
+  // data-testid="AudioCatalogTextLinkAction" (verified live) — clicking the
+  // first match found would as likely jump into "friends' music" as into
+  // playlists. findSectionShowAll walks up from the "Плейлисты" heading text
+  // to the nearest ancestor that contains one such link, scoping the click to
+  // the right block. (A page with only one playlists-style block, e.g.
+  // someone else's /audios, still works the same way.)
+  function findSectionShowAll(sectionTitle) {
+    const heading = [...document.querySelectorAll('h1,h2,h3,div,span')]
+      .find(el => el.children.length === 0 && el.textContent.trim() === sectionTitle);
+    if (!heading) return null;
+    let node = heading;
+    for (let i = 0; i < 12 && node; i++) {
+      const link = node.querySelector('[data-testid="AudioCatalogTextLinkAction"]');
+      if (link) return link;
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  async function scanAllOwnerPlaylistTitles() {
+    const CELL_SEL = '[data-testid="MusicPlaylistItem_Cell"]';
+    const TITLE_SEL = '[data-testid="MusicPlaylistItem_Title"]';
+
+    await waitForElement('[data-testid="AudioCatalogTextLinkAction"], ' + CELL_SEL, 10000);
+    const showAll = findSectionShowAll('Плейлисты');
+    if (showAll) {
+      showAll.click();
+      await waitForElement(CELL_SEL, 10000);
+    } else {
+      // No "Плейлисты" show-all link — either every playlist already fits
+      // inline, or the owner has none. Harvest whatever's mounted rather
+      // than failing outright.
+      await waitForElement(CELL_SEL, 5000);
+    }
+
+    let lastCount = -1, stable = 0;
+    const MAX_ITER = 60, STABLE_LIMIT = 4;
+    for (let i = 0; i < MAX_ITER && stable < STABLE_LIMIT; i++) {
+      window.scrollTo(0, document.body.scrollHeight);
+      await sleep(600);
+      const n = document.querySelectorAll(CELL_SEL).length;
+      stable = (n === lastCount) ? stable + 1 : 0;
+      lastCount = n;
+    }
+
+    return [...document.querySelectorAll(CELL_SEL)]
+      .map(cell => cell.querySelector(TITLE_SEL)?.textContent?.trim() || '')
+      .filter(Boolean);
+  }
+
+  if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (msg?.type === 'VMU_SCAN_PLAYLISTS') {
+        scanAllOwnerPlaylistTitles()
+          .then(titles => sendResponse({ ok: true, titles }))
+          .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
+        return true;
+      }
+      return false;
+    });
+  }
+
   function translateError(msg) {
     const map = {
       btn_create_playlist_not_found: 'Кнопка "Создать плейлист" не найдена. Перейдите на страницу своей музыки (/audios) и попробуйте снова.',
@@ -2818,33 +2890,6 @@
     });
   }
 
-  // ─── status helpers ───────────────────────────────────────────────────────────
-  function setPlaylistStatus(text, isError, progress) {
-    const el = document.getElementById('vmu-pl-status');
-    if (!el) return;
-    let textEl = el.querySelector('.vmu-pl-status-text');
-    let progWrap = el.querySelector('.vmu-pl-progress');
-    let bar = el.querySelector('.vmu-pl-progress-bar');
-    // Backfill DOM if a legacy element exists without children
-    if (!textEl) {
-      el.innerHTML = '<div class="vmu-pl-status-text"></div><div class="vmu-pl-progress"><div class="vmu-pl-progress-bar"></div></div>';
-      textEl = el.querySelector('.vmu-pl-status-text');
-      progWrap = el.querySelector('.vmu-pl-progress');
-      bar = el.querySelector('.vmu-pl-progress-bar');
-    }
-    textEl.textContent = text || '';
-    textEl.style.color = isError ? '#e64646' : '#4bb34b';
-    el.style.display = text ? 'block' : 'none';
-    if (progress && progress.total > 0) {
-      const pct = Math.min(100, Math.max(0, (progress.loaded / progress.total) * 100));
-      progWrap.style.display = 'block';
-      bar.style.width = pct + '%';
-      bar.classList.toggle('vmu-pl-progress-bar-error', !!isError);
-    } else if (progWrap) {
-      progWrap.style.display = 'none';
-    }
-  }
-
   // VK's upload transport doesn't reliably let us correlate a done_add
   // response back to a specific filename anymore (see NATIVE_HANDOFF_ONLY) —
   // "fileName: null" comes back for native-handoff uploads, which is exactly
@@ -2887,9 +2932,9 @@
     if (!done.length) return;
 
     const ownerId = getVkUserId();
-    if (!ownerId) { setPlaylistStatus('Ошибка: ID пользователя не найден', true); return; }
+    if (!ownerId) { showProgressToast('Ошибка: ID пользователя не найден', { id: 'vmu-autoplaylist', kind: 'error' }); return; }
 
-    setPlaylistStatus('Читаем метаданные…');
+    showProgressToast('Читаем метаданные…', { id: 'vmu-autoplaylist' });
 
     try {
       const tagsList = done.map(i => i.tags || {});
@@ -2912,19 +2957,32 @@
       const description = title + '\nчеловек паук поможет каждому [vk.com/reuploadunder]';
 
       // Duplicate check: ask before creating a second playlist with the same
-      // title. Checked against ALL of the owner's playlists via VK's own API
-      // (getOwnerPlaylistTitles in injected.js), not just whatever a given
-      // catalog page happens to have rendered — a DOM scan would miss
-      // playlists further down an unloaded/virtualized list.
+      // title. Checked against the owner's REAL playlist list, scraped the
+      // same way a person checking by hand would: background.js opens
+      // /audios<ownerId> in a hidden, minimized window, our own content.js
+      // auto-runs there (manifest content_scripts, no extra permission
+      // needed), clicks "Показать все" and scrolls the catalog until every
+      // playlist is mounted, then reports the titles back — see
+      // scanAllOwnerPlaylistTitles above and scanPlaylistsInHiddenTab in
+      // background.js. Replaced the old audio.getPlaylists API call, which
+      // had to hand-parse a token out of localStorage and finish an entire
+      // paginated fetch inside one 15s window — fragile for any account with
+      // a lot of playlists, and any failure silently proceeded as "no
+      // duplicate" with zero feedback.
       if (settings.dupPlaylistCheck) {
-        setPlaylistStatus('Проверяем на дубликаты…');
+        showProgressToast('Проверяем на дубликаты…', { id: 'vmu-autoplaylist' });
         try {
-          const dupRes = await pageCall('VK_GET_ALL_PLAYLISTS', 'VK_ALL_PLAYLISTS', {
-            reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
-            ownerId,
-          }, 15000, 'reqId');
+          const scanRes = await new Promise(resolve => {
+            try {
+              chrome.runtime.sendMessage(
+                { type: 'VKD_SCAN_PLAYLISTS', url: `${location.origin}/audios${ownerId}` },
+                res => resolve(res)
+              );
+            } catch { resolve({ ok: false, error: 'extension context error' }); }
+          });
+          if (!scanRes?.ok) throw new Error(scanRes?.error || 'scan failed');
           const norm = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
-          const isDupe = (dupRes.playlists || []).some(p => norm(p.title) === norm(title));
+          const isDupe = (scanRes.titles || []).some(t => norm(t) === norm(title));
           if (isDupe) {
             const choice = await showDupPlaylistPrompt(title);
             if (choice.dontAskAgain) {
@@ -2934,15 +2992,18 @@
               if (dupToggle) dupToggle.checked = false;
             }
             if (!choice.create) {
-              setPlaylistStatus(`Отменено: плейлист «${title.slice(0,30)}» уже есть`, true);
+              showProgressToast(`Отменено: плейлист «${title.slice(0,30)}» уже есть`, { id: 'vmu-autoplaylist', kind: 'error' });
               return;
             }
           }
         } catch (err) {
-          // Non-fatal — the check is a courtesy, not a gate. If it fails (no
-          // token found, API hiccup, etc.) just proceed as if nothing was
-          // found rather than blocking the upload on it.
+          // Non-fatal — the check is a courtesy, not a gate. If it fails
+          // (hidden tab couldn't load, scan timed out, etc.) proceed as if
+          // nothing was found, but say so — silently swallowing this used to
+          // make the whole feature look broken.
           console.warn('[VK Multi Upload] duplicate playlist check failed, proceeding:', err);
+          showProgressToast('Не удалось проверить на дубликаты, продолжаю без проверки…', { id: 'vmu-autoplaylist', kind: 'error' });
+          await sleep(2000);
         }
       }
 
@@ -2969,7 +3030,7 @@
       } else if (settings.autoCoverFromId3) {
         const apicItem = done.find(i => i.tags?.APIC?.data);
         if (apicItem) {
-          setPlaylistStatus('Извлекаем обложку из ID3…');
+          showProgressToast('Извлекаем обложку из ID3…', { id: 'vmu-autoplaylist' });
           const apic = apicItem.tags.APIC;
           const apicBlob = new Blob([apic.data], { type: apic.mime || 'image/jpeg' });
           coverSource = await new Promise(res => {
@@ -2981,7 +3042,7 @@
         }
       }
       if (coverSource) {
-        setPlaylistStatus('Готовим обложку…');
+        showProgressToast('Готовим обложку…', { id: 'vmu-autoplaylist' });
         coverBlob = await makePerezalitoCover(coverSource);
       }
 
@@ -2990,7 +3051,7 @@
       // different overlapping VK_CREATE_PLAYLIST call's (see injected.js's
       // __playlistCreationQueue — they no longer actually run concurrently,
       // but this keeps pageCall() correct even if that ever changes).
-      setPlaylistStatus('Создаём плейлист…');
+      showProgressToast('Создаём плейлист…', { id: 'vmu-autoplaylist' });
       const created = await pageCall('VK_CREATE_PLAYLIST', 'VK_PLAYLIST_CREATED', {
         reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
         title: title.slice(0, 255),
@@ -2999,9 +3060,9 @@
         coverBuf: coverBlob ? await coverBlob.arrayBuffer() : null,
       }, 60000, 'reqId');
 
-      setPlaylistStatus(`✓ Плейлист «${title.slice(0,30)}» создан!`);
+      showProgressToast(`✓ Плейлист «${title.slice(0,30)}» создан!`, { id: 'vmu-autoplaylist', kind: 'done' });
     } catch (err) {
-      setPlaylistStatus(`Ошибка: ${translateError(err.message)}`, true);
+      showProgressToast(`Ошибка: ${translateError(err.message)}`, { id: 'vmu-autoplaylist', kind: 'error' });
       console.error('[VK Multi Upload]', err);
     }
   }
@@ -4364,7 +4425,7 @@
 
   async function scanForDuplicates(plInfoArg, statusCallback, cancelToken) {
     const pl = plInfoArg || getPlaylistInfoFromUrl();
-    const report = statusCallback || ((msg, isError, progress) => setPlaylistStatus(msg, isError, progress));
+    const report = statusCallback || ((msg, isError) => showToast(msg, isError));
     const isCancelled = () => !!cancelToken?.cancelled;
 
     if (!pl) {
@@ -4993,11 +5054,6 @@
             </label>
           </div>
         </div>
-
-        <div id="vmu-pl-status" style="display:none">
-          <div class="vmu-pl-status-text"></div>
-          <div class="vmu-pl-progress"><div class="vmu-pl-progress-bar"></div></div>
-        </div>
       </div>`;
   }
 
@@ -5574,13 +5630,13 @@
 
     const startCount = startCountEarly;
     if (startCount != null) {
-      setPlaylistStatus('Ждём подтверждения загрузки…');
+      showProgressToast('Ждём подтверждения загрузки…', { id: 'vmu-autoplaylist' });
       waitForTrackCountIncrease(startCount, items.length)
         .then(gained => {
           if (gained > 0) return runAutoPlaylist(batchItems);
-          setPlaylistStatus('Ошибка: загрузка не подтвердилась, плейлист не создан', true);
+          showProgressToast('Ошибка: загрузка не подтвердилась, плейлист не создан', { id: 'vmu-autoplaylist', kind: 'error' });
         })
-        .catch(err => setPlaylistStatus(`Ошибка: ${translateError(err.message)}`, true))
+        .catch(err => showProgressToast(`Ошибка: ${translateError(err.message)}`, { id: 'vmu-autoplaylist', kind: 'error' }))
         .finally(() => { autoPlaylistRunning = false; });
     }
   }
@@ -7162,7 +7218,6 @@
         // Trigger auto-playlist if enabled (once per completed batch)
         if (settings.autoPlaylist && !autoPlaylistRunning) {
           autoPlaylistRunning = true;
-          if (!settingsPanelOpen) toggleSettings();
           runAutoPlaylist([...fileQueue]).finally(() => {
             autoPlaylistRunning = false;
             reloadAfterBatchIfNeeded();

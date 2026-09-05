@@ -560,33 +560,6 @@ html.vmu-theme-light {
 .vmu-action-btn:hover::after,
 .vmu-action-btn:hover::before { opacity: 1; }
 
-/* ── Playlist status bar ──────────────────────────────────────────────────── */
-#vmu-pl-status {
-  font-size: 11.5px;
-  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
-  padding: 6px 12px 8px;
-  color: #4bb34b;
-}
-.vmu-pl-status-text {
-  font-size: 11.5px;
-  line-height: 1.3;
-}
-.vmu-pl-progress {
-  display: none;
-  margin-top: 5px;
-  height: 2px;
-  background: rgba(var(--vmu-ov),0.06);
-  border-radius: 1px;
-  overflow: hidden;
-}
-.vmu-pl-progress-bar {
-  height: 100%;
-  width: 0;
-  background: #2688eb;
-  transition: width .25s ease;
-}
-.vmu-pl-progress-bar-error { background: #e64646; }
-
 /* ── Spinner ──────────────────────────────────────────────────────────────── */
 @keyframes vmu-spin { to { transform: rotate(360deg); } }
 .vmu-spin {

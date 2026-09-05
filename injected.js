@@ -1182,14 +1182,6 @@
         break;
       }
 
-      case 'VK_GET_ALL_PLAYLISTS': {
-        const reqId = e.data.reqId;
-        getOwnerPlaylistTitles(e.data.ownerId)
-          .then(playlists => window.postMessage({ type: 'VK_ALL_PLAYLISTS', ok: true, reqId, playlists }, '*'))
-          .catch(err => window.postMessage({ type: 'VK_ALL_PLAYLISTS', ok: false, reqId, error: err.message }, '*'));
-        break;
-      }
-
       // Fallback: add via al_audio.php (for editing existing playlists)
       case 'VK_ADD_TO_PLAYLIST': {
         const { ownerId, playlistId, audioIds } = e.data;
@@ -2204,43 +2196,6 @@
       if (i < edits.length - 1) await pause(PACING_MS);
     }
     return { ok, fail };
-  }
-
-  // Fetches every playlist title the owner has (paginated), for the
-  // auto-playlist flow's duplicate check — asked to look across ALL of the
-  // owner's playlists, not just whatever a given catalog page happens to
-  // have rendered, so this goes through VK's own web API (same
-  // localStorage access_token pattern as bulkEditTracks above) rather than
-  // scraping a specific catalog URL, which would only ever cover playlists
-  // that page happened to list and would break the moment VK reshuffles
-  // that URL's hash (see the vk.com→vk.ru/data-testid churn elsewhere in
-  // this file).
-  async function getOwnerPlaylistTitles(ownerId) {
-    const tokenKey = Object.keys(localStorage).find(k => /:web_token:login:auth$/.test(k));
-    if (!tokenKey) throw new Error('no_token');
-    const clientId = tokenKey.split(':')[0];
-    const { access_token } = JSON.parse(localStorage.getItem(tokenKey) || '{}');
-    if (!access_token) throw new Error('no_access_token');
-
-    const playlists = [];
-    const CHUNK = 100;
-    let offset = 0;
-    let total = Infinity;
-    while (offset < total) {
-      const res = await fetch(`https://web.api.vk.ru/method/audio.getPlaylists?v=5.285&client_id=${clientId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ owner_id: String(ownerId), offset: String(offset), count: String(CHUNK), access_token }).toString(),
-      });
-      const json = await res.json();
-      if (json.error) throw new Error(json.error.error_msg || 'audio.getPlaylists failed');
-      const items = json.response?.items || [];
-      total = typeof json.response?.count === 'number' ? json.response.count : items.length;
-      for (const it of items) playlists.push({ id: it.id, title: it.title || '' });
-      if (!items.length) break;
-      offset += CHUNK;
-    }
-    return playlists;
   }
 
   // Bulk delete (duplicates/blocked cleanup) for the "Массовые операции"
