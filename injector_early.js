@@ -1,6 +1,15 @@
 ﻿// Runs at document_start to patch fetch/XHR before VK scripts fire
 (function () {
   if (window.__vkMultiUploadInjected) return;
+  // Must be set BEFORE anything else below — this guard exists specifically
+  // to stop this whole IIFE (the window-level drag/drop listeners further
+  // down, and the injected.js <script> tag) from registering twice if this
+  // content script ever runs more than once against the same document. It
+  // was previously checked but never actually set, so it could never trip —
+  // a real double-run (observed live as near-simultaneous duplicate
+  // VK_HANDOFF_FILES/VK_CREATE_PLAYLIST calls racing each other) sailed
+  // straight through it.
+  window.__vkMultiUploadInjected = true;
   const s = document.createElement('script');
   s.src = chrome.runtime.getURL('injected.js');
   (document.documentElement || document.head).appendChild(s);

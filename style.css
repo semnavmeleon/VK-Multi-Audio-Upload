@@ -9,8 +9,8 @@
 :root {
   --vmu-ov: 255,255,255;
   --vmu-panel-bg: rgb(41, 41, 41);
-  --vmu-panel-bg-92: rgba(35,35,36,0.92);
-  --vmu-panel-bg-95: rgba(35,35,36,0.95);
+  --vmu-panel-bg-92: rgb(35,35,36);
+  --vmu-panel-bg-95: rgb(35,35,36);
   --vmu-panel-bg-solid2: #2c2d2e;
   --vmu-text: #e1e3e6;
   --vmu-text-2: #d0d2d4;
@@ -30,7 +30,7 @@
 html.vmu-theme-light {
   --vmu-ov: 0,0,0;
   --vmu-panel-bg: #ffffff;
-  --vmu-panel-bg-92: rgba(255,255,255,0.96);
+  --vmu-panel-bg-92: #ffffff;
   --vmu-panel-bg-95: #ffffff;
   --vmu-panel-bg-solid2: #ffffff;
   --vmu-text: #17181a;
@@ -102,15 +102,9 @@ html.vmu-theme-light {
   flex-shrink: 0;
 }
 .vmu-settings-btn-header:hover { background: rgba(var(--vmu-ov),0.13); color: var(--vmu-text); }
-/* SoundCloud button sits right before the settings gear (both injected next
-   to VK's native close button) with no gap of their own — VK's native
-   header flex has little to no gap, so the two circular icons touched. */
-#vmu-sc-btn { margin-right: 8px; }
 
-/* ── Settings panel ───────────────────────────────────────────────────────── */
-#vmu-settings-panel {
-  flex-shrink: 0;
-}
+/* ── Settings panel (now the content of the standalone #vmu-settings-modal —
+   see toggleSettings) ───────────────────────────────────────────────────── */
 .vmu-settings-section {
   padding: 8px 16px;
   display: grid;
@@ -1469,6 +1463,9 @@ html.vmu-theme-light {
 .vmu-bulkops-body { padding: 10px 0; overflow-y: auto; }
 .vmu-bulkops-scan-status { padding: 6px 12px 10px; font-size: 12px; color: var(--vmu-text-dim); }
 .vmu-parsedorder-panel { left: 24px; right: auto; width: 360px; }
+/* Wider than the base .vmu-bulkops-panel — settings' 3-column grid rows
+   (.vmu-settings-section) need more room than a typical list panel. */
+.vmu-settings-modal { width: 440px; }
 .vmu-parsedorder-list { display: flex; flex-direction: column; gap: 2px; padding: 6px 12px 10px; }
 .vmu-parsedorder-row {
   display: flex;
@@ -1534,7 +1531,11 @@ html.vmu-theme-light {
   padding: 10px 12px;
   border-bottom: 1px solid rgba(var(--vmu-ov),0.06);
   background: rgba(var(--vmu-ov),0.02);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
+.vmu-check-head.vmu-dragging { cursor: grabbing; }
 .vmu-check-title-wrap { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .vmu-check-title { font-size: 12px; color: var(--vmu-text-3); font-weight: 600; }
 .vmu-check-subtitle { font-size: 11px; color: var(--vmu-text-faint-3); }
@@ -2121,6 +2122,20 @@ html.vmu-theme-light {
    rendering with the SVG's own default currentColor black. */
 .vmu-audiofx-btn svg { display: block; }
 
+/* ── Toolbar trigger buttons (injected next to VK's own catalog toolbar
+   icons — filter/upload): bulk-ops, settings, SoundCloud download ───────── */
+/* Cloning the upload button's className (injectBulkOpsButton /
+   injectToolbarSettingsButtons) matches size/hover/spacing, but VK colors
+   that button's own icon a step darker than the button's own `color` via a
+   per-build hashed class on the <svg> itself (verified live: button color
+   rgb(225,227,230), icon rgb(101,101,101)) — nothing we can borrow by class
+   name since that hash isn't stable across VK's rebuilds. --vmu-text-hint
+   already tracks that same muted shade in both themes, so use it directly
+   instead. */
+#vmu-bulkops-btn svg,
+#vmu-toolbar-settings-btn svg,
+#vmu-toolbar-sc-btn svg { display: block; color: var(--vmu-text-hint); }
+
 /* Chrome/radius/shadow match VK's own dropdown popovers (vkuiPopover),
    sampled live from the account menu: opaque rgb(41,41,41) background
    (VK's popovers never use a translucent card — that was our own earlier
@@ -2163,7 +2178,11 @@ html.vmu-theme-light {
   padding: 10px 12px;
   border-bottom: 1px solid rgba(var(--vmu-ov),0.06);
   background: rgba(var(--vmu-ov),0.02);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
+.vmu-audiofx-head.vmu-dragging { cursor: grabbing; }
 .vmu-audiofx-title { font-size: 12px; color: var(--vmu-text-3); font-weight: 600; flex: 1 1 auto; }
 
 .vmu-audiofx-presets-row {
@@ -2720,7 +2739,8 @@ html.vmu-theme-light .vmu-fx-dd-list,
 html.vmu-theme-light #vmu-issue-panel,
 html.vmu-theme-light .vmu-check-panel,
 html.vmu-theme-light #vmu-upload-side,
-html.vmu-theme-light .vmu-dlp-floating {
+html.vmu-theme-light .vmu-dlp-floating,
+html.vmu-theme-light .vmu-dup-toast {
   border: 1px solid rgba(0,0,0,0.1);
 }
 html.vmu-theme-light .vmu-audiofx-select,
@@ -2751,3 +2771,203 @@ html.vmu-theme-light .vmu-check-copy:hover {
 /* Tooltips (#vmu-tooltip, dialog-button ::after bubbles) stay dark-on-any-
    background by design — matches VK's own tt_w/tt_black tooltip in both
    themes — so they're deliberately left untouched here. */
+
+/* ── Duplicate-playlist confirmation (showDupPlaylistPrompt) ─────────────────
+   Bottom-center slide-up card, styled like VK's own snackbars/dialogs via
+   the shared --vmu-* theme tokens so it follows light/dark automatically. */
+.vmu-dup-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translate(-50%, 140%);
+  opacity: 0;
+  z-index: 1000000;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(420px, calc(100vw - 32px));
+  background: var(--vmu-panel-bg);
+  color: var(--vmu-text);
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.35), 0 0 0 1px rgba(var(--vmu-ov),0.08);
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+  box-sizing: border-box;
+  transition: transform .28s cubic-bezier(.2,.8,.3,1), opacity .28s ease;
+}
+.vmu-dup-toast.vmu-dup-toast-shown {
+  transform: translate(-50%, 0);
+  opacity: 1;
+}
+.vmu-dup-toast-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.vmu-dup-toast-icon {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(230,148,26,0.16);
+  color: #e6941a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+}
+.vmu-dup-toast-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.vmu-dup-toast-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--vmu-text);
+}
+.vmu-dup-toast-text {
+  font-size: 13px;
+  color: var(--vmu-text-2);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.vmu-dup-toast-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.vmu-dup-toast-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  cursor: pointer;
+  user-select: none;
+}
+.vmu-dup-toast-check input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+/* Same hidden-input-plus-styled-sibling pattern as .vmu-toggle, scaled down
+   to a checkbox square instead of a switch — matches VK's own small tick
+   checkboxes (e.g. "Скрыть из поиска и рекомендаций" in its own dialogs). */
+.vmu-dup-toast-checkbox {
+  position: relative;
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  border: 1.5px solid rgba(var(--vmu-ov),0.3);
+  background: transparent;
+  transition: background .12s, border-color .12s;
+}
+.vmu-dup-toast-checkbox::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 7px;
+  border: solid #fff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+  opacity: 0;
+  transition: opacity .1s;
+}
+.vmu-dup-toast-check input:checked ~ .vmu-dup-toast-checkbox {
+  background: #2688eb;
+  border-color: #2688eb;
+}
+.vmu-dup-toast-check input:checked ~ .vmu-dup-toast-checkbox::after {
+  opacity: 1;
+}
+.vmu-dup-toast-check-label {
+  font-size: 11px;
+  color: var(--vmu-text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vmu-dup-toast-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.vmu-dup-toast-btn {
+  border: none;
+  border-radius: 8px;
+  padding: 7px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  background: rgba(var(--vmu-ov),0.08);
+  color: var(--vmu-text-2);
+  transition: background .12s;
+}
+.vmu-dup-toast-btn:hover { background: rgba(var(--vmu-ov),0.14); }
+.vmu-dup-toast-btn-primary { background: #2688eb; color: #fff; }
+.vmu-dup-toast-btn-primary:hover { background: #1f78d1; }
+
+/* ── Generic notices (showToast/showProgressToast) ───────────────────────────
+   Same bottom-center slide-up card language as .vmu-dup-toast above (shared
+   --vmu-* tokens, same radius/shadow/transition) instead of the old ad-hoc
+   bottom-left colored boxes — every extension notice now reads as one
+   consistent design. Non-interactive (pointer-events:none), unlike the
+   duplicate-playlist prompt, since these never carry buttons. */
+.vmu-notice {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translate(-50%, 140%);
+  opacity: 0;
+  z-index: 1000000;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: max-content;
+  max-width: min(420px, calc(100vw - 32px));
+  background: var(--vmu-panel-bg);
+  color: var(--vmu-text);
+  border-radius: 12px;
+  padding: 12px 16px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.35), 0 0 0 1px rgba(var(--vmu-ov),0.08);
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+  box-sizing: border-box;
+  pointer-events: none;
+  transition: transform .28s cubic-bezier(.2,.8,.3,1), opacity .28s ease;
+}
+html.vmu-theme-light .vmu-notice { border: 1px solid rgba(0,0,0,0.1); }
+.vmu-notice.vmu-notice-shown { transform: translate(-50%, 0); opacity: 1; }
+.vmu-notice-icon {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+}
+.vmu-notice-icon-success { background: rgba(75,179,75,0.16); color: #4bb34b; }
+.vmu-notice-icon-error { background: rgba(230,70,70,0.16); color: #e64646; }
+.vmu-notice-icon-progress { background: rgba(38,136,235,0.16); color: #2688eb; }
+.vmu-notice-spin {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(38,136,235,0.3);
+  border-top-color: #2688eb;
+  animation: vmu-spin 1s linear infinite;
+}
+.vmu-notice-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.vmu-notice-text { font-size: 13px; line-height: 1.4; word-break: break-word; }
+.vmu-notice-bar { height: 4px; background: rgba(var(--vmu-ov),0.12); border-radius: 2px; overflow: hidden; }
+.vmu-notice-bar-fill { height: 100%; background: #2688eb; transition: width .18s ease; }

@@ -245,101 +245,133 @@ async function resolveSoundCloud(rawUrl) {
 // ─── Genius (playlist "sort as Genius tracklist" source) ────────────────────
 // Genius's own site talks to its unofficial genius.com/api/* endpoints
 // (distinct from the documented, API-key-gated api.genius.com) — same calls
-// the album page's own React app makes, unauthenticated, no key needed.
+// the album page's own React app makes, unauthenticated, no key needed. A
+// bare service-worker fetch to them has no real page behind it though (no
+// referrer, no cookies a returning visitor would have, nothing a bot-check
+// could see as "a browser actually visited this"), which risks Genius
+// rate-limiting or blocking it. So instead every Genius request opens the
+// real page in a background window (minimized, unfocused — never steals
+// focus from VK) and runs the fetch/DOM-read *inside that page's own
+// context* via chrome.scripting.executeScript, indistinguishable from an
+// ordinary visitor's browser, then closes the window again.
+
+// Resolves once `tabId` finishes loading (or immediately if it already has).
+function waitForTabComplete(tabId, timeoutMs = 15000) {
+  return chrome.tabs.get(tabId).then(tab => {
+    if (tab.status === 'complete') return;
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const finish = fn => {
+        if (done) return;
+        done = true;
+        chrome.tabs.onUpdated.removeListener(listener);
+        clearTimeout(timer);
+        fn();
+      };
+      const listener = (id, info) => {
+        if (id === tabId && info.status === 'complete') finish(resolve);
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+      const timer = setTimeout(() => finish(() => reject(new Error('genius_page_load_timeout'))), timeoutMs);
+    });
+  });
+}
+
+// Opens `url` in a minimized, unfocused window, waits for it to finish
+// loading, then runs `func(...args)` inside that page and closes the window
+// either way. `func` runs in an isolated world with no closure over this
+// file's scope (chrome.scripting.executeScript constraint) — it must be
+// self-contained and resolve to {ok:true, data} or {ok:false, error} itself,
+// since a thrown error inside it isn't distinguishable from other
+// executeScript rejection shapes.
+async function runInGeniusPage(url, func, args = []) {
+  const win = await chrome.windows.create({ url, focused: false, state: 'minimized', type: 'popup' });
+  // 'minimized' at creation time is unreliable on some platforms — reassert it.
+  await chrome.windows.update(win.id, { state: 'minimized', focused: false }).catch(() => {});
+  const tabId = win.tabs?.[0]?.id;
+  try {
+    if (!tabId) throw new Error('genius_window_no_tab');
+    await waitForTabComplete(tabId);
+    const [injection] = await chrome.scripting.executeScript({ target: { tabId }, func, args });
+    const value = injection?.result;
+    if (!value) throw new Error('genius_no_result');
+    if (!value.ok) throw new Error(value.error || 'genius_page_failed');
+    return value.data;
+  } finally {
+    chrome.windows.remove(win.id).catch(() => {});
+  }
+}
 
 async function geniusSearch(query) {
   if (!query || !query.trim()) return { ok: false, error: 'пустой запрос' };
-  const res = await fetch('https://genius.com/api/search/album?q=' + encodeURIComponent(query), { credentials: 'omit' });
-  if (!res.ok) return { ok: false, error: 'Genius API вернул ' + res.status };
-  const data = await res.json();
-  const hits = data?.response?.sections?.[0]?.hits || [];
-  const albums = hits
-    .filter(h => h.type === 'album' && h.result)
-    .map(h => ({
-      id: h.result.id,
-      name: h.result.name || '',
-      artist: h.result.artist?.name || '',
-      release: h.result.release_date_for_display || '',
-      cover: h.result.cover_art_thumbnail_url || h.result.cover_art_url || null,
-      // Full-res variant for the cover-text-overlay editor (vs. the thumbnail
-      // above, used for the small result-list icon) — falls back to the
-      // thumbnail if Genius didn't send a separate full-size URL.
-      coverFull: h.result.cover_art_url || h.result.cover_art_thumbnail_url || null,
-      url: h.result.url,
-    }));
-  if (!albums.length) return { ok: false, error: 'ничего не найдено на Genius' };
-  return { ok: true, albums };
-}
-
-// Genius's album pages hydrate a Redux store from a single inline script:
-//   window.__PRELOADED_STATE__ = JSON.parse('...escaped JSON...');
-// We only have the raw HTML (no DOM/JS engine in a service worker), so the
-// single-quoted JS string literal is decoded by hand — not eval'd, since
-// this is third-party page content. state.islands.album.id is the numeric
-// id genius.com/api/albums/{id}/tracks needs.
-function extractSingleQuotedLiteral(str, marker) {
-  const start = str.indexOf(marker);
-  if (start === -1) return null;
-  let i = start + marker.length;
-  const bodyStart = i;
-  while (i < str.length) {
-    if (str[i] === '\\') { i += 2; continue; }
-    if (str[i] === "'") break;
-    i++;
-  }
-  return str.slice(bodyStart, i);
-}
-
-function decodeJsSingleQuotedLiteral(body) {
-  let out = '';
-  for (let i = 0; i < body.length; i++) {
-    const c = body[i];
-    if (c === '\\') {
-      const next = body[++i];
-      switch (next) {
-        case 'n': out += '\n'; break;
-        case 't': out += '\t'; break;
-        case 'r': out += '\r'; break;
-        case '\\': out += '\\'; break;
-        case "'": out += "'"; break;
-        case '"': out += '"'; break;
-        case '/': out += '/'; break;
-        case 'u': { out += String.fromCharCode(parseInt(body.slice(i + 1, i + 5), 16)); i += 4; break; }
-        default: out += next;
+  try {
+    const albums = await runInGeniusPage('https://genius.com/', async (q) => {
+      try {
+        const res = await fetch('/api/search/album?q=' + encodeURIComponent(q), { credentials: 'same-origin' });
+        if (!res.ok) return { ok: false, error: 'Genius API вернул ' + res.status };
+        const data = await res.json();
+        const hits = data?.response?.sections?.[0]?.hits || [];
+        const found = hits
+          .filter(h => h.type === 'album' && h.result)
+          .map(h => ({
+            id: h.result.id,
+            name: h.result.name || '',
+            artist: h.result.artist?.name || '',
+            release: h.result.release_date_for_display || '',
+            cover: h.result.cover_art_thumbnail_url || h.result.cover_art_url || null,
+            // Full-res variant for the cover-text-overlay editor (vs. the thumbnail
+            // above, used for the small result-list icon) — falls back to the
+            // thumbnail if Genius didn't send a separate full-size URL.
+            coverFull: h.result.cover_art_url || h.result.cover_art_thumbnail_url || null,
+            url: h.result.url,
+          }));
+        if (!found.length) return { ok: false, error: 'ничего не найдено на Genius' };
+        return { ok: true, data: found };
+      } catch (e) {
+        return { ok: false, error: e?.message || String(e) };
       }
-    } else out += c;
+    }, [query]);
+    return { ok: true, albums };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
   }
-  return out;
 }
 
-async function geniusAlbumIdFromUrl(url) {
-  const res = await fetch(url, { credentials: 'omit' });
-  if (!res.ok) throw new Error('страница недоступна (' + res.status + ')');
-  const html = await res.text();
-  const body = extractSingleQuotedLiteral(html, "window.__PRELOADED_STATE__ = JSON.parse('");
-  if (!body) throw new Error('не нашёл данные альбома на странице');
-  const state = JSON.parse(decodeJsSingleQuotedLiteral(body));
-  const id = state?.islands?.album?.id;
-  if (!id) throw new Error('не нашёл id альбома');
-  return id;
-}
-
+// Loads the album page directly when albumId isn't already known (e.g. the
+// user pasted a genius.com/albums/... link instead of using search) so
+// window.__PRELOADED_STATE__ can supply its numeric id, then paginates that
+// same page's own /api/albums/{id}/tracks. Genius doesn't embed the actual
+// tracklist in the page's initial state, only the id, so the follow-up calls
+// are still needed — just run in-page now instead of bare from the worker.
 async function geniusAlbumTracks(albumId, albumUrl) {
-  const id = albumId || await geniusAlbumIdFromUrl(albumUrl);
-  const out = [];
-  let nextPage = 1;
-  let guard = 0;
-  while (nextPage && guard++ < 10) {
-    const res = await fetch(`https://genius.com/api/albums/${id}/tracks?page=${nextPage}`, { credentials: 'omit' });
-    if (!res.ok) break;
-    const data = await res.json();
-    const tracks = data?.response?.tracks || [];
-    for (const t of tracks) out.push({ number: t.number || 0, title: t.song?.title || '', artist: t.song?.artist_names || '' });
-    nextPage = data?.response?.next_page || null;
+  const url = albumUrl || 'https://genius.com/';
+  try {
+    const tracks = await runInGeniusPage(url, async (knownId) => {
+      try {
+        let id = knownId;
+        if (!id) id = window.__PRELOADED_STATE__?.islands?.album?.id;
+        if (!id) return { ok: false, error: 'не нашёл id альбома на странице' };
+        const out = [];
+        let nextPage = 1, guard = 0;
+        while (nextPage && guard++ < 10) {
+          const res = await fetch(`/api/albums/${id}/tracks?page=${nextPage}`, { credentials: 'same-origin' });
+          if (!res.ok) break;
+          const data = await res.json();
+          const pageTracks = data?.response?.tracks || [];
+          for (const t of pageTracks) out.push({ number: t.number || 0, title: t.song?.title || '', artist: t.song?.artist_names || '' });
+          nextPage = data?.response?.next_page || null;
+        }
+        if (!out.length) return { ok: false, error: 'треклист альбома пуст' };
+        out.sort((a, b) => a.number - b.number);
+        return { ok: true, data: out };
+      } catch (e) {
+        return { ok: false, error: e?.message || String(e) };
+      }
+    }, [albumId || null]);
+    return { ok: true, tracks };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
   }
-  if (!out.length) return { ok: false, error: 'треклист альбома пуст' };
-  out.sort((a, b) => a.number - b.number);
-  return { ok: true, tracks: out };
 }
 
 // Fetches an image cross-origin and hands it back to content.js as a data:

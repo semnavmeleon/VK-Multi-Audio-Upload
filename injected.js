@@ -517,6 +517,17 @@
   let __savePlaylistCapture = null;
   // Capture audio.editPlaylist params for reorder
   let __editPlaylistCapture = null;
+  // createPlaylistViaUI drives VK's own create/edit dialogs through
+  // __savePlaylistCapture/__editPlaylistCapture above — module-level state,
+  // not per-call. Two overlapping VK_CREATE_PLAYLIST messages used to run
+  // createPlaylistViaUI concurrently and clobber each other's capture
+  // callback (whichever call's onCapture was registered second would "win"
+  // VK's save-playlist response meant for the first), which is exactly what
+  // produced two near-identical playlists from what was really one upload.
+  // Chaining every call onto this promise serializes them — a second
+  // request that arrives while one is still in flight now waits its turn
+  // instead of racing it.
+  let __playlistCreationQueue = Promise.resolve();
 
   // ── Pending upload → done_add bridge ────────────────────────────────────────
   // VK's upload chain is: <upload-host>/...upload (file transfer) → al_audio.php?act=done_add
@@ -1147,7 +1158,7 @@
       }
 
       case 'VK_CREATE_PLAYLIST': {
-        const { title, description, trackNames, coverBuf } = e.data;
+        const { title, description, trackNames, coverBuf, reqId } = e.data;
         // Cover as a File object, passed straight through the call chain
         // (not a shared window global) — two overlapping VK_CREATE_PLAYLIST
         // calls used to clobber each other's window.__vmuPendingCover, so
@@ -1156,14 +1167,26 @@
         const coverFile = coverBuf
           ? new File([coverBuf], 'cover.jpg', { type: 'image/jpeg' })
           : null;
-        createPlaylistViaUI(title, description, trackNames || [], coverFile)
-          .then(r => window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: true, ...r }, '*'))
-          .catch(err => { window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: false, error: err.message }, '*'); });
+        // Queued (see __playlistCreationQueue above), not fired directly —
+        // a second VK_CREATE_PLAYLIST arriving before this one finishes
+        // waits its turn instead of running createPlaylistViaUI concurrently.
+        __playlistCreationQueue = __playlistCreationQueue
+          .then(() => createPlaylistViaUI(title, description, trackNames || [], coverFile))
+          .then(r => window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: true, reqId, ...r }, '*'))
+          .catch(err => { window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: false, reqId, error: err.message }, '*'); });
         break;
       }
 
       case 'VK_GET_RECENT_AUDIOS': {
         window.postMessage({ type: 'VK_RECENT_AUDIOS', ids: getRecentAudioIdsFromDOM(e.data.count) }, '*');
+        break;
+      }
+
+      case 'VK_GET_ALL_PLAYLISTS': {
+        const reqId = e.data.reqId;
+        getOwnerPlaylistTitles(e.data.ownerId)
+          .then(playlists => window.postMessage({ type: 'VK_ALL_PLAYLISTS', ok: true, reqId, playlists }, '*'))
+          .catch(err => window.postMessage({ type: 'VK_ALL_PLAYLISTS', ok: false, reqId, error: err.message }, '*'));
         break;
       }
 
@@ -1939,14 +1962,56 @@
   // finds nothing and the reorder flow throws "no_api_client", even though
   // the exact same playlist works fine a few seconds later with no other
   // change (verified live). Poll instead of failing on the first check.
-  async function waitForApiClient(maxWaitMs = 2500) {
+  async function waitForApiClient(maxWaitMs = 5000) {
     const start = Date.now();
     let client = resolveApiClient();
     while (!client && Date.now() - start < maxWaitMs) {
       await pause(200);
       client = resolveApiClient();
     }
+    if (!client) client = await recoverApiClientViaEditToggle();
     return client;
+  }
+
+  // Waiting alone doesn't always help — verified live (2026-08-30): the
+  // "Редактирование плейлиста" box (.audio_pl_edit_box, old box_layout popup)
+  // is its own detached React tree; its rows (data-testid
+  // MusicPlaylist_EditModal_MusicTrackRow) carry no React fiber at all, and
+  // walking up from there hits a dead end with no audioApi in props anywhere.
+  // The only place the client is reachable is the *view* popup's
+  // MusicPlaylistTracks_Items/audiolistitems-list container — the one VK
+  // opens when you click a playlist's cover, which the edit box normally
+  // sits stacked on top of. Whether that view popup stays mounted (hidden)
+  // underneath is inconsistent — sometimes VK tears it down, and no amount
+  // of polling brings back an anchor that was never going to appear.
+  // refreshPlaylistEditDialog() (below) already relies on that same view
+  // popup being one click away via closeBtn+Action_Edit; reuse the same
+  // close/reopen round-trip here to force it back into the DOM, harvest the
+  // client while it's briefly visible, then restore the edit dialog.
+  async function recoverApiClientViaEditToggle() {
+    const box = getEditPlaylistBox();
+    const closeBtn = box?.querySelector('.box_x_button');
+    if (!closeBtn) return null;
+    closeBtn.click();
+    await pause(400);
+    const client = await (async () => {
+      const start = Date.now();
+      let c = resolveApiClient();
+      while (!c && Date.now() - start < 1500) {
+        await pause(200);
+        c = resolveApiClient();
+      }
+      return c;
+    })();
+    document.querySelector('[data-testid="Action_Edit"]')?.click();
+    await pause(300);
+    return client;
+  }
+
+  function getEditPlaylistBox() {
+    const boxes = [...document.querySelectorAll('.popup_box_container')]
+      .filter(c => getComputedStyle(c).display !== 'none' && c.querySelector('.audio_pl_edit_box'));
+    return boxes[boxes.length - 1] || null;
   }
 
   async function loadPlaylistViaAudioGet(ownerId, playlistId, accessHash) {
@@ -2139,6 +2204,43 @@
       if (i < edits.length - 1) await pause(PACING_MS);
     }
     return { ok, fail };
+  }
+
+  // Fetches every playlist title the owner has (paginated), for the
+  // auto-playlist flow's duplicate check — asked to look across ALL of the
+  // owner's playlists, not just whatever a given catalog page happens to
+  // have rendered, so this goes through VK's own web API (same
+  // localStorage access_token pattern as bulkEditTracks above) rather than
+  // scraping a specific catalog URL, which would only ever cover playlists
+  // that page happened to list and would break the moment VK reshuffles
+  // that URL's hash (see the vk.com→vk.ru/data-testid churn elsewhere in
+  // this file).
+  async function getOwnerPlaylistTitles(ownerId) {
+    const tokenKey = Object.keys(localStorage).find(k => /:web_token:login:auth$/.test(k));
+    if (!tokenKey) throw new Error('no_token');
+    const clientId = tokenKey.split(':')[0];
+    const { access_token } = JSON.parse(localStorage.getItem(tokenKey) || '{}');
+    if (!access_token) throw new Error('no_access_token');
+
+    const playlists = [];
+    const CHUNK = 100;
+    let offset = 0;
+    let total = Infinity;
+    while (offset < total) {
+      const res = await fetch(`https://web.api.vk.ru/method/audio.getPlaylists?v=5.285&client_id=${clientId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ owner_id: String(ownerId), offset: String(offset), count: String(CHUNK), access_token }).toString(),
+      });
+      const json = await res.json();
+      if (json.error) throw new Error(json.error.error_msg || 'audio.getPlaylists failed');
+      const items = json.response?.items || [];
+      total = typeof json.response?.count === 'number' ? json.response.count : items.length;
+      for (const it of items) playlists.push({ id: it.id, title: it.title || '' });
+      if (!items.length) break;
+      offset += CHUNK;
+    }
+    return playlists;
   }
 
   // Bulk delete (duplicates/blocked cleanup) for the "Массовые операции"
@@ -2405,8 +2507,13 @@
 
         // Save playlist (no tracks yet)
         await pause(300);
+        // Scoped to the dialog itself (falling back to dialog, never all the
+        // way out to `document`) — a page-wide '.FlatButton--primary' match
+        // could hit an unrelated button elsewhere on the page (VK reuses
+        // that class broadly), which risks clicking the wrong thing instead
+        // of just failing loudly with save_btn_not_found.
         const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
-        const saveBtn = (boxLayout || document).querySelector('.FlatButton--primary') || document.querySelector('.FlatButton--primary');
+        const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
         if (!saveBtn) { clearTimeout(timeout); __savePlaylistCapture = null; reject(new Error('save_btn_not_found')); return; }
         saveBtn.click();
       })();
@@ -2432,7 +2539,7 @@
         window.nav.reload();
         await pause(3000);
       }
-      await addTracksViaEditDialog(title, result.playlistId, trackNames);
+      await addTracksViaEditDialog(title, description, result.ownerId, result.playlistId, trackNames);
     }
 
     return result;
@@ -2457,7 +2564,7 @@
   }
 
   // Open edit dialog for the newly created playlist and select tracks by name
-  async function addTracksViaEditDialog(playlistTitle, playlistId, trackNames) {
+  async function addTracksViaEditDialog(playlistTitle, playlistDescription, ownerId, playlistId, trackNames) {
     // Wait for new playlist to appear in DOM (VK SPA updates after save)
     let editBtn = null;
     for (let i = 0; i < 20; i++) {
@@ -2498,24 +2605,15 @@
     // Give VK time to attach event handlers to the dialog
     await pause(1000);
 
-    // Must click ape_add_audios_btn to reveal ._ape_audio_item list.
+    // Must click ape_add_audios_btn to reveal the ._ape_audio_item list.
     const addAudiosBtn = dialog.querySelector('.ape_add_audios_btn');
     if (!addAudiosBtn) { console.warn('[vmu] ape_add_audios_btn not found in edit dialog'); return; }
+    addAudiosBtn.click();
 
-    let items = [];
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      console.log('[vmu] ape_add_audios_btn click attempt', attempt);
-      addAudiosBtn.click();
-      items = await waitForItems(dialog, 1, 3000);
-      if (items.length > 0) { console.log('[vmu] Items appeared after attempt', attempt); break; }
-      if (attempt < 3) await pause(1000);
-    }
+    if (!await waitForEl('._ape_audio_item', 3000)) { console.warn('[vmu] add-audios item list not found'); return; }
 
-    if (!items.length) { console.warn('[vmu] No ._ape_audio_item after 3 attempts'); return; }
-    console.log('[vmu] Found', items.length, '._ape_audio_item items, matching by name...');
-
-    // Match tracks by name instead of just taking first N
-    await selectTracksByName(items, trackNames);
+    const selectedCount = await selectTracksFromCommunityList(dialog, trackNames);
+    if (!selectedCount) console.warn('[vmu] No tracks matched in the community list for playlist', playlistId);
 
     await pause(300);
 
@@ -2525,9 +2623,10 @@
       // Also set a timeout in case VK uses the old al_audio.php path
       setTimeout(() => resolve(null), 10000);
 
-      // Must click Сохранить — without it tracks are NOT persisted
+      // Must click Сохранить — without it tracks are NOT persisted. Scoped
+      // to the dialog itself, same reasoning as the create-phase save above.
       const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
-      const saveBtn = (boxLayout || document).querySelector('.FlatButton--primary') || document.querySelector('.FlatButton--primary');
+      const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
       if (!saveBtn) { console.warn('[vmu] Save button not found in edit dialog'); __editPlaylistCapture = null; resolve(null); return; }
       console.log('[vmu] Clicking Save');
       saveBtn.click();
@@ -2537,26 +2636,9 @@
 
     // Reorder tracks to match album order
     if (editPlaylistBody && trackNames.length > 1) {
-      await reorderPlaylistTracks(editPlaylistBody, trackNames);
+      await reorderPlaylistTracks(ownerId, playlistId, editPlaylistBody, playlistTitle, playlistDescription, trackNames);
       await pause(1000);
     }
-  }
-
-  // Wait for ._ape_audio_item elements to appear in dialog
-  function waitForItems(dialog, minCount, timeout) {
-    return new Promise(resolve => {
-      const check = () => {
-        const items = [...dialog.querySelectorAll('._ape_audio_item')];
-        if (items.length >= minCount || items.length > 0) { resolve(items); return; }
-        const obs = new MutationObserver(() => {
-          const found = [...dialog.querySelectorAll('._ape_audio_item')];
-          if (found.length > 0) { obs.disconnect(); clearTimeout(t); resolve(found); }
-        });
-        obs.observe(dialog, { childList: true, subtree: true });
-        const t = setTimeout(() => { obs.disconnect(); resolve([...dialog.querySelectorAll('._ape_audio_item')]); }, timeout);
-      };
-      check();
-    });
   }
 
   function normalizeStr(s) {
@@ -2573,6 +2655,38 @@
     return { title, artist, fullText };
   }
 
+  function levenshtein(a, b) {
+    if (a === b) return 0;
+    const al = a.length, bl = b.length;
+    if (!al) return bl;
+    if (!bl) return al;
+    let prev = new Array(bl + 1);
+    let curr = new Array(bl + 1);
+    for (let j = 0; j <= bl; j++) prev[j] = j;
+    for (let i = 1; i <= al; i++) {
+      curr[0] = i;
+      for (let j = 1; j <= bl; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      }
+      [prev, curr] = [curr, prev];
+    }
+    return prev[bl];
+  }
+
+  // Whether `word` shows up in `text`, tolerating a small per-word edit
+  // distance (verified live: a real reuploaded track spelled "Voogifin"
+  // where Genius's own tracklist had "Vogifin" — one inserted letter — which
+  // a plain substring check treats as two unrelated words). Tolerance scales
+  // with word length so short words still need to be exact/near-exact, or
+  // e.g. "от" would "fuzzy-match" half the dictionary at 1 edit.
+  function fuzzyWordInText(word, text) {
+    if (text.includes(word)) return true;
+    if (word.length < 4) return false;
+    const maxEdits = word.length >= 8 ? 2 : 1;
+    return text.split(' ').some(w => Math.abs(w.length - word.length) <= maxEdits && levenshtein(word, w) <= maxEdits);
+  }
+
   function trackMatchesItem(trackName, itemText) {
     const tTitle = normalizeStr(trackName.title);
     const tArtist = normalizeStr(trackName.artist);
@@ -2586,20 +2700,37 @@
       }
       return true;
     }
-    // Partial: check if significant portion of the title is in the item
+    // Partial: check if significant portion of the title is in the item,
+    // tolerating a small spelling difference per word (see fuzzyWordInText).
     if (tTitle.length > 4) {
       const words = tTitle.split(' ').filter(w => w.length > 2);
-      const matchedWords = words.filter(w => itemText.fullText.includes(w));
+      const matchedWords = words.filter(w => fuzzyWordInText(w, itemText.fullText));
       if (matchedWords.length >= Math.ceil(words.length * 0.7)) return true;
     }
     return false;
   }
 
-  // Reorder audio_ids to match trackNames order, then send audio.editPlaylist
-  async function reorderPlaylistTracks(capturedBody, trackNames) {
+  // Reorder the just-saved playlist to match trackNames order, then send
+  // audio.editPlaylist. Used to match tracks by scraping ._audio_row/.ai_title
+  // DOM nodes and resend the reordered audio_ids via a raw fetch hardcoded to
+  // the old api.vk.com host — both assumptions rotted independently (VK's
+  // redesign replaced those semantic classes with opaque per-build hashes,
+  // see [[vk-naming-churn]], and the API host moved to web.api.vk.ru), so the
+  // match silently found nothing and the resend silently failed, leaving
+  // whatever order VK's own save produced. Now mirrors the "Порядок с
+  // Genius"/dropped-files sort (applyPlaylistOrderFromEntries in content.js):
+  // fetch the real current track list via VK's own internal API client
+  // (fetchFullPlaylistItems) instead of the DOM, and submit the reorder
+  // through that same client (reorderPlaylistViaApi) instead of a manual
+  // fetch. ownerId/playlistId/title/description come from the caller (the
+  // values this same flow already used to create the playlist), not parsed
+  // out of the captured body — only no_discover, which nothing upstream
+  // tracks, is read from the real captured save request so resending it
+  // doesn't flip a field we never touched. Falls back to the captured
+  // title/description if for some reason our own value is missing.
+  async function reorderPlaylistTracks(ownerId, playlistId, capturedBody, fallbackTitle, fallbackDescription, trackNames) {
     if (!capturedBody || !trackNames.length) return;
 
-    // Parse captured params
     const params = {};
     capturedBody.split('&').forEach(pair => {
       const eqIdx = pair.indexOf('=');
@@ -2608,111 +2739,133 @@
       }
     });
 
-    const audioIdsStr = params.audio_ids;
-    if (!audioIdsStr) { console.warn('[vmu] No audio_ids in captured editPlaylist call'); return; }
+    let items;
+    try {
+      items = await fetchFullPlaylistItems(ownerId, playlistId, null);
+    } catch (err) {
+      console.warn('[vmu] reorderPlaylistTracks: fetchFullPlaylistItems failed:', err);
+      return;
+    }
+    if (items.length < 2) return;
 
-    // Parse audio_ids: "ownerID_audioID_hash,ownerID_audioID_hash,..."
-    const audioEntries = audioIdsStr.split(',').map(entry => {
-      const parts = entry.split('_');
-      // Format: ownerID_audioID_hash (e.g. -206614096_456239638_b332ffe4664ae5ed82)
-      return { full: entry, ownerId: parts[0], audioId: parts[1], hash: parts.slice(2).join('_') };
-    });
+    const itemMeta = items.map(it => ({
+      id: it.id,
+      title: normalizeStr(it.title || ''),
+      artist: normalizeStr(it.artist || ''),
+      fullText: normalizeStr(`${it.artist || ''} ${it.title || ''}`),
+    }));
 
-    // We need to find the title/artist for each audio ID to match with trackNames
-    // Look them up in the DOM - they were just visible in the edit dialog
-    const audioIdToName = {};
-    document.querySelectorAll('._audio_row').forEach(row => {
-      const cls = row.className;
-      const match = cls.match(/_audio_row_(-?\d+_\d+)/);
-      if (match) {
-        const titleEl = row.querySelector('.audio_row__title_inner, .ai_title');
-        const artistEl = row.querySelector('.audio_row__performers, .ai_artist');
-        audioIdToName[match[1]] = {
-          title: normalizeStr(titleEl?.textContent || ''),
-          artist: normalizeStr(artistEl?.textContent || ''),
-          fullText: normalizeStr(row.textContent || '')
-        };
-      }
-    });
-
-    // Build ordered audio_ids based on trackNames
-    const orderedEntries = [];
+    // Build the desired order based on trackNames
     const used = new Set();
-
+    const orderedIds = [];
     for (const trackName of trackNames) {
-      let bestEntry = null;
-      for (const entry of audioEntries) {
-        const key = entry.ownerId + '_' + entry.audioId;
-        if (used.has(key)) continue;
-        const nameInfo = audioIdToName[key];
-        if (nameInfo && trackMatchesItem(trackName, nameInfo)) {
-          bestEntry = entry;
-          used.add(key);
-          break;
-        }
-      }
-      if (bestEntry) orderedEntries.push(bestEntry);
+      const m = itemMeta.find(x => !used.has(x.id) && trackMatchesItem(trackName, x));
+      if (m) { used.add(m.id); orderedIds.push(m.id); }
+    }
+    // Add any remaining tracks not matched (shouldn't happen, but just in case)
+    for (const it of items) {
+      if (!used.has(it.id)) orderedIds.push(it.id);
     }
 
-    // Add any remaining entries not matched (shouldn't happen, but just in case)
-    for (const entry of audioEntries) {
-      const key = entry.ownerId + '_' + entry.audioId;
-      if (!used.has(key)) orderedEntries.push(entry);
-    }
-
-    const newAudioIds = orderedEntries.map(e => e.full).join(',');
-    if (newAudioIds === audioIdsStr) {
+    if (orderedIds.join(',') === items.map(it => it.id).join(',')) {
       console.log('[vmu] Track order already correct, no reorder needed');
       return;
     }
 
     console.log('[vmu] Reordering tracks via audio.editPlaylist...');
-
-    // Send the reorder request
-    const formData = new URLSearchParams();
-    for (const [k, v] of Object.entries(params)) {
-      if (k === 'audio_ids') formData.append(k, newAudioIds);
-      else formData.append(k, v);
-    }
-
     try {
-      const resp = await origFetch('https://api.vk.com/method/audio.editPlaylist?' + new URLSearchParams({v: '5.280', client_id: '6287487'}).toString(), {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await resp.json();
-      console.log('[vmu] Reorder result:', data.response ? 'success' : 'error', data);
+      const title = params.title || fallbackTitle || '';
+      const description = params.description || fallbackDescription || '';
+      const res = await reorderPlaylistViaApi(ownerId, playlistId, null, title, description, params.no_discover === '1', orderedIds);
+      console.log('[vmu] Reorder result:', res);
     } catch (err) {
       console.error('[vmu] Reorder failed:', err);
     }
   }
 
-  // Select tracks by matching names in album order (first track in trackNames = first clicked)
-  async function selectTracksByName(items, trackNames) {
-    // Build text map for all items
-    const itemTexts = items.map(item => ({ item, text: getItemText(item) }));
+  // Excludes ._ape_item_global_results — VK's own search blends in "Найдено
+  // в глобальном поиске" (other users' tracks with a similar name) from
+  // across all of VK once you type a query there; irrelevant to the default
+  // list this now relies on exclusively, but kept as a defensive filter in
+  // case that ever changes.
+  function ownAudioItems(dialog) {
+    return [...dialog.querySelectorAll('._ape_audio_item')]
+      .filter(item => !item.closest('._ape_item_global_results'));
+  }
 
-    let selectedCount = 0;
-    // Click in album order (trackNames is already in correct order)
-    for (const trackName of trackNames) {
-      let matched = null;
-      for (const { item, text } of itemTexts) {
+  // Finds the add-audios panel's own scrollable results container by
+  // walking up from a known row until an ancestor is actually scrollable —
+  // more robust than hardcoding a class name VK could rename.
+  function findScrollableAncestor(dialog) {
+    let el = dialog.querySelector('._ape_audio_item');
+    while (el && el !== dialog) {
+      if (el.scrollHeight > el.clientHeight + 10) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // Scrolls the add-audios panel's own default (unsearched) list one page
+  // further and waits briefly for the new rows to mount. Returns false once
+  // scrolling stops adding rows (the community's whole catalog is loaded).
+  // Verified live: setting scrollTop alone doesn't reliably fire VK's own
+  // onScroll handler (its virtualized loader just never triggers), so a
+  // 'scroll' event has to be dispatched explicitly after moving it.
+  async function loadMoreOwnItems(dialog) {
+    const scroller = findScrollableAncestor(dialog);
+    if (!scroller) return false;
+    const before = dialog.querySelectorAll('._ape_audio_item').length;
+    scroller.scrollTop = scroller.scrollHeight;
+    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+    for (let i = 0; i < 10; i++) {
+      await pause(150);
+      if (dialog.querySelectorAll('._ape_audio_item').length > before) return true;
+    }
+    return false;
+  }
+
+  // Selects tracks by scrolling the add-audios panel's own default list —
+  // scoped to just this community, ordered newest-upload-first (verified
+  // live: 20 rows on open, growing by scrolling, with a batch just uploaded
+  // for THIS auto-playlist run clustered near the top). No search box
+  // involved at all: typing into #ape_edit_playlist_search races VK's own
+  // search debounce before it even fires a request, AND blends in "Найдено
+  // в глобальном поиске" — other users' tracks with a similar name, from
+  // across all of VK rather than just this community — either of which can
+  // silently select nothing or the wrong track. Keeps scrolling for as long
+  // as it keeps turning up new rows (i.e. until the community's whole
+  // catalog is loaded), not some fixed page cap, so a track sitting further
+  // back still gets found rather than reported missing early.
+  async function selectTracksFromCommunityList(dialog, trackNames) {
+    const remaining = new Set(trackNames);
+    const matched = new Set();
+    let scannedFrom = 0;
+    for (;;) {
+      const items = ownAudioItems(dialog);
+      for (let i = scannedFrom; i < items.length && remaining.size; i++) {
+        const item = items[i];
         if (item.classList.contains('ape_selected')) continue;
-        if (trackMatchesItem(trackName, text)) {
-          matched = item;
-          break;
+        const itemText = getItemText(item);
+        for (const trackName of remaining) {
+          if (trackMatchesItem(trackName, itemText)) {
+            const chk = item.querySelector('.ape_check') || item;
+            chk.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            matched.add(trackName);
+            remaining.delete(trackName);
+            await pause(150);
+            break;
+          }
         }
       }
-      if (matched) {
-        const chk = matched.querySelector('.ape_check') || matched;
-        chk.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-        selectedCount++;
-        await pause(100);
-      } else {
-        console.warn('[vmu] Track not found in list:', trackName.artist, '-', trackName.title);
-      }
+      scannedFrom = items.length;
+      if (!remaining.size) break;
+      if (!await loadMoreOwnItems(dialog)) break;
     }
-    console.log('[vmu] Selected', selectedCount, 'of', trackNames.length, 'tracks by name');
+    for (const trackName of remaining) {
+      console.warn('[vmu] Track not found in community list:', trackName.artist, '-', trackName.title);
+    }
+    console.log('[vmu] Selected', matched.size, 'of', trackNames.length, 'tracks from community list');
+    return matched.size;
   }
 
   // Primary: find newly created playlist by title in DOM.

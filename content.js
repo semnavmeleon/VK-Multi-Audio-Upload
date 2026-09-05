@@ -188,7 +188,7 @@
   // (freq) / wheel (q, bandwidth).
   const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   const EQ_DEFAULT_Q = 1.41; // RBJ-cookbook default — matches BiquadFilterNode's own peaking-EQ default
-  let settings = { autoPlaylist: false, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  let settings = { autoPlaylist: false, dupPlaylistCheck: true, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -265,6 +265,7 @@
     try {
       const out = {
         autoPlaylist: settings.autoPlaylist,
+        dupPlaylistCheck: settings.dupPlaylistCheck,
         coverDataUrl: settings.coverDataUrl,
         autoMeta: settings.autoMeta,
         autoCoverFromId3: settings.autoCoverFromId3,
@@ -1149,6 +1150,7 @@
   function positionCheckPanel() {
     const panel = document.getElementById('vmu-check-panel');
     if (!panel) return;
+    if (panel.dataset.vmuUserMoved) return;
     const margin = 24;
     const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
     const playerBlock = document.querySelector('[data-testid="AudioPage_PlayerBlock"]');
@@ -1578,6 +1580,7 @@
     const panel = document.getElementById('vmu-audiofx-panel');
     const btn = getVisibleAudioFxBtn();
     if (!btn || !panel || !panel.classList.contains('vmu-audiofx-panel-open')) return;
+    if (panel.dataset.vmuUserMoved) return;
     const margin = 12;
     const r = btn.getBoundingClientRect();
     // Anchor under the button's own live position rather than guessing from
@@ -1603,7 +1606,7 @@
   // first match, so the button stays reachable however the page is
   // scrolled. Reuses VK's own button classes so it matches size/hover/
   // spacing without custom CSS; only inserted where missing, same
-  // idempotent-on-rerender idiom as injectGearIntoNativeHeader.
+  // idempotent-on-rerender idiom as injectToolbarSettingsButtons.
   function injectAudioFxIntoPlayerBar() {
     document.querySelectorAll('[data-testid="ToggleCurrentTargets"]').forEach(anchor => {
       if (!anchor.parentElement) return;
@@ -2077,6 +2080,7 @@
       wrap.innerHTML = buildAudioFxPanel();
       document.body.appendChild(wrap.firstElementChild);
       attachAudioFxHandlers();
+      makePanelDraggable(document.getElementById('vmu-audiofx-panel'), document.querySelector('.vmu-audiofx-head'));
     }
     positionAudioFxUI();
   }
@@ -2907,6 +2911,41 @@
       // Description: название + подпись
       const description = title + '\nчеловек паук поможет каждому [vk.com/reuploadunder]';
 
+      // Duplicate check: ask before creating a second playlist with the same
+      // title. Checked against ALL of the owner's playlists via VK's own API
+      // (getOwnerPlaylistTitles in injected.js), not just whatever a given
+      // catalog page happens to have rendered — a DOM scan would miss
+      // playlists further down an unloaded/virtualized list.
+      if (settings.dupPlaylistCheck) {
+        setPlaylistStatus('Проверяем на дубликаты…');
+        try {
+          const dupRes = await pageCall('VK_GET_ALL_PLAYLISTS', 'VK_ALL_PLAYLISTS', {
+            reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+            ownerId,
+          }, 15000, 'reqId');
+          const norm = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+          const isDupe = (dupRes.playlists || []).some(p => norm(p.title) === norm(title));
+          if (isDupe) {
+            const choice = await showDupPlaylistPrompt(title);
+            if (choice.dontAskAgain) {
+              settings.dupPlaylistCheck = false;
+              saveSettings();
+              const dupToggle = document.getElementById('vmu-dupcheck-toggle');
+              if (dupToggle) dupToggle.checked = false;
+            }
+            if (!choice.create) {
+              setPlaylistStatus(`Отменено: плейлист «${title.slice(0,30)}» уже есть`, true);
+              return;
+            }
+          }
+        } catch (err) {
+          // Non-fatal — the check is a courtesy, not a gate. If it fails (no
+          // token found, API hiccup, etc.) just proceed as if nothing was
+          // found rather than blocking the upload on it.
+          console.warn('[VK Multi Upload] duplicate playlist check failed, proceeding:', err);
+        }
+      }
+
       // Build track names list for matching in the edit dialog (in upload order)
       const trackNames = done.map(i => {
         const tags = i.tags || {};
@@ -2946,14 +2985,19 @@
         coverBlob = await makePerezalitoCover(coverSource);
       }
 
-      // Create playlist: opens VK dialog, fills fields, injects cover, selects tracks, saves
+      // Create playlist: opens VK dialog, fills fields, injects cover, selects tracks, saves.
+      // reqId as matchKey so this call's response can't cross-resolve with a
+      // different overlapping VK_CREATE_PLAYLIST call's (see injected.js's
+      // __playlistCreationQueue — they no longer actually run concurrently,
+      // but this keeps pageCall() correct even if that ever changes).
       setPlaylistStatus('Создаём плейлист…');
       const created = await pageCall('VK_CREATE_PLAYLIST', 'VK_PLAYLIST_CREATED', {
+        reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
         title: title.slice(0, 255),
         description: description.slice(0, 1000),
         trackNames,
         coverBuf: coverBlob ? await coverBlob.arrayBuffer() : null,
-      }, 60000);
+      }, 60000, 'reqId');
 
       setPlaylistStatus(`✓ Плейлист «${title.slice(0,30)}» создан!`);
     } catch (err) {
@@ -3150,21 +3194,87 @@
     // collab albums. Artist only breaks ties between rows sharing the same
     // normalized title (remixes, alternate versions, "feat." variants).
     const wordsOf = s => normalizeNamePart(s).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
-    const rowMeta = rows.map(r => ({ row: r, titleKey: normalizeNamePart(r.title), artistWords: new Set(wordsOf(r.artist)) }));
+    const rowMeta = rows.map(r => ({ row: r, titleKey: normalizeNamePart(r.title), titleWords: wordsOf(r.title), artistWords: new Set(wordsOf(r.artist)) }));
+
+    // Below the normalized-title-equality tier, a looser fallback for titles
+    // that are clearly the same track but not byte-identical after
+    // normalization — one side appending extra credit text the stripping
+    // regexes above don't recognize, a homoglyph pair (Cyrillic/Latin
+    // look-alikes that read identical but are different code points), or a
+    // reuploader's own spelling variant of a name (verified live: Genius'
+    // "Vogifin" vs the actual VK track's "Voogifin" — one inserted letter).
+    // Scored as "what fraction of the SHORTER title's words also appear in
+    // the longer one" (relative to the smaller side, not a symmetric Jaccard
+    // over the union) — the same shape of heuristic selectTracksBySearch/
+    // trackMatchesItem already use in injected.js — rather than a single
+    // whole-string edit distance, since a whole appended credit phrase
+    // (several extra words) shouldn't tank the score the way it would
+    // penalize a length-normalized distance metric. Per-word comparison
+    // itself also tolerates a small edit distance rather than requiring
+    // exact equality, so a one-letter spelling variant on an otherwise
+    // identical title doesn't zero out that word's contribution.
+    const FUZZY_TITLE_THRESHOLD = 0.75;
+    function levenshtein(a, b) {
+      if (a === b) return 0;
+      const al = a.length, bl = b.length;
+      if (!al) return bl;
+      if (!bl) return al;
+      let prev = new Array(bl + 1);
+      let curr = new Array(bl + 1);
+      for (let j = 0; j <= bl; j++) prev[j] = j;
+      for (let i = 1; i <= al; i++) {
+        curr[0] = i;
+        for (let j = 1; j <= bl; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+        }
+        [prev, curr] = [curr, prev];
+      }
+      return prev[bl];
+    }
+    // Tolerance scales with word length so short words still need to be
+    // exact (else "от" would "fuzzy-match" half the dictionary at 1 edit).
+    function wordsMatch(a, b) {
+      if (a === b) return true;
+      const minLen = Math.min(a.length, b.length);
+      if (minLen < 4) return false;
+      const maxEdits = minLen >= 8 ? 2 : 1;
+      return levenshtein(a, b) <= maxEdits;
+    }
+    function fuzzyTitleScore(wordsA, wordsB) {
+      if (wordsA.length < 2 || wordsB.length < 2) return 0; // too short to safely fuzzy-match
+      const used = new Array(wordsB.length).fill(false);
+      let common = 0;
+      for (const wa of wordsA) {
+        const idx = wordsB.findIndex((wb, j) => !used[j] && wordsMatch(wa, wb));
+        if (idx !== -1) { used[idx] = true; common++; }
+      }
+      return common / Math.min(wordsA.length, wordsB.length);
+    }
 
     const claimed = new Set();
-    const matchedOrder = [];
-    // Parallel to entries (same order, same length) — records whether each
-    // parsed entry found a track, for showParsedOrderPanel below. Kept
-    // regardless of whether anything ends up unmatched; cost is trivial.
+    // Parallel to entries (same order, same length) — slotNumId[i] is the
+    // matched row's numId for entries[i], or null while still unmatched.
+    // Kept as a fixed-size array (rather than pushing only matches) so the
+    // elimination pass below can fill specific gaps without disturbing the
+    // positions already resolved by title matching.
+    const slotNumId = new Array(entries.length).fill(null);
     const entryResults = [];
-    for (const en of entries) {
+    entries.forEach((en, idx) => {
       const titleKey = normalizeNamePart(en.title);
       const artistWords = wordsOf(en.artist);
-      const candidates = rowMeta
-        .map((m, i) => ({ m, i }))
-        .filter(({ m, i }) => !claimed.has(i) && m.titleKey === titleKey);
-      if (!candidates.length) { entryResults.push({ artist: en.artist, title: en.title, matched: false }); continue; }
+      const remaining = rowMeta.map((m, i) => ({ m, i })).filter(({ i }) => !claimed.has(i));
+      let candidates = remaining.filter(({ m }) => m.titleKey === titleKey);
+      if (!candidates.length) {
+        const entryTitleWords = wordsOf(en.title);
+        let bestFuzzy = null, bestFuzzyScore = FUZZY_TITLE_THRESHOLD;
+        for (const c of remaining) {
+          const score = fuzzyTitleScore(entryTitleWords, c.m.titleWords);
+          if (score >= bestFuzzyScore) { bestFuzzyScore = score; bestFuzzy = c; }
+        }
+        candidates = bestFuzzy ? [bestFuzzy] : [];
+      }
+      if (!candidates.length) { entryResults.push({ artist: en.artist, title: en.title, matched: false }); return; }
       let best = candidates[0];
       if (candidates.length > 1) {
         let bestScore = -1;
@@ -3174,9 +3284,36 @@
         }
       }
       claimed.add(best.i);
-      matchedOrder.push(best.m.row.numId);
+      slotNumId[idx] = best.m.row.numId;
       entryResults.push({ artist: en.artist, title: en.title, matched: true });
+    });
+
+    // Last resort for whatever's left after both title tiers above — e.g. a
+    // title that's mostly redacted/garbled on one side, or phrased so
+    // differently there's no usable word overlap. Text similarity can't
+    // help there (at that point almost any two tracks look "equally
+    // similar"), but a much stronger signal still can: if exactly as many
+    // rows are left unclaimed as there are entries still unmatched,
+    // everything else has already been claimed by an actual title match —
+    // so there is only one way the leftovers on both sides can correspond,
+    // in the same relative order they were already in. Only applied when
+    // the counts line up exactly; if they don't, a genuinely missing or
+    // extra track is more likely than a text-matching failure, and forcing
+    // a pairing then would misalign the rest instead of just under-fixing.
+    const unmatchedIdxs = [];
+    for (let i = 0; i < slotNumId.length; i++) if (slotNumId[i] == null) unmatchedIdxs.push(i);
+    const leftoverRowIdxs = [];
+    for (let i = 0; i < rowMeta.length; i++) if (!claimed.has(i)) leftoverRowIdxs.push(i);
+    if (unmatchedIdxs.length && unmatchedIdxs.length === leftoverRowIdxs.length) {
+      unmatchedIdxs.forEach((entryIdx, k) => {
+        const rowIdx = leftoverRowIdxs[k];
+        slotNumId[entryIdx] = rowMeta[rowIdx].row.numId;
+        claimed.add(rowIdx);
+        entryResults[entryIdx].matched = true;
+      });
     }
+
+    const matchedOrder = slotNumId.filter(id => id != null);
     const leftovers = rows.filter((r, i) => !claimed.has(i)).map(r => r.numId);
     const finalOrder = [...matchedOrder, ...leftovers];
     const unmatched = entries.length - matchedOrder.length;
@@ -4649,16 +4786,43 @@
   }
 
   // ─── settings panel ───────────────────────────────────────────────────────────
+  // Standalone, draggable modal (own floating panel, same look as
+  // .vmu-bulkops-panel) reachable from the toolbar gear (injectToolbarSettingsButtons)
+  // instead of living inside VK's own upload dialog — settings shouldn't
+  // require opening the upload flow just to reach them, and this also
+  // sidesteps ever having two copies of the same ids mounted at once.
   let settingsPanelOpen = false;
+
+  function closeSettingsPanel() {
+    settingsPanelOpen = false;
+    document.getElementById('vmu-settings-modal')?.remove();
+    const toolbarBtn = document.getElementById('vmu-toolbar-settings-btn');
+    if (toolbarBtn) toolbarBtn.style.color = '';
+  }
 
   function toggleSettings() {
     syncVmuTheme(); // cheap self-heal in case the observer's target got replaced
-    settingsPanelOpen = !settingsPanelOpen;
-    if (settingsPanelOpen) closeSoundCloudPanel();
-    const panel = document.getElementById('vmu-settings-panel');
-    const btn = document.getElementById('vmu-settings-btn');
-    if (panel) panel.style.display = settingsPanelOpen ? 'block' : 'none';
-    if (btn) btn.style.color = settingsPanelOpen ? '#2688eb' : '';
+    if (document.getElementById('vmu-settings-modal')) { closeSettingsPanel(); return; }
+    closeSoundCloudPanel();
+    settingsPanelOpen = true;
+    const modal = document.createElement('div');
+    modal.id = 'vmu-settings-modal';
+    modal.className = 'vmu-bulkops-panel vmu-settings-modal';
+    modal.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Настройки</span>
+        <button type="button" class="vmu-check-close" id="vmu-settings-modal-close" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body">${buildSettingsPanel()}</div>
+    `;
+    document.body.appendChild(modal);
+    const panel = modal.querySelector('#vmu-settings-panel');
+    if (panel) panel.style.display = 'block';
+    makePanelDraggable(modal, modal.querySelector('.vmu-bulkops-head'));
+    modal.querySelector('#vmu-settings-modal-close').addEventListener('click', closeSettingsPanel);
+    attachSettingsHandlers();
+    const toolbarBtn = document.getElementById('vmu-toolbar-settings-btn');
+    if (toolbarBtn) toolbarBtn.style.color = '#2688eb';
   }
 
   function buildSettingsPanel() {
@@ -4777,6 +4941,17 @@
             </div>
             <label class="vmu-toggle">
               <input type="checkbox" id="vmu-ap-toggle" ${settings.autoPlaylist ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+
+          <div class="vmu-setting-row ${settings.autoPlaylist ? '' : 'vmu-row-disabled'}" id="vmu-dupcheck-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Проверка дубликатов плейлиста</span>
+              <span class="vmu-setting-hint">Спрашивать перед созданием, если плейлист с таким названием уже есть</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-dupcheck-toggle" ${settings.dupPlaylistCheck ? 'checked' : ''}>
               <span class="vmu-toggle-track"></span>
             </label>
           </div>
@@ -4962,6 +5137,16 @@
         if (coverRow) coverRow.classList.toggle('vmu-row-disabled', !settings.autoPlaylist);
         const id3Row = document.getElementById('vmu-id3cover-row');
         if (id3Row) id3Row.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && !settings.coverDataUrl));
+        const dupRow = document.getElementById('vmu-dupcheck-row');
+        if (dupRow) dupRow.classList.toggle('vmu-row-disabled', !settings.autoPlaylist);
+      });
+    }
+
+    const dupCheckToggle = document.getElementById('vmu-dupcheck-toggle');
+    if (dupCheckToggle) {
+      dupCheckToggle.addEventListener('change', () => {
+        settings.dupPlaylistCheck = dupCheckToggle.checked;
+        saveSettings();
       });
     }
 
@@ -5030,31 +5215,42 @@
   }
 
   // ─── SoundCloud download panel ─────────────────────────────────────────────
+  // Same standalone-modal treatment as settings above — its own draggable
+  // floating panel from the toolbar SC button, independent of the upload
+  // dialog.
   let soundCloudPanelOpen = false;
 
   function closeSoundCloudPanel() {
     soundCloudPanelOpen = false;
-    const panel = document.getElementById('vmu-sc-panel');
-    if (panel) panel.style.display = 'none';
-    const btn = document.getElementById('vmu-sc-btn');
-    if (btn) btn.style.color = '';
+    document.getElementById('vmu-sc-modal')?.remove();
+    const toolbarBtn = document.getElementById('vmu-toolbar-sc-btn');
+    if (toolbarBtn) toolbarBtn.style.color = '';
   }
 
   function toggleSoundCloud() {
     syncVmuTheme();
-    soundCloudPanelOpen = !soundCloudPanelOpen;
-    if (soundCloudPanelOpen) {
-      settingsPanelOpen = false;
-      const sp = document.getElementById('vmu-settings-panel');
-      if (sp) sp.style.display = 'none';
-      const sb = document.getElementById('vmu-settings-btn');
-      if (sb) sb.style.color = '';
-    }
-    const panel = document.getElementById('vmu-sc-panel');
-    const btn = document.getElementById('vmu-sc-btn');
-    if (panel) panel.style.display = soundCloudPanelOpen ? 'block' : 'none';
-    if (btn) btn.style.color = soundCloudPanelOpen ? '#ff7700' : '';
-    if (soundCloudPanelOpen) document.getElementById('vmu-sc-input')?.focus();
+    if (document.getElementById('vmu-sc-modal')) { closeSoundCloudPanel(); return; }
+    closeSettingsPanel();
+    soundCloudPanelOpen = true;
+    const modal = document.createElement('div');
+    modal.id = 'vmu-sc-modal';
+    modal.className = 'vmu-bulkops-panel vmu-sc-modal';
+    modal.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Скачать с SoundCloud</span>
+        <button type="button" class="vmu-check-close" id="vmu-sc-modal-close" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body">${buildSoundCloudPanel()}</div>
+    `;
+    document.body.appendChild(modal);
+    const panel = modal.querySelector('#vmu-sc-panel');
+    if (panel) panel.style.display = 'block';
+    makePanelDraggable(modal, modal.querySelector('.vmu-bulkops-head'));
+    modal.querySelector('#vmu-sc-modal-close').addEventListener('click', closeSoundCloudPanel);
+    attachSoundCloudHandlers();
+    const toolbarBtn = document.getElementById('vmu-toolbar-sc-btn');
+    if (toolbarBtn) toolbarBtn.style.color = '#ff7700';
+    document.getElementById('vmu-sc-input')?.focus();
   }
 
   function buildSoundCloudPanel() {
@@ -5295,6 +5491,29 @@
   // static dropzone sitting on top of it forever.
   function revealNativeUploadUI() {
     nativeUiRevealed = true;
+    // Put VK's real file input back at its exact original spot (the anchor
+    // comment left in injectIntoVkDialog) before un-hiding the section
+    // around it — injectIntoVkDialog pulls this node out to be a direct
+    // (invisible) child of the dialog box so our own dropzone can drive it
+    // independently of whatever's hidden underneath, but that meant the
+    // revealed native section came back missing the one input VK's own
+    // post-upload UI actually needs. Left orphaned like that, VK's native
+    // "не удалось загрузить — загрузить ещё раз?" retry for a failed track
+    // has no scoped input to reuse and falls back to a fresh, unscoped
+    // upload — which is why a retried track landed in the uploader's own
+    // personal audio instead of the community. Restoring the exact original
+    // node (not a clone) to its exact original position keeps VK's own
+    // event handlers, closures and DOM-position-based lookups all intact.
+    const input = document.querySelector('[data-vmu-vk="1"]');
+    if (input?.__vmuAnchor?.parentNode) {
+      input.__vmuAnchor.parentNode.insertBefore(input, input.__vmuAnchor);
+      input.__vmuAnchor.remove();
+    }
+    if (input) {
+      input.__vmuAnchor = null;
+      input.removeAttribute('data-vmu-vk');
+      input.style.cssText = '';
+    }
     document.querySelectorAll('[data-vmu-native-middle="1"]').forEach(c => {
       c.style.display = '';
       delete c.dataset.vmuNativeMiddle;
@@ -5425,15 +5644,18 @@
       // strip square/curly bracket tags like "[vk.com/reuploadunder]" or "(Live)"
       .replace(/[\[\{].*?[\]\}]/g, ' ')
       .replace(/\([^)]*\)\s*$/g, ' ')
-      // drop "feat. X" / "ft. X" / "при участии X" suffixes so credits don't
-      // break matching. [\s(]+ (not just \s+) before the keyword also
-      // rescues a malformed credits parenthetical — e.g. "(при участии A,
-      // B (2000) и C" with no final ")", verified live on a real reuploaded
-      // track — where a nested "(...)" inside the credits list steals the
-      // real closing paren, so the trailing-paren strip above only eats the
-      // innermost group and leaves "(при участии ..." dangling with a "("
-      // immediately before it instead of whitespace.
-      .replace(/[\s(]+(?:feat\.?|ft\.?|при\s+участии)\s+.*$/i, '')
+      // drop "feat. X" / "ft. X" / "при участии X" / "при уч. X" / "с уч. X"
+      // suffixes so credits don't break matching — [а-я-]*\.? after "уч"
+      // covers every abbreviation level a reuploader types, from "уч."/"уч-и"
+      // up through the full "участии"/"участием", not just the one spelled-
+      // out form. [\s(]+ (not just \s+) before the keyword also rescues a
+      // malformed credits parenthetical — e.g. "(при участии A, B (2000) и C"
+      // with no final ")", verified live on a real reuploaded track — where a
+      // nested "(...)" inside the credits list steals the real closing paren,
+      // so the trailing-paren strip above only eats the innermost group and
+      // leaves "(при участии ..." dangling with a "(" immediately before it
+      // instead of whitespace.
+      .replace(/[\s(]+(?:feat\.?|ft\.?|(?:при|с)\s+уч[а-я-]*\.?)\s+.*$/i, '')
       .replace(/[«»"'`’]/g, '')
       // Trailing "?"/"!" is often present on only one side of a match —
       // Genius keeps title punctuation, reuploaded filenames routinely drop
@@ -5858,6 +6080,10 @@
       panel.style.left = startLeft + 'px';
       panel.style.top = startTop + 'px';
       panel.style.right = 'auto';
+      // Marks the panel as manually placed so any auto-repositioning logic
+      // elsewhere (e.g. positionAudioFxUI/positionCheckPanel reacting to
+      // resize or reopen) can skip and leave the user's placement alone.
+      panel.dataset.vmuUserMoved = '1';
       handle.setPointerCapture(e.pointerId);
       handle.classList.add('vmu-dragging');
     });
@@ -5997,6 +6223,17 @@
   // element into a container React already owns is the same safe pattern
   // injectSingleDlBtn already uses elsewhere; cloning/mutating VK's own node
   // risks React's reconciliation fighting us on the next re-render).
+  // Copies the upload button's OWN inline size (width/height/min-width/
+  // min-height — VK sets these directly on the element, not via the shared
+  // className our clones already copy) so a smaller icon glyph (16/20px vs
+  // VK's own 24px) still centers inside the same box height instead of the
+  // button shrinking to fit it — verified live: without this, icon-button
+  // midpoints were off by 2-4px against the native upload button.
+  function matchNativeButtonBox(btn, referenceBtn) {
+    const inlineStyle = referenceBtn.getAttribute('style');
+    if (inlineStyle) btn.setAttribute('style', inlineStyle);
+  }
+
   function injectBulkOpsButton() {
     if (document.getElementById('vmu-bulkops-btn')) return;
     const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
@@ -6006,18 +6243,68 @@
     btn.type = 'button';
     btn.id = 'vmu-bulkops-btn';
     btn.className = uploadBtn.className;
+    matchNativeButtonBox(btn, uploadBtn);
     btn.setAttribute('aria-label', 'Массовые операции');
-    btn.title = 'Массовые операции (переименование/артист по Genius или файлам)';
+    // Native title swapped for the same custom vkit-style bubble the other
+    // toolbar-injected buttons (.vmu-audiofx-btn) use — see showDlTooltip's
+    // isNewVk check — so it looks like one of VK's own tooltips instead of
+    // the browser's default one.
+    btn.setAttribute('data-vmu-tip', 'Массовые операции');
     btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h14M3 10h10M3 14h6"/></svg>`;
+    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
+    btn.addEventListener('mouseleave', hideDlTooltip);
     btn.addEventListener('click', async () => {
+      hideDlTooltip();
       if (document.getElementById('vmu-massop-confirm')) return;
       const confirmed = await vmuConfirmMassOpsLaunch(btn);
       if (confirmed) openBulkOpsPanel();
     });
     group.insertBefore(btn, uploadBtn);
   }
-  new MutationObserver(() => injectBulkOpsButton()).observe(document.body, { childList: true, subtree: true });
-  injectBulkOpsButton();
+
+  // Settings and SoundCloud-download were previously only reachable from
+  // inside VK's own upload dialog (its header gear/SC icons). These toolbar
+  // buttons sit right next to the catalog's own upload button instead, one
+  // click away, and open their own standalone draggable modals (toggleSettings
+  // / toggleSoundCloud) — no upload dialog involved at all anymore.
+  function injectToolbarSettingsButtons() {
+    if (document.getElementById('vmu-toolbar-settings-btn')) return;
+    const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
+    const group = uploadBtn?.parentElement;
+    if (!group) return;
+    const gearBtn = document.createElement('button');
+    gearBtn.type = 'button';
+    gearBtn.id = 'vmu-toolbar-settings-btn';
+    gearBtn.className = uploadBtn.className;
+    matchNativeButtonBox(gearBtn, uploadBtn);
+    gearBtn.setAttribute('aria-label', 'Настройки');
+    gearBtn.setAttribute('data-vmu-tip', 'Настройки');
+    gearBtn.innerHTML = ICON_SETTINGS;
+    gearBtn.addEventListener('mouseenter', () => showDlTooltip(gearBtn));
+    gearBtn.addEventListener('mouseleave', hideDlTooltip);
+    gearBtn.addEventListener('click', () => { hideDlTooltip(); toggleSettings(); });
+    group.insertBefore(gearBtn, uploadBtn);
+
+    const scBtn = document.createElement('button');
+    scBtn.type = 'button';
+    scBtn.id = 'vmu-toolbar-sc-btn';
+    scBtn.className = uploadBtn.className;
+    matchNativeButtonBox(scBtn, uploadBtn);
+    scBtn.setAttribute('aria-label', 'Скачать с SoundCloud');
+    scBtn.setAttribute('data-vmu-tip', 'Скачать с SoundCloud');
+    scBtn.innerHTML = ICON_SOUNDCLOUD;
+    scBtn.addEventListener('mouseenter', () => showDlTooltip(scBtn));
+    scBtn.addEventListener('mouseleave', hideDlTooltip);
+    scBtn.addEventListener('click', () => { hideDlTooltip(); toggleSoundCloud(); });
+    group.insertBefore(scBtn, gearBtn);
+  }
+
+  function injectCatalogToolbarButtons() {
+    injectBulkOpsButton();
+    injectToolbarSettingsButtons();
+  }
+  new MutationObserver(() => injectCatalogToolbarButtons()).observe(document.body, { childList: true, subtree: true });
+  injectCatalogToolbarButtons();
 
   function buildBulkOpsSection(list, { pageTracks, entries }) {
     const wrap = document.createElement('div');
@@ -6756,6 +7043,7 @@
     body.appendChild(list);
     panel.appendChild(body);
     document.body.appendChild(panel);
+    makePanelDraggable(panel, head);
 
     positionCheckPanel();
     const onResize = () => positionCheckPanel();
@@ -7039,21 +7327,19 @@
     const isCheck = settings.workMode === 'check';
     const dzLabel = isCheck ? 'Перетащите MP3 для проверки' : 'Перетащите MP3 файлы сюда';
     const dzHint = isCheck ? 'имена файлов будут сверены с треками на странице' : 'не более 200 МБ каждый';
-    // Own header (title + gear + ✕) is only rendered when the dialog has no
-    // native header we could keep — otherwise the native title and close
-    // button stay and the gear is injected next to them.
+    // Own header (title + ✕) is only rendered when the dialog has no native
+    // header we could keep — otherwise the native title and close button
+    // stay as-is. Settings/SoundCloud used to live here too (gear + SC icon
+    // next to the close button) but both moved out to their own standalone,
+    // draggable modals reachable from the catalog toolbar (see toggleSettings
+    // / toggleSoundCloud) — no longer tied to this dialog's lifecycle at all.
     const ownHeader = withOwnHeader ? `
       <div id="vmu-header">
         <span id="vmu-header-title">${isCheck ? 'Проверка аудиозаписей' : 'Загрузка аудиозаписей'}</span>
-        <button type="button" id="vmu-sc-btn" class="vmu-settings-btn-header" title="Скачать с SoundCloud">${ICON_SOUNDCLOUD}</button>
-        <button type="button" id="vmu-settings-btn" class="vmu-settings-btn-header" title="Настройки">${ICON_SETTINGS}</button>
         <button type="button" id="vmu-close-btn" class="vmu-settings-btn-header" title="Закрыть">${ICON_CLOSE}</button>
       </div>` : '';
     wrap.innerHTML = `
       ${ownHeader}
-
-      ${buildSettingsPanel()}
-      ${buildSoundCloudPanel()}
 
       <div id="vmu-dropzone">
         <div class="vmu-dz-label">${dzLabel}</div>
@@ -7160,9 +7446,16 @@
     box.dataset.vmuInjected = '1';
     nativeUiRevealed = false;
 
-    // Save VK's original file input (with its VK event listeners intact)
+    // Save VK's original file input (with its VK event listeners intact).
+    // Leaves a comment-node anchor at its exact original spot so
+    // revealNativeUploadUI() can put it back there later — see that
+    // function for why the input has to actually return, not just the
+    // section around it.
     const vkInput = box.querySelector('input[type="file"]');
     if (vkInput) {
+      const anchor = document.createComment('vmu-vk-input-anchor');
+      vkInput.before(anchor);
+      vkInput.__vmuAnchor = anchor;
       vkInput.setAttribute('data-vmu-vk', '1');
       vkInput.style.cssText = 'position:absolute;opacity:0;pointer-events:none;width:0;height:0;overflow:hidden;';
     }
@@ -7192,8 +7485,6 @@
       if (footer) box.insertBefore(ui, footer);
       else box.appendChild(ui);
       if (vkInput) box.appendChild(vkInput);
-      injectGearIntoNativeHeader(header);
-      injectSoundCloudIntoNativeHeader(header);
       injectClearIntoNativeFooter(footer);
     } else {
       // No recognizable native chrome (old VK .audio_add_box) — replace the
@@ -7206,43 +7497,6 @@
 
     attachEmbeddedHandlers();
     renderQueue();
-  }
-
-  // Settings gear placed next to the native close button so it survives our
-  // injection (we keep the native header) and looks like part of VK's dialog.
-  function injectGearIntoNativeHeader(header) {
-    if (!header || document.getElementById('vmu-settings-btn')) return;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.id = 'vmu-settings-btn';
-    btn.className = 'vmu-settings-btn-header';
-    btn.title = 'Настройки';
-    btn.innerHTML = ICON_SETTINGS;
-    btn.addEventListener('click', toggleSettings);
-    if (settingsPanelOpen) btn.style.color = '#2688eb';
-    const closeWrap = header.querySelector('[data-testid="modal-close-button"]');
-    if (closeWrap && closeWrap.parentElement) closeWrap.parentElement.insertBefore(btn, closeWrap);
-    else header.appendChild(btn);
-  }
-
-  // SoundCloud download button placed right before the settings gear (same
-  // anchoring trick as injectGearIntoNativeHeader — survives VK re-rendering
-  // its native header).
-  function injectSoundCloudIntoNativeHeader(header) {
-    if (!header || document.getElementById('vmu-sc-btn')) return;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.id = 'vmu-sc-btn';
-    btn.className = 'vmu-settings-btn-header';
-    btn.title = 'Скачать с SoundCloud';
-    btn.innerHTML = ICON_SOUNDCLOUD;
-    btn.addEventListener('click', toggleSoundCloud);
-    if (soundCloudPanelOpen) btn.style.color = '#ff7700';
-    const gearBtn = document.getElementById('vmu-settings-btn');
-    const closeWrap = header.querySelector('[data-testid="modal-close-button"]');
-    if (gearBtn) gearBtn.parentElement.insertBefore(btn, gearBtn);
-    else if (closeWrap && closeWrap.parentElement) closeWrap.parentElement.insertBefore(btn, closeWrap);
-    else header.appendChild(btn);
   }
 
   // Relocates the (already-built, listener-attached) #vmu-clear button from
@@ -7262,29 +7516,11 @@
   }
 
   function attachEmbeddedHandlers() {
-    // Scoped to our own header — the native-header gear gets its listener in
-    // injectGearIntoNativeHeader (binding by id here would double-toggle it)
-    document.querySelector('#vmu-embedded #vmu-settings-btn')?.addEventListener('click', toggleSettings);
-    document.querySelector('#vmu-embedded #vmu-sc-btn')?.addEventListener('click', toggleSoundCloud);
     document.getElementById('vmu-close-btn')?.addEventListener('click', closeUploadModal);
     document.getElementById('vmu-clear')?.addEventListener('click', () => {
       fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
       renderQueue();
     });
-    // The panel is rebuilt collapsed on every (re)injection — restore state
-    if (settingsPanelOpen) {
-      const panel = document.getElementById('vmu-settings-panel');
-      if (panel) panel.style.display = 'block';
-      const btn = document.getElementById('vmu-settings-btn');
-      if (btn) btn.style.color = '#2688eb';
-    }
-    if (soundCloudPanelOpen) {
-      const panel = document.getElementById('vmu-sc-panel');
-      if (panel) panel.style.display = 'block';
-      const btn = document.getElementById('vmu-sc-btn');
-      if (btn) btn.style.color = '#ff7700';
-    }
-    attachSoundCloudHandlers();
 
     document.getElementById('vmu-input')?.addEventListener('change', e => {
       addFiles([...e.target.files].filter(isMP3));
@@ -7300,8 +7536,6 @@
 
     // The side action buttons live in a floating panel outside the popup; its
     // click listener is wired up in renderUploadSidePanel().
-
-    attachSettingsHandlers();
   }
 
   // ─── dupes button injection into playlists ────────────────────────────────────
@@ -7318,14 +7552,117 @@
     _pendingDupesPlaylist = { ownerId: parts[0], playlistId: parts[1] };
   }, true);
 
+  // Bottom slide-up confirmation for runAutoPlaylist's duplicate-playlist
+  // check — styled to sit alongside VK's own dialogs/toasts (uses the same
+  // --vmu-* theme tokens as the settings panel, so it follows light/dark
+  // automatically). Resolves to {create, dontAskAgain}; dontAskAgain mirrors
+  // the "Больше не спрашивать" checkbox and is also exposed as the
+  // standalone "Проверка дубликатов плейлиста" settings toggle, so either
+  // one flips the same settings.dupPlaylistCheck flag.
+  function showDupPlaylistPrompt(title) {
+    return new Promise(resolve => {
+      document.getElementById('vmu-dup-toast')?.remove();
+      const el = document.createElement('div');
+      el.id = 'vmu-dup-toast';
+      el.className = 'vmu-dup-toast';
+
+      const icon = document.createElement('div');
+      icon.className = 'vmu-dup-toast-icon';
+      icon.textContent = '⚠';
+
+      const body = document.createElement('div');
+      body.className = 'vmu-dup-toast-body';
+      const titleEl = document.createElement('div');
+      titleEl.className = 'vmu-dup-toast-title';
+      titleEl.textContent = 'Такой плейлист уже есть';
+      const textEl = document.createElement('div');
+      textEl.className = 'vmu-dup-toast-text';
+      textEl.textContent = `«${title}» уже есть среди ваших плейлистов. Создать ещё один?`;
+      body.append(titleEl, textEl);
+
+      const top = document.createElement('div');
+      top.className = 'vmu-dup-toast-top';
+      top.append(icon, body);
+
+      // Same custom checkbox pattern as .vmu-toggle elsewhere (hidden input +
+      // a styled sibling) instead of a bare native checkbox — sits on the
+      // same row as the buttons below, not its own row above them.
+      const checkLabel = document.createElement('label');
+      checkLabel.className = 'vmu-dup-toast-check';
+      const checkInput = document.createElement('input');
+      checkInput.type = 'checkbox';
+      const checkBox = document.createElement('span');
+      checkBox.className = 'vmu-dup-toast-checkbox';
+      const checkText = document.createElement('span');
+      checkText.className = 'vmu-dup-toast-check-label';
+      checkText.textContent = 'Больше не спрашивать';
+      checkLabel.append(checkInput, checkBox, checkText);
+
+      const actions = document.createElement('div');
+      actions.className = 'vmu-dup-toast-actions';
+      const btnNo = document.createElement('button');
+      btnNo.type = 'button';
+      btnNo.className = 'vmu-dup-toast-btn';
+      btnNo.textContent = 'Не создавать';
+      const btnYes = document.createElement('button');
+      btnYes.type = 'button';
+      btnYes.className = 'vmu-dup-toast-btn vmu-dup-toast-btn-primary';
+      btnYes.textContent = 'Создать дубликат';
+      actions.append(btnNo, btnYes);
+
+      const footer = document.createElement('div');
+      footer.className = 'vmu-dup-toast-footer';
+      footer.append(checkLabel, actions);
+
+      el.append(top, footer);
+      document.body.appendChild(el);
+      // Double rAF so the initial (offscreen) state actually paints before
+      // the "-shown" class is added — otherwise the browser can coalesce
+      // both into one frame and the slide-up transition never plays.
+      requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('vmu-dup-toast-shown')));
+
+      let settled = false;
+      const finish = create => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        el.classList.remove('vmu-dup-toast-shown');
+        setTimeout(() => el.remove(), 250);
+        resolve({ create, dontAskAgain: checkInput.checked });
+      };
+      btnYes.addEventListener('click', () => finish(true));
+      btnNo.addEventListener('click', () => finish(false));
+      // Safety net so an unanswered prompt (tab backgrounded, user walked
+      // away) never leaves runAutoPlaylist hanging forever — defaults to
+      // NOT creating a duplicate, the less surprising outcome if nobody
+      // was actually there to answer.
+      const timer = setTimeout(() => finish(false), 45000);
+    });
+  }
+
+  // Both toasts below share the same bottom-center slide-up card look as
+  // showDupPlaylistPrompt's duplicate-playlist confirmation (.vmu-notice —
+  // see its CSS for the shared visual language) instead of the old ad-hoc
+  // bottom-left colored boxes, so every extension notice reads as one
+  // consistent design instead of two different ones.
   function showToast(msg, isError) {
     document.getElementById('vmu-toast')?.remove();
     const el = document.createElement('div');
     el.id = 'vmu-toast';
-    el.textContent = msg;
-    el.style.cssText = `position:fixed;bottom:20px;left:20px;z-index:999999;background:${isError ? '#b71c1c' : '#1b5e20'};color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.5);max-width:340px;word-break:break-word;pointer-events:none;`;
+    el.className = 'vmu-notice';
+    const icon = document.createElement('div');
+    icon.className = 'vmu-notice-icon ' + (isError ? 'vmu-notice-icon-error' : 'vmu-notice-icon-success');
+    icon.textContent = isError ? '✕' : '✓';
+    const text = document.createElement('div');
+    text.className = 'vmu-notice-text';
+    text.textContent = msg;
+    el.append(icon, text);
     document.body.appendChild(el);
-    setTimeout(() => el.remove(), 5000);
+    requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('vmu-notice-shown')));
+    setTimeout(() => {
+      el.classList.remove('vmu-notice-shown');
+      setTimeout(() => el.remove(), 280);
+    }, 5000);
   }
 
   // Persistent progress toast — same slot as showToast but updates in place
@@ -7341,27 +7678,36 @@
       document.getElementById('vmu-toast')?.remove();
       el = document.createElement('div');
       el.id = id;
-      el.style.cssText = `position:fixed;bottom:20px;left:20px;z-index:999999;color:#fff;padding:10px 14px 12px;border-radius:8px;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.5);min-width:240px;max-width:340px;word-break:break-word;pointer-events:none;transition:background .25s ease;`;
-      el.innerHTML = `<div class="vmu-pt-row" style="display:flex;align-items:center;gap:8px;"><span class="vmu-pt-spin" style="width:12px;height:12px;border-radius:50%;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;animation:vmu-spin 1s linear infinite;flex:0 0 auto;"></span><span class="vmu-pt-text" style="flex:1 1 auto;"></span></div><div class="vmu-pt-bar" style="margin-top:8px;height:4px;background:rgba(255,255,255,.18);border-radius:2px;overflow:hidden;display:none;"><div class="vmu-pt-fill" style="height:100%;width:0%;background:#fff;transition:width .18s ease;"></div></div>`;
-      if (!document.getElementById('vmu-pt-style')) {
-        const s = document.createElement('style');
-        s.id = 'vmu-pt-style';
-        s.textContent = '@keyframes vmu-spin{to{transform:rotate(360deg)}}';
-        document.head.appendChild(s);
-      }
+      el.className = 'vmu-notice';
+      el.innerHTML = `
+        <div class="vmu-notice-icon"><span class="vmu-notice-spin"></span></div>
+        <div class="vmu-notice-body">
+          <div class="vmu-notice-text"></div>
+          <div class="vmu-notice-bar" style="display:none"><div class="vmu-notice-bar-fill" style="width:0%"></div></div>
+        </div>`;
       document.body.appendChild(el);
+      requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('vmu-notice-shown')));
     }
-    el.style.background = kind === 'error' ? '#b71c1c' : kind === 'done' ? '#1b5e20' : '#0d47a1';
-    el.querySelector('.vmu-pt-text').textContent = title || '';
-    const spin = el.querySelector('.vmu-pt-spin');
-    spin.style.display = kind === 'progress' ? '' : 'none';
-    const bar = el.querySelector('.vmu-pt-bar');
-    const fill = el.querySelector('.vmu-pt-fill');
+    // A call arriving mid-fade-out (its remove() timer already fired the
+    // class removal but not the element removal yet) needs the shown class
+    // put back, or the update would render invisible until it got yanked
+    // out from under itself.
+    clearTimeout(el._vmuTimer);
+    clearTimeout(el._vmuRemoveTimer);
+    el.classList.add('vmu-notice-shown');
+    const iconEl = el.querySelector('.vmu-notice-icon');
+    iconEl.className = 'vmu-notice-icon ' + (kind === 'error' ? 'vmu-notice-icon-error' : kind === 'done' ? 'vmu-notice-icon-success' : 'vmu-notice-icon-progress');
+    iconEl.innerHTML = kind === 'error' ? '✕' : kind === 'done' ? '✓' : '<span class="vmu-notice-spin"></span>';
+    el.querySelector('.vmu-notice-text').textContent = title || '';
+    const bar = el.querySelector('.vmu-notice-bar');
+    const fill = el.querySelector('.vmu-notice-bar-fill');
     if (pct !== null) { bar.style.display = ''; fill.style.width = pct + '%'; }
     else if (kind !== 'progress') bar.style.display = 'none';
-    clearTimeout(el._vmuTimer);
     if (kind === 'done' || kind === 'error') {
-      el._vmuTimer = setTimeout(() => el.remove(), 4000);
+      el._vmuTimer = setTimeout(() => {
+        el.classList.remove('vmu-notice-shown');
+        el._vmuRemoveTimer = setTimeout(() => el.remove(), 280);
+      }, 4000);
     }
   }
 
@@ -8134,7 +8480,10 @@
     // playlist modal get the vkui-style tooltip via .vmu-tooltip-new.
     const isNewVk = btn.classList.contains('vmu-single-dl-vkit')
       || btn.classList.contains('vmu-single-dl-after')
-      || btn.classList.contains('vmu-audiofx-btn');
+      || btn.classList.contains('vmu-audiofx-btn')
+      || btn.id === 'vmu-bulkops-btn'
+      || btn.id === 'vmu-toolbar-settings-btn'
+      || btn.id === 'vmu-toolbar-sc-btn';
     el.classList.toggle('vmu-tooltip-new', isNewVk);
     // Reset placement modifier before measuring so layout reflects the
     // default-above tail height.
@@ -8158,6 +8507,43 @@
     const el = document.getElementById('vmu-tooltip');
     if (el) el.classList.remove('vmu-tooltip-show');
   }
+
+  // ─── Global bridge: native title="" → the custom #vmu-tooltip bubble ───────
+  // This project has 50+ title="..." call sites (help icons, reset buttons,
+  // EQ band labels, panel close buttons, etc.), most built via innerHTML
+  // template strings where wiring an explicit data-vmu-tip + mouseenter/
+  // mouseleave pair per element (the pattern .vmu-audiofx-btn and friends use
+  // deliberately) isn't practical. Delegating on document instead covers all
+  // of them — present now or added later — without touching those call
+  // sites: on hover, swap title for data-vmu-tip (so the browser's own
+  // tooltip doesn't also render) and show our bubble; on leave, swap back.
+  // Scoped to elements inside something carrying a vmu- id/class so this
+  // never touches VK's own native title="" tooltips elsewhere on the page.
+  let _vmuTitleHoverEl = null;
+  document.addEventListener('mouseover', e => {
+    const el = e.target.closest('[title]');
+    if (!el || el === _vmuTitleHoverEl) return;
+    const text = el.getAttribute('title');
+    if (!text || !el.closest('[id^="vmu-"], [class*="vmu-"]')) return;
+    _vmuTitleHoverEl = el;
+    el.setAttribute('data-vmu-tip', text);
+    el.removeAttribute('title');
+    showDlTooltip(el);
+  }, true);
+  document.addEventListener('mouseout', e => {
+    if (!_vmuTitleHoverEl) return;
+    // mouseout bubbles and fires on every child boundary crossing too — only
+    // actually leaving (relatedTarget outside the tracked element, or gone
+    // entirely) should hide the tooltip, not moving from the element onto
+    // its own child icon/text.
+    if (e.relatedTarget && _vmuTitleHoverEl.contains(e.relatedTarget)) return;
+    const el = _vmuTitleHoverEl;
+    const text = el.getAttribute('data-vmu-tip');
+    if (text) el.setAttribute('title', text);
+    el.removeAttribute('data-vmu-tip');
+    _vmuTitleHoverEl = null;
+    hideDlTooltip();
+  }, true);
 
   function makeSingleDlBtn(row, extraClass) {
     const btn = document.createElement('button');
@@ -8369,13 +8755,6 @@
     if (box && box.dataset.vmuInjected && !document.getElementById('vmu-embedded') && !nativeUiRevealed) {
       delete box.dataset.vmuInjected;
       injectIntoVkDialog(box);
-    }
-    // Restore the gear if VK re-rendered its native header
-    if (box && box.dataset.vmuInjected && !document.getElementById('vmu-settings-btn')) {
-      injectGearIntoNativeHeader(box.querySelector('[data-testid="modalheader"], [class*="vkitModalHeader"]'));
-    }
-    if (box && box.dataset.vmuInjected && !document.getElementById('vmu-sc-btn')) {
-      injectSoundCloudIntoNativeHeader(box.querySelector('[data-testid="modalheader"], [class*="vkitModalHeader"]'));
     }
     // Restore Clear's spot next to "Выбрать из своих аудиозаписей" if VK
     // re-rendered its native footer (cheap no-op once already in place)
