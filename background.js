@@ -43,14 +43,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'VKD_GENIUS_SEARCH') {
-    geniusSearch(msg.query)
+    geniusSearch(msg.query, sender.tab?.windowId)
       .then(sendResponse)
       .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
     return true;
   }
 
   if (msg.type === 'VKD_GENIUS_TRACKS') {
-    geniusAlbumTracks(msg.albumId, msg.albumUrl)
+    geniusAlbumTracks(msg.albumId, msg.albumUrl, sender.tab?.windowId)
       .then(sendResponse)
       .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
     return true;
@@ -291,10 +291,18 @@ function waitForTabComplete(tabId, timeoutMs = 15000) {
 // self-contained and resolve to {ok:true, data} or {ok:false, error} itself,
 // since a thrown error inside it isn't distinguishable from other
 // executeScript rejection shapes.
-async function runInGeniusPage(url, func, args = []) {
+async function runInGeniusPage(url, func, args = [], originalWindowId) {
   const win = await chrome.windows.create({ url, focused: false, state: 'minimized', type: 'popup' });
   // 'minimized' at creation time is unreliable on some platforms — reassert it.
   await chrome.windows.update(win.id, { state: 'minimized', focused: false }).catch(() => {});
+  // Minimizing a freshly-created window shuffles the OS-level window stack
+  // on Windows (verified live via the same pattern in scanPlaylistsInHiddenTab
+  // below) and can surface some OTHER unrelated recently-used window/tab
+  // instead of leaving the user's actual foreground tab alone — re-focus it
+  // explicitly to undo that.
+  if (originalWindowId != null) {
+    chrome.windows.update(originalWindowId, { focused: true }).catch(() => {});
+  }
   const tabId = win.tabs?.[0]?.id;
   try {
     if (!tabId) throw new Error('genius_window_no_tab');
@@ -372,7 +380,7 @@ async function scanPlaylistsInHiddenTab(url, originalWindowId) {
   }
 }
 
-async function geniusSearch(query) {
+async function geniusSearch(query, originalWindowId) {
   if (!query || !query.trim()) return { ok: false, error: 'пустой запрос' };
   try {
     const albums = await runInGeniusPage('https://genius.com/', async (q) => {
@@ -400,7 +408,7 @@ async function geniusSearch(query) {
       } catch (e) {
         return { ok: false, error: e?.message || String(e) };
       }
-    }, [query]);
+    }, [query], originalWindowId);
     return { ok: true, albums };
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };
@@ -413,7 +421,7 @@ async function geniusSearch(query) {
 // same page's own /api/albums/{id}/tracks. Genius doesn't embed the actual
 // tracklist in the page's initial state, only the id, so the follow-up calls
 // are still needed — just run in-page now instead of bare from the worker.
-async function geniusAlbumTracks(albumId, albumUrl) {
+async function geniusAlbumTracks(albumId, albumUrl, originalWindowId) {
   const url = albumUrl || 'https://genius.com/';
   try {
     const tracks = await runInGeniusPage(url, async (knownId) => {
@@ -437,7 +445,7 @@ async function geniusAlbumTracks(albumId, albumUrl) {
       } catch (e) {
         return { ok: false, error: e?.message || String(e) };
       }
-    }, [albumId || null]);
+    }, [albumId || null], originalWindowId);
     return { ok: true, tracks };
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };

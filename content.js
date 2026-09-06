@@ -53,7 +53,22 @@
   // keyed by filename instead of a single global callback/item.
   const uploadDoneCallbacks = new Map();   // fileName -> (data) => void
   const uploadingItemsByName = new Map();  // fileName -> queue item
+  // autoPlaylistClaimed: synchronous "am I the one tracking THIS upload
+  // call towards auto-playlist" claim, set/checked with no `await` in
+  // between (see handoffFilesNatively) so two near-simultaneous calls for
+  // what's really one drop/paste never both decide to track it. Released as
+  // soon as the batch is either dropped or handed to the queue below — NOT
+  // held for the whole runAutoPlaylist run, or a second, genuinely separate
+  // upload (e.g. the user clicking "Повторить" on a track that failed while
+  // the first batch's dup-check/track-search was still in flight) would see
+  // it still held and silently never get processed at all.
+  let autoPlaylistClaimed = false;
+  // autoPlaylistRunning / autoPlaylistQueue: actual execution serialization.
+  // A batch that finishes while runAutoPlaylist is already busy with an
+  // earlier one is queued, never dropped — drainAutoPlaylistQueue works
+  // through them one at a time.
   let autoPlaylistRunning = false;
+  let autoPlaylistQueue = [];
   let isPaused = false;
   let itemIdCounter = 0;
 
@@ -2466,26 +2481,18 @@
     });
   }
 
-  // ─── cover text-overlay editor: color analysis ─────────────────────────────────
-  // JS port of text_overlay_app/color_tools.py — same WCAG-contrast-driven
-  // auto text-color pick, working off the cover's own dominant colors rather
-  // than a single sampled pixel (a flat overlay color has to hold up against
-  // every major region of a busy cover, not just the patch behind the text).
-  const VMU_WCAG_AA_NORMAL = 4.5;
-  const VMU_WCAG_AA_LARGE = 3.0;
-  const VMU_WCAG_AAA_NORMAL = 7.0;
-  const VMU_NEUTRAL_BONUS = 40.0;
-
+  // ─── cover text-overlay editor: color helpers ───────────────────────────────────
+  // Used to be a WCAG-contrast-driven analysis of the cover's own dominant
+  // colors (JS port of text_overlay_app/color_tools.py) — picked whatever
+  // flat color scored best against the image so text would stay legible.
+  // Replaced with a plain random color: simpler, and the live canvas
+  // preview already shows at a glance whether the result reads well, so a
+  // numeric contrast score never told the user anything they couldn't just
+  // look at.
   function vmuRelLuminance([r, g, b]) {
     const ch = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
     return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b);
   }
-  function vmuContrastRatio(a, b) {
-    const l1 = vmuRelLuminance(a), l2 = vmuRelLuminance(b);
-    const lighter = Math.max(l1, l2), darker = Math.min(l1, l2);
-    return (lighter + 0.05) / (darker + 0.05);
-  }
-  function vmuColorDistance(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
   function vmuOppositeNeutral(rgb) { return vmuRelLuminance(rgb) >= 0.5 ? [0, 0, 0] : [255, 255, 255]; }
   function vmuRgbToHex([r, g, b]) {
     return '#' + [r, g, b].map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('');
@@ -2493,49 +2500,6 @@
   function vmuHexToRgb(hex) {
     const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex || '');
     return m ? [parseInt(m[1], 16), parseInt(m[2], 16), parseInt(m[3], 16)] : [255, 255, 255];
-  }
-
-  function vmuThumbCanvas(sourceCanvas, size) {
-    const c = document.createElement('canvas');
-    c.width = size; c.height = size;
-    c.getContext('2d').drawImage(sourceCanvas, 0, 0, size, size);
-    return c;
-  }
-
-  function vmuDominantColors(sourceCanvas, k = 6, thumbSize = 150, binSize = 32) {
-    const thumb = vmuThumbCanvas(sourceCanvas, thumbSize);
-    const { data } = thumb.getContext('2d').getImageData(0, 0, thumbSize, thumbSize);
-    const counts = new Map();
-    for (let i = 0; i < data.length; i += 4) {
-      const r = Math.floor(data[i] / binSize) * binSize + binSize / 2;
-      const g = Math.floor(data[i + 1] / binSize) * binSize + binSize / 2;
-      const b = Math.floor(data[i + 2] / binSize) * binSize + binSize / 2;
-      const key = r + ',' + g + ',' + b;
-      counts.set(key, (counts.get(key) || 0) + 1);
-    }
-    return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, k).map(([key]) => key.split(',').map(Number));
-  }
-
-  function vmuAverageColor(sourceCanvas, thumbSize = 64) {
-    const thumb = vmuThumbCanvas(sourceCanvas, thumbSize);
-    const { data } = thumb.getContext('2d').getImageData(0, 0, thumbSize, thumbSize);
-    let r = 0, g = 0, b = 0, n = 0;
-    for (let i = 0; i < data.length; i += 4) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
-    return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
-  }
-
-  function vmuRgbToHsv(r, g, b) {
-    r /= 255; g /= 255; b /= 255;
-    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
-    let h = 0;
-    if (d !== 0) {
-      if (max === r) h = ((g - b) / d) % 6;
-      else if (max === g) h = (b - r) / d + 2;
-      else h = (r - g) / d + 4;
-      h /= 6;
-      if (h < 0) h += 1;
-    }
-    return [h, max === 0 ? 0 : d / max, max];
   }
   function vmuHsvToRgb(h, s, v) {
     const i = Math.floor(h * 6);
@@ -2552,54 +2516,11 @@
     }
     return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
   }
-
-  function vmuFullGrayscaleRamp(step = 15) {
-    const out = [];
-    for (let v = 0; v <= 255; v += step) out.push([v, v, v]);
-    return out;
-  }
-  function vmuFixedAccents() {
-    return [[255, 235, 59], [255, 87, 34], [76, 175, 80], [33, 150, 243], [255, 193, 7]];
-  }
-  // Light + dark accent variants derived from the cover's own dominant hue
-  // (complementary + two triadic rotations) so a fallback accent still feels
-  // like it belongs on this cover.
-  function vmuComplementaryAccents(dominants) {
-    if (!dominants.length) return [];
-    const [h] = vmuRgbToHsv(...dominants[0]);
-    const out = [];
-    for (const shift of [0.5, 0.5 + 1 / 3, 0.5 - 1 / 3]) {
-      const nh = ((h + shift) % 1 + 1) % 1;
-      for (const [value, sat] of [[0.95, 0.55], [0.35, 0.65]]) out.push(vmuHsvToRgb(nh, sat, value));
-    }
-    return out;
-  }
-
-  // Returns { color, ratio, dominants }. Picks a flat color that clears the
-  // WCAG floor against every dominant color at once (not just one), tying
-  // toward neutrals and then whichever candidate stays furthest from all of
-  // them; falls back to the least-bad candidate if nothing clears the floor
-  // (busy cover spanning near-black to near-white — the outline picks up
-  // the slack there via vmuOppositeNeutral).
-  function vmuPickContrastingColor(dominants, minContrast = VMU_WCAG_AA_NORMAL) {
-    if (!dominants || !dominants.length) dominants = [[128, 128, 128]];
-    const palette = [...vmuFullGrayscaleRamp(), ...vmuFixedAccents(), ...vmuComplementaryAccents(dominants)];
-    const scored = palette.map(c => {
-      const worstRatio = Math.min(...dominants.map(d => vmuContrastRatio(c, d)));
-      const dist = Math.min(...dominants.map(d => vmuColorDistance(c, d)));
-      const isNeutral = (Math.max(...c) - Math.min(...c)) <= 12;
-      return { c, worstRatio, dist, isNeutral };
-    });
-    const passing = scored.filter(s => s.worstRatio >= minContrast);
-    let chosen;
-    if (passing.length) {
-      passing.sort((a, b) => (b.dist + (b.isNeutral ? VMU_NEUTRAL_BONUS : 0)) - (a.dist + (a.isNeutral ? VMU_NEUTRAL_BONUS : 0)) || b.worstRatio - a.worstRatio);
-      chosen = passing[0];
-    } else {
-      scored.sort((a, b) => b.worstRatio - a.worstRatio);
-      chosen = scored[0];
-    }
-    return { color: chosen.c, ratio: chosen.worstRatio, dominants };
+  // Random hue at high saturation/value — vivid and legible-ish without
+  // ever looking at the cover itself. Outline just goes black/white
+  // opposite the picked color (vmuOppositeNeutral), same as before.
+  function vmuRandomTextColor() {
+    return vmuHsvToRgb(Math.random(), 0.7 + Math.random() * 0.3, 0.85 + Math.random() * 0.15);
   }
 
   // ─── cover text-overlay editor: text layer rendering ───────────────────────────
@@ -2976,6 +2897,34 @@
   }
 
   // ─── auto-playlist flow ───────────────────────────────────────────────────────
+  // Queues a completed batch for runAutoPlaylist instead of calling it
+  // directly — a second batch (typically a retried track finishing upload
+  // while the first batch's dup-check/track-search is still in flight) gets
+  // its turn once the current one finishes rather than being silently
+  // dropped. `onSettled` runs once this specific batch is done, success or
+  // not (reloadAfterBatchIfNeeded at the call sites needs that).
+  function enqueueAutoPlaylist(items, onSettled) {
+    autoPlaylistQueue.push({ items, onSettled });
+    drainAutoPlaylistQueue();
+  }
+
+  async function drainAutoPlaylistQueue() {
+    if (autoPlaylistRunning) return;
+    autoPlaylistRunning = true;
+    try {
+      while (autoPlaylistQueue.length) {
+        const { items, onSettled } = autoPlaylistQueue.shift();
+        try {
+          await runAutoPlaylist(items);
+        } finally {
+          onSettled?.();
+        }
+      }
+    } finally {
+      autoPlaylistRunning = false;
+    }
+  }
+
   async function runAutoPlaylist(uploadedItems) {
     const done = uploadedItems.filter(i => i.status === 'done');
     if (!done.length) return;
@@ -3585,11 +3534,11 @@
     wrap.className = 'vmu-pl-sort-wrap';
     wrap.innerHTML = `
       <div class="vmu-pl-sort-row">
-        <span class="vmu-pl-sort-label">Сортировать как файлы${helpIcon('Включи и перетащи (или выбери) MP3-файлы в нужном порядке — расширение сопоставит их с треками плейлиста по имени и переставит треки в этом порядке. Несопоставленные треки остаются в конце, порядок между собой не меняют.')}</span>
-        <label class="vmu-toggle">
-          <input type="checkbox" id="vmu-pl-sort-toggle">
-          <span class="vmu-toggle-track"></span>
-        </label>
+        <span class="vmu-pl-sort-label">Порядок треков${helpIcon('Как файлы — включи и перетащи (или выбери) MP3-файлы в нужном порядке, расширение сопоставит их с треками плейлиста по имени и переставит в этом порядке; несопоставленные остаются в конце. Genius — ищет альбом на Genius по названию/исполнителю/году из строки названия плейлиста выше (можно поправить перед поиском, или вставить прямую ссылку genius.com/albums/...) и переставляет треки по его треклисту.')}</span>
+        <div class="vmu-pl-sort-switch" id="vmu-pl-sort-switch">
+          <button type="button" data-vmu-sortsrc="files">Как файлы</button>
+          <button type="button" data-vmu-sortsrc="genius">Genius</button>
+        </div>
       </div>
       <div id="vmu-pl-sort-dz" class="vmu-pl-sort-dz" style="display:none">
         <span class="vmu-pl-sort-dz-hint">Перетащи MP3 в нужном порядке</span>
@@ -3597,13 +3546,6 @@
           ${ICON_UPLOAD}
           Выбрать файлы
           <input type="file" class="vmu-pl-sort-input" accept=".mp3,audio/mpeg" multiple>
-        </label>
-      </div>
-      <div class="vmu-pl-sort-row">
-        <span class="vmu-pl-sort-label">Порядок с Genius${helpIcon('Ищет альбом на Genius по названию, исполнителю и году из строки названия плейлиста выше (можно поправить перед поиском) — либо вставь прямую ссылку на альбом genius.com/albums/... Клик по найденному альбому сразу подтягивает его треклист и переставляет треки плейлиста в этом порядке.')}</span>
-        <label class="vmu-toggle">
-          <input type="checkbox" id="vmu-pl-genius-toggle">
-          <span class="vmu-toggle-track"></span>
         </label>
       </div>
       <div id="vmu-pl-genius-panel" class="vmu-pl-genius-panel" style="display:none">
@@ -3616,7 +3558,6 @@
     `;
     anchor.insertAdjacentElement('afterend', wrap);
 
-    const toggle = wrap.querySelector('#vmu-pl-sort-toggle');
     const dz = wrap.querySelector('#vmu-pl-sort-dz');
     const fileInput = wrap.querySelector('.vmu-pl-sort-input');
 
@@ -3636,12 +3577,28 @@
       handleFiles(fileInput.files);
       fileInput.value = '';
     });
-    toggle.addEventListener('change', () => {
-      dz.style.display = toggle.checked ? '' : 'none';
+
+    // Either/or source switch — was two independent toggle rows (both could
+    // be left on at once, which made no sense since only one source's panel
+    // is ever acted on). One active source at a time; clicking the active
+    // one again turns it off.
+    const srcSwitch = wrap.querySelector('#vmu-pl-sort-switch');
+    let activeSortSrc = null;
+    function setActiveSortSrc(src) {
+      activeSortSrc = activeSortSrc === src ? null : src;
+      srcSwitch.querySelectorAll('button').forEach(b => {
+        b.classList.toggle('active', b.dataset.vmuSortsrc === activeSortSrc);
+      });
+      dz.style.display = activeSortSrc === 'files' ? '' : 'none';
+      gPanelToggle(activeSortSrc === 'genius');
+    }
+    srcSwitch.addEventListener('click', e => {
+      const btn = e.target.closest('button[data-vmu-sortsrc]');
+      if (!btn) return;
+      setActiveSortSrc(btn.dataset.vmuSortsrc);
     });
 
     // ── Genius block ──
-    const gToggle = wrap.querySelector('#vmu-pl-genius-toggle');
     const gPanel = wrap.querySelector('#vmu-pl-genius-panel');
     const gInput = wrap.querySelector('#vmu-pl-genius-q');
     const gGo = wrap.querySelector('#vmu-pl-genius-go');
@@ -3687,14 +3644,14 @@
 
     gGo.addEventListener('click', runGeniusSearch);
     gInput.addEventListener('keydown', e => { if (e.key === 'Enter') runGeniusSearch(); });
-    gToggle.addEventListener('change', () => {
-      gPanel.style.display = gToggle.checked ? '' : 'none';
-      if (gToggle.checked && !gPrefilled) {
+    function gPanelToggle(show) {
+      gPanel.style.display = show ? '' : 'none';
+      if (show && !gPrefilled) {
         gPrefilled = true;
         const titleInput = box.querySelector('input.ape_pl_input');
         gInput.value = parseGeniusQueryFromTitle(titleInput?.value).query;
       }
-    });
+    }
   }
 
   // ─── cover text-overlay editor: panel ───────────────────────────────────────────
@@ -3804,7 +3761,7 @@
             <span class="vmu-setting-label">Цвет текста</span>
             <div class="vmu-covered-color-cell">
               <input type="color" id="vmu-covered-textcolor" value="#ff0000">
-              <label class="vmu-rename-check"><input type="checkbox" id="vmu-covered-auto"><span>Авто</span></label>
+              <button type="button" id="vmu-covered-random" class="vmu-slider-reset" title="Случайный цвет">🎲</button>
             </div>
           </div>
           <div class="vmu-setting-row">
@@ -3830,8 +3787,6 @@
           ${vmuCoveredSliderRow('vmu-covered-scale', 'Масштаб, %', 10, 500, 1, 115, '')}
           ${vmuCoveredSliderRow('vmu-covered-opacity', 'Прозрачность', 0, 255, 1, 255, '')}
 
-          <div class="vmu-covered-info" id="vmu-covered-info"></div>
-
           <div class="vmu-covered-actions">
             <span class="vmu-covered-status" id="vmu-covered-status"></span>
             <button type="button" id="vmu-covered-download" class="vmu-rename-cleanup-btn" title="Скачать PNG">Скачать</button>
@@ -3846,7 +3801,7 @@
     panel.querySelector('#vmu-covered-close').addEventListener('click', () => panel.remove());
 
     const BASE = 1000;
-    const state = { baseCanvas: null, resultCanvas: null, dominants: null, customX: 500, customY: 500, renderTimer: null };
+    const state = { baseCanvas: null, resultCanvas: null, customX: 500, customY: 500, renderTimer: null };
 
     const canvas = panel.querySelector('#vmu-covered-canvas');
     const cctx = canvas.getContext('2d');
@@ -3860,7 +3815,7 @@
       outlineWidth: panel.querySelector('#vmu-covered-outlinewidth'),
       textColor: panel.querySelector('#vmu-covered-textcolor'),
       outlineColor: panel.querySelector('#vmu-covered-outlinecolor'),
-      auto: panel.querySelector('#vmu-covered-auto'),
+      random: panel.querySelector('#vmu-covered-random'),
       position: panel.querySelector('#vmu-covered-position'),
       customRow: panel.querySelector('#vmu-covered-custom-row'),
       x: panel.querySelector('#vmu-covered-x'),
@@ -3868,7 +3823,6 @@
       rotation: panel.querySelector('#vmu-covered-rotation'),
       scale: panel.querySelector('#vmu-covered-scale'),
       opacity: panel.querySelector('#vmu-covered-opacity'),
-      info: panel.querySelector('#vmu-covered-info'),
       apply: panel.querySelector('#vmu-covered-apply'),
       download: panel.querySelector('#vmu-covered-download'),
       status: panel.querySelector('#vmu-covered-status'),
@@ -3896,27 +3850,8 @@
       els.status.style.color = isError ? '#e64646' : '';
     }
 
-    function updateInfo(textColor, outlineColor, ratio) {
-      if (!textColor) {
-        els.info.innerHTML = '<div class="vmu-covered-info-empty">Введите текст, чтобы увидеть подбор цвета и контраст</div>';
-        return;
-      }
-      const bg = vmuAverageColor(state.baseCanvas);
-      const mark = ok => ok ? '✅' : '❌';
-      els.info.innerHTML = `
-        <div class="vmu-covered-swatches">
-          <span class="vmu-covered-swatch" style="background:${vmuRgbToHex(bg)}" title="Фон"></span>
-          <span class="vmu-covered-swatch" style="background:${vmuRgbToHex(textColor)}" title="Текст"></span>
-          <span class="vmu-covered-swatch" style="background:${vmuRgbToHex(outlineColor)}" title="Обводка"></span>
-          <span class="vmu-covered-swatches-hex">${vmuRgbToHex(bg)} · ${vmuRgbToHex(textColor)} · ${vmuRgbToHex(outlineColor)}</span>
-        </div>
-        <div class="vmu-covered-contrast">Контраст текста: ${ratio.toFixed(2)} : 1 — AA ${mark(ratio >= VMU_WCAG_AA_NORMAL)} · AA крупный ${mark(ratio >= VMU_WCAG_AA_LARGE)} · AAA ${mark(ratio >= VMU_WCAG_AAA_NORMAL)}</div>
-      `;
-    }
-
     function render() {
       if (!state.baseCanvas) return;
-      if (!state.dominants) state.dominants = vmuDominantColors(state.baseCanvas);
 
       const text = els.text.value;
       const fontFamily = els.font.value;
@@ -3927,18 +3862,8 @@
       const opacity = Number(els.opacity.value);
       const position = els.position.value;
 
-      let textColor, outlineColor, ratio = null;
-      if (els.auto.checked) {
-        const picked = vmuPickContrastingColor(state.dominants);
-        textColor = picked.color;
-        outlineColor = vmuOppositeNeutral(textColor);
-        ratio = picked.ratio;
-        els.textColor.value = vmuRgbToHex(textColor);
-        els.outlineColor.value = vmuRgbToHex(outlineColor);
-      } else {
-        textColor = vmuHexToRgb(els.textColor.value);
-        outlineColor = vmuHexToRgb(els.outlineColor.value);
-      }
+      const textColor = vmuHexToRgb(els.textColor.value);
+      const outlineColor = vmuHexToRgb(els.outlineColor.value);
 
       let resultCanvas = state.baseCanvas;
       if (text.trim() && fontFamily) {
@@ -3953,10 +3878,6 @@
         octx.drawImage(state.baseCanvas, 0, 0);
         octx.drawImage(layer, px, py);
         resultCanvas = out;
-        if (ratio === null) ratio = vmuContrastRatio(textColor, vmuAverageColor(state.baseCanvas));
-        updateInfo(textColor, outlineColor, ratio);
-      } else {
-        updateInfo(null);
       }
 
       state.resultCanvas = resultCanvas;
@@ -3972,7 +3893,6 @@
           c.width = BASE; c.height = BASE;
           c.getContext('2d').drawImage(img, 0, 0, BASE, BASE);
           state.baseCanvas = c;
-          state.dominants = null;
           resolve();
         };
         img.onerror = () => reject(new Error('не удалось загрузить изображение'));
@@ -3995,10 +3915,10 @@
 
     els.text.addEventListener('input', () => scheduleRender());
     els.font.addEventListener('change', () => scheduleRender());
-    els.auto.addEventListener('change', () => {
-      const manual = !els.auto.checked;
-      els.textColor.disabled = !manual;
-      els.outlineColor.disabled = !manual;
+    els.random.addEventListener('click', () => {
+      const textColor = vmuRandomTextColor();
+      els.textColor.value = vmuRgbToHex(textColor);
+      els.outlineColor.value = vmuRgbToHex(vmuOppositeNeutral(textColor));
       scheduleRender();
     });
     els.textColor.addEventListener('input', () => scheduleRender());
@@ -4093,7 +4013,7 @@
       setStatus('Ставим обложку плейлиста…');
       try {
         await uploadCoverViaDialog(blob);
-        setStatus('✓ Обложка применена');
+        setStatus('Обложка применена');
         showToast('Обложка плейлиста обновлена');
       } catch (err) {
         setStatus(err.message || 'ошибка', true);
@@ -5680,8 +5600,17 @@
     // still false and each create their own playlist. Checking-and-setting
     // here, with no await in between, closes that race (single-threaded JS
     // runs this synchronous prefix to completion before yielding).
-    const shouldTrackPlaylist = settings.autoPlaylist && !autoPlaylistRunning;
-    if (shouldTrackPlaylist) autoPlaylistRunning = true;
+    //
+    // autoPlaylistClaimed is released as soon as THIS batch is either
+    // dropped or hand off to enqueueAutoPlaylist below — it only needs to
+    // survive the synchronous prefix above, not the whole upload+dup-check+
+    // track-search pipeline. Holding it that long is what used to silently
+    // swallow a retried track that finished uploading while an earlier
+    // batch's runAutoPlaylist was still busy: the retry's own synchronous
+    // check saw the flag still held, decided not to track, and its tracks
+    // never got fed into auto-playlist at all.
+    const shouldTrackPlaylist = settings.autoPlaylist && !autoPlaylistClaimed;
+    if (shouldTrackPlaylist) autoPlaylistClaimed = true;
     const startCountEarly = shouldTrackPlaylist ? getPageTrackCount() : null;
 
     const items = [];
@@ -5723,11 +5652,14 @@
       showProgressToast('Ждём подтверждения загрузки…', { id: 'vmu-autoplaylist' });
       waitForTrackCountIncrease(startCount, items.length)
         .then(gained => {
-          if (gained > 0) return runAutoPlaylist(batchItems);
+          autoPlaylistClaimed = false; // decided — a new upload can claim the next slot now
+          if (gained > 0) { enqueueAutoPlaylist(batchItems); return; }
           showProgressToast('Ошибка: загрузка не подтвердилась, плейлист не создан', { id: 'vmu-autoplaylist', kind: 'error' });
         })
-        .catch(err => showProgressToast(`Ошибка: ${translateError(err.message)}`, { id: 'vmu-autoplaylist', kind: 'error' }))
-        .finally(() => { autoPlaylistRunning = false; });
+        .catch(err => {
+          autoPlaylistClaimed = false;
+          showProgressToast(`Ошибка: ${translateError(err.message)}`, { id: 'vmu-autoplaylist', kind: 'error' });
+        });
     }
   }
 
@@ -5741,7 +5673,7 @@
       handoffFilesNatively(files);
       return;
     }
-    autoPlaylistRunning = false;
+    autoPlaylistClaimed = false;
     files.forEach(f => {
       const item = { id: ++itemIdCounter, file: f, status: 'pending', errorMsg: null, tags: {}, progress: 0 };
       fileQueue.push(item);
@@ -7305,14 +7237,14 @@
     if (!pending.length) {
       renderQueue();
       if (fileQueue.length > 0 && !fileQueue.some(f => f.status === 'uploading')) {
-        // Trigger auto-playlist if enabled (once per completed batch)
-        if (settings.autoPlaylist && !autoPlaylistRunning) {
-          autoPlaylistRunning = true;
-          runAutoPlaylist([...fileQueue]).finally(() => {
-            autoPlaylistRunning = false;
-            reloadAfterBatchIfNeeded();
-          });
-        } else if (!autoPlaylistRunning) {
+        // Trigger auto-playlist if enabled (once per completed batch) — always
+        // enqueued, never gated on !autoPlaylistRunning: that used to drop a
+        // batch that completed while an earlier one's runAutoPlaylist was
+        // still busy (see enqueueAutoPlaylist above) instead of giving it a
+        // turn once the current one finishes.
+        if (settings.autoPlaylist) {
+          enqueueAutoPlaylist([...fileQueue], reloadAfterBatchIfNeeded);
+        } else {
           reloadAfterBatchIfNeeded();
         }
       }
@@ -8881,7 +8813,9 @@
       lastHref = location.href;
       _pendingDupesPlaylist = null;
       fileQueue = [];
+      autoPlaylistClaimed = false;
       autoPlaylistRunning = false;
+      autoPlaylistQueue = [];
       isProcessing = false;
       uploadDoneCallbacks.clear();
       uploadingItemsByName.clear();

@@ -2344,23 +2344,32 @@
     });
   }
 
-  function findCropSaveBtn() {
-    // Try known class names
+  // All candidate "confirm" buttons a real crop popup's save button could be
+  // — same three tiers as before, just split out so injectCoverFile can
+  // snapshot what already matches BEFORE the cover file is even set (see
+  // watchCropAndConfirm below for why that snapshot matters).
+  function findCropSaveBtnCandidates() {
+    const found = [];
     for (const sel of ['.photo_crop_button_save', '[class*="cropSave"]', '[class*="crop_save"]']) {
-      const btn = document.querySelector(sel);
-      if (btn) return btn;
+      document.querySelectorAll(sel).forEach(b => found.push(b));
     }
-    // Fallback: find button with "Сохранить" text inside crop/photo dialogs
     for (const btn of document.querySelectorAll('button, .FlatButton')) {
       const txt = (btn.textContent || '').trim();
       if (txt === 'Сохранить' && btn.closest('[class*="crop"], [class*="photo_editor"], .pv_save_btn, .popup_box_container')) {
-        return btn;
+        found.push(btn);
       }
     }
     // Last resort: any "Сохранить и продолжить" or "Сохранить" inside a popup that appeared after cover
     for (const btn of document.querySelectorAll('.popup_box_container button, .box_layout button')) {
       const txt = (btn.textContent || '').trim();
-      if (txt.includes('Сохран') && btn.offsetParent !== null) return btn;
+      if (txt.includes('Сохран') && btn.offsetParent !== null) found.push(btn);
+    }
+    return found;
+  }
+
+  function findCropSaveBtn(excludeBtns) {
+    for (const btn of findCropSaveBtnCandidates()) {
+      if (!excludeBtns || !excludeBtns.has(btn)) return btn;
     }
     return null;
   }
@@ -3064,11 +3073,23 @@
     if (!coverEl) { window.postMessage({ type: 'VK_COVER_DONE', ok: false, error: 'ape_cover не найден' }, '*'); return; }
 
     const setFile = input => {
+      // Snapshot every button that already looks like a crop-confirm button
+      // BEFORE the change event fires — verified live: our own generated
+      // covers are always pre-cropped to exactly 1000×1000, so VK never
+      // shows a real crop popup for them, and findCropSaveBtn's own
+      // last-resort tier ("any visible 'Сохранить' inside a popup/box")
+      // then matches the PLAYLIST EDIT DIALOG'S OWN Save button instead —
+      // that dialog sits inside .box_layout too. Without this exclusion,
+      // watchCropAndConfirm clicked that button ~400ms after setting the
+      // cover, silently closing/saving the whole edit dialog as a side
+      // effect of "set a cover" — exactly the flaky "иногда не грузится"
+      // behavior this fixes.
+      const preExisting = new Set(findCropSaveBtnCandidates());
       const dt = new DataTransfer();
       dt.items.add(coverFile);
       input.files = dt.files;
       input.dispatchEvent(new Event('change', { bubbles: true }));
-      watchCropAndConfirm();
+      watchCropAndConfirm(preExisting);
     };
 
     const existingInput = coverEl.querySelector('input[type="file"]');
@@ -3086,12 +3107,21 @@
     }, 200);
   }
 
-  function watchCropAndConfirm() {
+  function watchCropAndConfirm(excludeBtns) {
+    // Every cover this extension ever generates (the auto-playlist cover and
+    // the "Обложка с текстом" editor's canvas alike) is composited to
+    // exactly 1000×1000 — verified live: VK never shows a real crop popup
+    // for an already-square image, so the "found nothing new, give up"
+    // branch below is really the NORMAL path, not a timeout. It used to be
+    // 25×400ms (10s) "just in case", which meant a needless 10-second hang
+    // on every single cover apply; short enough now to stay responsive
+    // while still giving a genuine (if unseen in practice) crop popup a
+    // couple of seconds to mount.
     let n = 0;
     const t = setInterval(() => {
-      const btn = findCropSaveBtn();
+      const btn = findCropSaveBtn(excludeBtns);
       if (btn) { btn.click(); clearInterval(t); setTimeout(() => window.postMessage({ type: 'VK_COVER_DONE', ok: true }, '*'), 2000); return; }
-      if (++n >= 25) { clearInterval(t); window.postMessage({ type: 'VK_COVER_DONE', ok: true }, '*'); }
+      if (++n >= 6) { clearInterval(t); window.postMessage({ type: 'VK_COVER_DONE', ok: true }, '*'); }
     }, 400);
   }
 

@@ -228,6 +228,33 @@ html.vmu-theme-light {
   font-weight: 500;
 }
 .vmu-pl-sort-row .vmu-toggle { margin: 0; }
+/* Either/or source switch — same visual language as .vmu-fx-ab-switch
+   (A/B compare), just auto-width text buttons instead of fixed-width
+   letters, since "Как файлы"/"Genius" replaced two independent toggle
+   rows that could both be left on with no real meaning to that state. */
+.vmu-pl-sort-switch {
+  display: flex;
+  gap: 2px;
+  background: rgba(var(--vmu-ov),0.06);
+  border-radius: 6px;
+  padding: 2px;
+  flex-shrink: 0;
+}
+.vmu-pl-sort-switch button {
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--vmu-text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .12s, color .12s;
+}
+.vmu-pl-sort-switch button:hover { color: var(--vmu-text-2); }
+.vmu-pl-sort-switch button.active { background: rgba(38,136,235,0.85); color: #fff; }
 .vmu-pl-sort-dz {
   display: flex;
   align-items: center;
@@ -1715,7 +1742,6 @@ html.vmu-theme-light {
   background: none;
   cursor: pointer;
 }
-.vmu-covered-body input[type="color"]:disabled { opacity: 0.45; cursor: default; }
 .vmu-covered-xy { display: flex; gap: 6px; }
 .vmu-covered-xy input[type="number"] {
   width: 64px;
@@ -1727,12 +1753,6 @@ html.vmu-theme-light {
   font-family: inherit;
   padding: 5px 6px;
 }
-.vmu-covered-info { padding: 8px 10px; border-radius: 8px; background: rgba(var(--vmu-ov),0.04); font-size: 11px; }
-.vmu-covered-info-empty { color: var(--vmu-text-hint-2); }
-.vmu-covered-swatches { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
-.vmu-covered-swatch { width: 14px; height: 14px; border-radius: 4px; border: 1px solid rgba(var(--vmu-ov),0.2); flex-shrink: 0; }
-.vmu-covered-swatches-hex { color: var(--vmu-text-dim); margin-left: 2px; }
-.vmu-covered-contrast { margin-top: 5px; color: var(--vmu-text-2); }
 .vmu-covered-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .vmu-covered-actions .vmu-pick-btn { margin-left: auto; }
 .vmu-covered-status { font-size: 11px; color: var(--vmu-text-dim); }
@@ -2728,6 +2748,7 @@ html.vmu-theme-light .vmu-fx-preset-saveform {
 html.vmu-theme-light .vmu-mode-switch,
 html.vmu-theme-light .vmu-audiofx-tabs,
 html.vmu-theme-light .vmu-fx-ab-switch,
+html.vmu-theme-light .vmu-pl-sort-switch,
 html.vmu-theme-light .vmu-fx-preset-cat,
 html.vmu-theme-light .vmu-fx-preset-tag,
 html.vmu-theme-light .vmu-check-copy,
