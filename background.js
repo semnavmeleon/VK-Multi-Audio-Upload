@@ -70,6 +70,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'VKD_SCAN_PLAYLIST_TRACKS') {
+    scanPlaylistTracksInHiddenTab(msg.url, sender.tab?.windowId)
+      .then(sendResponse)
+      .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+
   return false;
 });
 
@@ -375,6 +382,34 @@ async function scanPlaylistsInHiddenTab(url, originalWindowId) {
     const result = await sendMessageWithRetry(tabId, { type: 'VMU_SCAN_PLAYLISTS' }, 30000);
     if (!result.ok) throw new Error(result.error || 'scan_failed');
     return { ok: true, playlists: result.playlists || [] };
+  } finally {
+    chrome.windows.remove(win.id).catch(() => {});
+  }
+}
+
+// Same hidden-window trick as scanPlaylistsInHiddenTab above, pointed at a
+// single playlist's own shareable URL (vk.ru/music/playlist/<owner>_<id>)
+// instead of the owner's /audios list — content.js auto-injected there reads
+// the real rendered track rows off the page (expandPlaylistModal, scoped to
+// document.body since this URL renders the playlist as a full page, not a
+// modal) rather than going through VK's internal API client, which is the
+// same reliability trade-off scanPlaylistsInHiddenTab already made for the
+// duplicate-playlist scan.
+async function scanPlaylistTracksInHiddenTab(url, originalWindowId) {
+  if (!url) throw new Error('scan_no_url');
+  const win = await chrome.windows.create({
+    url, focused: false, state: 'minimized', type: 'popup',
+  });
+  if (originalWindowId != null) {
+    chrome.windows.update(originalWindowId, { focused: true }).catch(() => {});
+  }
+  const tabId = win.tabs?.[0]?.id;
+  try {
+    if (!tabId) throw new Error('scan_window_no_tab');
+    await waitForTabComplete(tabId, 20000);
+    const result = await sendMessageWithRetry(tabId, { type: 'VMU_SCAN_PLAYLIST_TRACKS' }, 30000);
+    if (!result.ok) throw new Error(result.error || 'scan_failed');
+    return { ok: true, tracks: result.tracks || [] };
   } finally {
     chrome.windows.remove(win.id).catch(() => {});
   }

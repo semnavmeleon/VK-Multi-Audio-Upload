@@ -25,7 +25,7 @@
     },
     {
       "matches": ["https://vk.com/*", "https://vk.ru/*"],
-      "js": ["content.js"],
+      "js": ["lame.min.js", "content.js"],
       "css": ["style.css"],
       "run_at": "document_idle"
     },

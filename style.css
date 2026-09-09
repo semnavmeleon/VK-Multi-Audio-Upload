@@ -1463,6 +1463,8 @@ html.vmu-theme-light {
 .vmu-bulkops-body { padding: 10px 0; overflow-y: auto; }
 .vmu-bulkops-scan-status { padding: 6px 12px 10px; font-size: 12px; color: var(--vmu-text-dim); }
 .vmu-parsedorder-panel { left: 24px; right: auto; width: 360px; }
+.vmu-geniusfind-panel { left: 24px; right: auto; width: 380px; }
+.vmu-geniusfind-panel .vmu-parsedorder-row input[type="checkbox"] { flex-shrink: 0; accent-color: #2688eb; }
 /* Wider than the base .vmu-bulkops-panel — settings' 3-column grid rows
    (.vmu-settings-section) need more room than a typical list panel. */
 .vmu-settings-modal { width: 440px; }
@@ -2965,3 +2967,167 @@ html.vmu-theme-light .vmu-notice { border: 1px solid rgba(0,0,0,0.1); }
 .vmu-notice-text { font-size: 13px; line-height: 1.4; word-break: break-word; }
 .vmu-notice-bar { height: 4px; background: rgba(var(--vmu-ov),0.12); border-radius: 2px; overflow: hidden; }
 .vmu-notice-bar-fill { height: 100%; background: #2688eb; transition: width .18s ease; }
+
+/* ── Settings tabs ─────────────────────────────────────────────────────────── */
+.vmu-settings-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 16px 0;
+  border-bottom: 1px solid rgba(var(--vmu-ov),0.1);
+  flex-shrink: 0;
+}
+.vmu-settings-tab {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--vmu-text-muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 6px 12px 8px;
+  cursor: pointer;
+  border-radius: 6px 6px 0 0;
+  transition: color .15s, background .15s, border-color .15s;
+  margin-bottom: -1px;
+}
+.vmu-settings-tab:hover { color: var(--vmu-text); background: rgba(var(--vmu-ov),0.05); }
+.vmu-settings-tab.active { color: #2688eb; border-bottom-color: #2688eb; background: none; }
+
+/* ── Slim group panels ─────────────────────────────────────────────────────── */
+.vmu-slim-group {
+  grid-column: 1 / -1;
+  border: 1px solid rgba(var(--vmu-ov),0.1);
+  border-radius: 8px;
+  margin-bottom: 6px;
+  transition: opacity .15s;
+}
+.vmu-slim-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: rgba(var(--vmu-ov),0.03);
+  border-bottom: 1px solid rgba(var(--vmu-ov),0.07);
+  border-radius: 7px 7px 0 0;
+}
+.vmu-slim-group-head .vmu-setting-label { font-size: 12px; font-weight: 600; flex: 1; }
+.vmu-slim-group-body { padding: 2px 0; }
+.vmu-slim-group-body .vmu-setting-row { padding: 5px 10px; }
+.vmu-slim-group-body.vmu-row-disabled { opacity: 0.38; pointer-events: none; }
+
+/* ── Slim text input ───────────────────────────────────────────────────────── */
+.vmu-slim-text-input {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--vmu-text);
+  background: rgba(var(--vmu-ov),0.06);
+  border: 1px solid rgba(var(--vmu-ov),0.14);
+  border-radius: 6px;
+  padding: 5px 9px;
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+  transition: border-color .15s, background .15s;
+}
+.vmu-slim-text-input:focus { border-color: #2688eb; background: rgba(var(--vmu-ov),0.04); }
+.vmu-slim-text-input::placeholder { color: var(--vmu-text-hint-2); }
+
+/* ── SJ Constructor ─────────────────────────────────────────────────────────── */
+.vmu-slim-sj-presets { display:flex; flex-wrap:wrap; align-items:center; gap:4px; padding:6px 10px 4px; }
+.vmu-slim-preset-btn {
+  font-size:10px; padding:2px 7px; border-radius:4px; border:1px solid rgba(var(--vmu-ov),0.25);
+  background:rgba(var(--vmu-ov),0.08); color:var(--vmu-text); cursor:pointer;
+  transition:background .12s;
+}
+.vmu-slim-preset-btn:hover { background:rgba(var(--vmu-ov),0.18); }
+.vmu-slim-sj-table-hdr {
+  display:grid; grid-template-columns:1fr 1fr 1fr 28px;
+  padding:3px 10px; font-size:10px; color:var(--vmu-text-hint-2); text-align:center;
+  border-bottom:1px solid rgba(var(--vmu-ov),0.1);
+}
+.vmu-slim-sj-row {
+  display:grid; grid-template-columns:1fr 1fr 1fr 28px;
+  align-items:center; gap:4px; padding:3px 10px;
+  border-bottom:1px solid rgba(var(--vmu-ov),0.06);
+}
+.vmu-slim-sj-num {
+  width:100%; padding:3px 5px; font-size:11px; text-align:center;
+  border:1px solid rgba(var(--vmu-ov),0.2); border-radius:4px;
+  background:rgba(var(--vmu-ov),0.06); color:var(--vmu-text);
+  box-sizing:border-box;
+}
+.vmu-slim-sj-num:focus { border-color:#2688eb; outline:none; }
+.vmu-slim-sj-del-btn {
+  width:22px; height:22px; border-radius:4px; border:none; cursor:pointer; font-size:11px;
+  background:rgba(200,60,60,0.15); color:#e06060; display:flex; align-items:center; justify-content:center;
+}
+.vmu-slim-sj-del-btn:hover { background:rgba(200,60,60,0.3); }
+#vmu-slim-sj-add-row {
+  width:100%; padding:5px 0; margin-top:4px; font-size:11px; cursor:pointer;
+  border:1px dashed rgba(var(--vmu-ov),0.25); border-radius:4px;
+  background:transparent; color:var(--vmu-text-hint-2);
+}
+#vmu-slim-sj-add-row:hover { background:rgba(var(--vmu-ov),0.08); color:var(--vmu-text); }
+
+/* ── Slim processing status ────────────────────────────────────────────────
+   Embedded directly into the native VK upload dialog in place of our own
+   #vmu-dropzone (see showSlimProcessingUI) instead of a page-covering
+   overlay, so it reads as part of that panel rather than a separate popup
+   stacked on top of it. .vmu-slim-processing-floating is only used as a
+   fallback when no dialog is mounted to embed into. */
+.vmu-slim-processing {
+  margin: 10px 0;
+  padding: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.vmu-slim-processing-floating {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 99999;
+  background: var(--vmu-panel-bg);
+  border-radius: 12px;
+  padding: 20px 24px 22px;
+  min-width: 280px;
+  max-width: 380px;
+  width: 90vw;
+  margin: 0;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.35);
+}
+.vmu-slim-processing-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--vmu-text);
+}
+.vmu-slim-processing-file {
+  font-size: 12px;
+  color: var(--vmu-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-height: 16px;
+}
+/* Thin flat bar matching VK's own native progress indicators elsewhere in
+   this file (see .vmu-progress / .vmu-dlp-bar) — 2px, no thumb, blue fill —
+   rather than the taller custom-styled bar this used to be. */
+.vmu-slim-track {
+  height: 2px;
+  background: rgba(var(--vmu-ov),0.1);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.vmu-slim-fill {
+  height: 100%;
+  width: 0%;
+  background: #2688eb;
+  border-radius: 1px;
+  transition: width .2s ease;
+}
+.vmu-slim-counter {
+  font-size: 11px;
+  color: var(--vmu-text-hint-2);
+  text-align: right;
+}

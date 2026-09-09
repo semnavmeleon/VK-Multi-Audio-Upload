@@ -1193,6 +1193,32 @@
         break;
       }
 
+      // Manual "find on Genius, review, then pick what to add" flow — opens
+      // the picker and reports matches without touching anything (see
+      // findTracksInCommunityListDryRun above for why: content.js needs to
+      // show the user a review panel before any track gets ticked).
+      case 'VK_FIND_TRACKS_IN_COMMUNITY': {
+        const { playlistId, trackNames, reqId } = e.data;
+        (async () => {
+          const dialog = await openAddTracksPicker(playlistId);
+          return findTracksInCommunityListDryRun(dialog, trackNames || []);
+        })()
+          .then(({ matches, unmatched }) => window.postMessage({ type: 'VK_FIND_TRACKS_IN_COMMUNITY_DONE', ok: true, reqId, matches, unmatched }, '*'))
+          .catch(err => window.postMessage({ type: 'VK_FIND_TRACKS_IN_COMMUNITY_DONE', ok: false, reqId, error: err.message }, '*'));
+        break;
+      }
+
+      // Second half of the manual flow: the user has reviewed the matches
+      // VK_FIND_TRACKS_IN_COMMUNITY found and picked a subset — tick exactly
+      // those and save.
+      case 'VK_CONFIRM_ADD_TRACKS_FROM_COMMUNITY': {
+        const { playlistId, audioIds, reqId } = e.data;
+        confirmAddTracksFromCommunity(playlistId, audioIds || [])
+          .then(selectedCount => window.postMessage({ type: 'VK_CONFIRM_ADD_TRACKS_FROM_COMMUNITY_DONE', ok: true, reqId, selectedCount }, '*'))
+          .catch(err => window.postMessage({ type: 'VK_CONFIRM_ADD_TRACKS_FROM_COMMUNITY_DONE', ok: false, reqId, error: err.message }, '*'));
+        break;
+      }
+
       case 'VK_REMOVE_FROM_PLAYLIST': {
         const { ownerId, playlistId, audioId } = e.data;
         callAlAudio('remove_from_playlist', {
@@ -2628,7 +2654,12 @@
   // Returns the number of tracks VK's own picker actually matched and
   // ticked. 0 is a real "nothing was added" outcome — the caller must treat
   // it as failure, not success.
-  async function addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames) {
+  // Opens the edit dialog for `playlistId` and reveals its "Добавить
+  // аудиозаписи" picker, waiting until it's actually populated (not just
+  // mounted) — the shared prefix behind both addTracksToExistingPlaylistViaUI
+  // (which then ticks+saves matches) and the manual find-in-community-catalog
+  // flow (which only wants to read the list, not touch it yet).
+  async function openAddTracksPicker(playlistId) {
     // Same "APE state" staleness createPlaylistViaUI already works around
     // before its own addTracksViaEditDialog call: VK's "Добавить
     // аудиозаписи" picker reads an in-memory audio list that doesn't yet
@@ -2696,6 +2727,11 @@
     })();
     if (!opened) throw new Error('audio_item_list_not_found');
 
+    return dialog;
+  }
+
+  async function addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames) {
+    const dialog = await openAddTracksPicker(playlistId);
     const selectedCount = await selectTracksFromCommunityList(dialog, trackNames);
     await pause(300);
 
@@ -2727,6 +2763,15 @@
     // Also try full text if selectors don't match
     const fullText = normalizeStr(item.textContent || '');
     return { title, artist, fullText };
+  }
+
+  // Same selectors as getItemText, but without normalizeStr — for surfacing
+  // an item's real display text to the user (the manual find-and-add
+  // review panel) rather than the lowercased/stripped form matching uses.
+  function getItemDisplayText(item) {
+    const titleEl = item.querySelector('.audio_row__title_inner, .ai_title, [class*="audio_title"]');
+    const artistEl = item.querySelector('.audio_row__performers, .ai_artist, [class*="audio_artist"]');
+    return { title: (titleEl?.textContent || '').trim(), artist: (artistEl?.textContent || '').trim() };
   }
 
   function levenshtein(a, b) {
@@ -2940,6 +2985,89 @@
     }
     console.log('[vmu] Selected', matched.size, 'of', trackNames.length, 'tracks from community list');
     return matched.size;
+  }
+
+  // Extracts the stable ownerId_audioId pair VK stamps into every add-audios
+  // picker row's own audio-row element as a class, e.g.
+  // "_audio_row_-206614096_456241117" (verified live). Used as a handle
+  // that survives round-tripping to content.js and back — the picker row
+  // can be re-located by this id string later (dialog.querySelector with a
+  // [class*=] match) without holding onto the DOM node itself across
+  // whatever pause the user takes to review results.
+  function getItemAudioId(item) {
+    const row = item.querySelector('[class*="_audio_row_"]');
+    const m = row?.className.match(/_audio_row_(-?\d+_\d+)/);
+    return m ? m[1] : null;
+  }
+
+  // Dry-run sibling of selectTracksFromCommunityList above: same scroll/
+  // claim loop over the community's whole catalog, but records a match
+  // instead of clicking .ape_check — used by the manual "find on Genius,
+  // review, then pick what to add" flow, which must show the user what it
+  // found before touching anything. Skips already-ape_selected items for
+  // the same reason the live function does: a track ticked for an unrelated
+  // reason shouldn't register as a fresh "found" match.
+  async function findTracksInCommunityListDryRun(dialog, trackNames) {
+    const remaining = new Set(trackNames);
+    const matches = [];
+    let scannedFrom = 0;
+    for (;;) {
+      const items = ownAudioItems(dialog);
+      for (let i = scannedFrom; i < items.length && remaining.size; i++) {
+        const item = items[i];
+        if (item.classList.contains('ape_selected')) continue;
+        const itemText = getItemText(item);
+        for (const trackName of remaining) {
+          if (trackMatchesItem(trackName, itemText)) {
+            const display = getItemDisplayText(item);
+            matches.push({
+              audioId: getItemAudioId(item),
+              artist: display.artist, title: display.title,
+              entryArtist: trackName.artist, entryTitle: trackName.title,
+            });
+            remaining.delete(trackName);
+            break;
+          }
+        }
+      }
+      scannedFrom = items.length;
+      if (!remaining.size) break;
+      if (!await loadMoreOwnItems(dialog)) break;
+    }
+    return { matches, unmatched: [...remaining] };
+  }
+
+  // Re-locates the add-audios picker fresh — no reference to the dialog/item
+  // DOM nodes is held across the user's review pause, since that pause is
+  // unbounded and the picker could in principle have re-rendered. Ticks
+  // exactly the given audioIds and saves. A few individually-unlocatable ids
+  // are skipped (not fatal, mirrors the "0 selected = real failure"
+  // convention addTracksToExistingPlaylistViaUI already uses) — only throws
+  // if the dialog itself is gone, or if none of the requested ids could be
+  // found at all.
+  async function confirmAddTracksFromCommunity(playlistId, audioIds) {
+    const dialog = getEditPlaylistBox()?.querySelector('.audio_pl_edit_box') || null;
+    if (!dialog) throw new Error('dialog_closed');
+
+    let selectedCount = 0;
+    for (const id of audioIds) {
+      const row = dialog.querySelector(`[class*="_audio_row_${id}"]`);
+      const item = row?.closest('._ape_audio_item');
+      if (!item || item.classList.contains('ape_selected')) continue;
+      const chk = item.querySelector('.ape_check') || item;
+      chk.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      selectedCount++;
+      await pause(150);
+    }
+    if (!selectedCount) throw new Error('no_matches_relocated');
+
+    const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
+    const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
+    if (!saveBtn) throw new Error('save_btn_not_found');
+    saveBtn.click();
+    await pause(1500);
+
+    return selectedCount;
   }
 
   // Primary: find newly created playlist by title in DOM.

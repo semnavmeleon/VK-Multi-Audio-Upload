@@ -203,7 +203,17 @@
   // (freq) / wheel (q, bandwidth).
   const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   const EQ_DEFAULT_Q = 1.41; // RBJ-cookbook default — matches BiquadFilterNode's own peaking-EQ default
-  let settings = { autoPlaylist: false, dupPlaylistCheck: true, autoAddToExistingPlaylist: true, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A' };
+  let settings = { autoPlaylist: false, dupPlaylistCheck: true, autoAddToExistingPlaylist: true, geniusValidateAutoAdd: true, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A',
+    slimEnabled: false,
+    slimSj: true, slimSjCount: 5, slimSjAtt: 15.0, slimSjNoise: true,
+    slimSjMode: 0, slimSjAdaptive: false, slimSjTemporal: false, slimSjBoost: false, slimSjManualFilters: [],
+    slimRd: true, slimRdAmount: 2, slimRdVar: true,
+    slimDc: true, slimDcVal: 0.000005,
+    slimMp: true, slimMpCents: 4.0, slimMpRand: true,
+    slimBd: true, slimBdType: 0,
+    slimBitrate: 320, slimVolume: 100,
+    slimPreserveMeta: true, slimPreserveCover: true,
+    slimCommunityTag: false, slimCommunityTagText: '' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -282,6 +292,7 @@
         autoPlaylist: settings.autoPlaylist,
         dupPlaylistCheck: settings.dupPlaylistCheck,
         autoAddToExistingPlaylist: settings.autoAddToExistingPlaylist,
+        geniusValidateAutoAdd: settings.geniusValidateAutoAdd,
         coverDataUrl: settings.coverDataUrl,
         autoMeta: settings.autoMeta,
         autoCoverFromId3: settings.autoCoverFromId3,
@@ -298,6 +309,19 @@
         audioFxCurrentPreset: settings.audioFxCurrentPreset,
         audioFxAB: settings.audioFxAB,
         audioFxABActive: settings.audioFxABActive,
+        slimEnabled: settings.slimEnabled,
+        slimSj: settings.slimSj, slimSjCount: settings.slimSjCount,
+        slimSjAtt: settings.slimSjAtt, slimSjNoise: settings.slimSjNoise,
+        slimSjMode: settings.slimSjMode, slimSjAdaptive: settings.slimSjAdaptive,
+        slimSjTemporal: settings.slimSjTemporal, slimSjBoost: settings.slimSjBoost,
+        slimSjManualFilters: settings.slimSjManualFilters,
+        slimRd: settings.slimRd, slimRdAmount: settings.slimRdAmount, slimRdVar: settings.slimRdVar,
+        slimDc: settings.slimDc, slimDcVal: settings.slimDcVal,
+        slimMp: settings.slimMp, slimMpCents: settings.slimMpCents, slimMpRand: settings.slimMpRand,
+        slimBd: settings.slimBd, slimBdType: settings.slimBdType,
+        slimBitrate: settings.slimBitrate, slimVolume: settings.slimVolume,
+        slimPreserveMeta: settings.slimPreserveMeta, slimPreserveCover: settings.slimPreserveCover,
+        slimCommunityTag: settings.slimCommunityTag, slimCommunityTagText: settings.slimCommunityTagText,
       };
       for (const key of AUDIOFX_FIELD_KEYS) out[key] = settings[key];
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(out));
@@ -2746,11 +2770,31 @@
       .filter(p => p.id && p.title);
   }
 
+  // Harvests the current page's own track list — used when this content
+  // script is running inside the hidden tab scanPlaylistTracksInHiddenTab
+  // (background.js) opened at a playlist's own vk.ru/music/playlist/<id>
+  // URL, which renders the full track list directly in the page body (no
+  // popup modal involved, confirmed live). expandPlaylistModal's harvest+
+  // scroll loop works unchanged here since callPlaylistTailLoader/
+  // markRowTrackData (injected.js) already query `document` globally rather
+  // than a specific modal element.
+  async function scanPlaylistTracksOnPage() {
+    await waitForElement(VMU_MODAL_ROW_SEL, 8000); // null on timeout = legitimately empty playlist
+    const items = await expandPlaylistModal(null, null, document.body);
+    return items.map(it => ({ artist: it.artist || '', title: it.title || '' }));
+  }
+
   if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg?.type === 'VMU_SCAN_PLAYLISTS') {
         scanAllOwnerPlaylists()
           .then(playlists => sendResponse({ ok: true, playlists }))
+          .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
+        return true;
+      }
+      if (msg?.type === 'VMU_SCAN_PLAYLIST_TRACKS') {
+        scanPlaylistTracksOnPage()
+          .then(tracks => sendResponse({ ok: true, tracks }))
           .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
         return true;
       }
@@ -2896,6 +2940,94 @@
     }
   }
 
+  // Fetches a specific playlist's REAL current tracks by opening its own
+  // shareable URL (vk.ru/music/playlist/<ownerId>_<playlistId>) in a hidden
+  // background window and reading the rendered DOM there (scanPlaylistTracksInHiddenTab
+  // in background.js -> scanPlaylistTracksOnPage above) — same trick and same
+  // reliability reasoning as scanAllOwnerPlaylists/scanPlaylistsInHiddenTab
+  // just below use for the duplicate-playlist title scan: VK's internal API
+  // client route was tried for this once already (audio.getPlaylists, then
+  // later the reorder feature's audio.get) and both needed a hand-parsed
+  // token/live client state — fine for an interactive feature run from the
+  // page that already has it, not something worth depending on from this
+  // background flow. `{ok:false}` (never throws) distinguishes a genuine
+  // fetch failure from a playlist that legitimately has zero tracks.
+  async function fetchPlaylistTracksViaHiddenTab(ownerId, playlistId) {
+    const res = await new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage(
+          { type: 'VKD_SCAN_PLAYLIST_TRACKS', url: `${location.origin}/music/playlist/${ownerId}_${playlistId}` },
+          r => resolve(r)
+        );
+      } catch { resolve({ ok: false, error: 'extension context error' }); }
+    });
+    if (!res?.ok) return { ok: false };
+    return { ok: true, tracks: res.tracks || [] };
+  }
+
+  // Validates an auto-add-to-existing-playlist candidate against the real
+  // Genius album tracklist before addTracksToExistingPlaylist blindly hands
+  // it every track from this upload batch. Never throws. Resolves:
+  //  { ok: false }                   Genius/playlist-fetch unavailable or
+  //                                   low-confidence — caller falls back to
+  //                                   today's blind-add-then-prompt behavior.
+  //  { ok: true, trackNames: [] }    Genius resolved confidently but there's
+  //                                   nothing to add (already complete, or
+  //                                   none of this batch fills a real gap) —
+  //                                   caller must NOT blind-add.
+  //  { ok: true, trackNames: [...] } a Genius-confirmed subset of trackNames
+  //                                   that fills a real gap.
+  async function resolveGeniusTracksToAdd(title, artists, trackNames, match) {
+    try {
+      const { query, year } = parseGeniusQueryFromTitle(title);
+      if (!query) return { ok: false };
+
+      const searchRes = await geniusMsg('VKD_GENIUS_SEARCH', { query });
+      if (!searchRes?.ok || !searchRes.albums?.length) return { ok: false };
+      const top = searchRes.albums[0]; // Genius's own relevance ranking — no human here to pick
+
+      // Confidence gate: no human is picking the album, so require
+      // corroborating evidence before trusting it enough to auto-modify a
+      // real playlist. Artist word-overlap is a hard requirement; the year
+      // (when both sides have one) is soft/corroborating only — a Genius
+      // reissue's release_date_for_display can legitimately differ from an
+      // ID3 TYER.
+      const artistOk = artists.some(ka => wordsOf(ka).some(kw => wordsOf(top.artist).some(cw => wordsMatch(kw, cw))));
+      if (!artistOk) return { ok: false };
+      if (year) {
+        const releaseYear = (top.release || '').match(/\d{4}/)?.[0];
+        if (releaseYear && releaseYear !== year) return { ok: false };
+      }
+
+      const tracksRes = await geniusMsg('VKD_GENIUS_TRACKS', { albumId: top.id, albumUrl: top.url });
+      if (!tracksRes?.ok || !tracksRes.tracks?.length) return { ok: false };
+      const geniusEntries = tracksRes.tracks.map(t => ({
+        artist: stripGeniusTranslation(t.artist), title: stripGeniusTranslation(t.title),
+      }));
+
+      const [ownerIdStr, playlistIdStr] = (match.id || '').split('_');
+      const playlistId = parseInt(playlistIdStr, 10);
+      if (!ownerIdStr || !Number.isFinite(playlistId)) return { ok: false };
+
+      const plTracksRes = await Promise.race([
+        fetchPlaylistTracksViaHiddenTab(ownerIdStr, playlistId),
+        new Promise(resolve => setTimeout(() => resolve({ ok: false }), 20000)),
+      ]);
+      if (!plTracksRes.ok) return { ok: false };
+
+      const { entryResults } = matchEntriesToRows(geniusEntries, plTracksRes.tracks.map((t, i) => ({ numId: i, ...t })));
+      const missingEntries = entryResults.filter(e => !e.matched).map(e => ({ artist: e.artist, title: e.title }));
+      if (!missingEntries.length) return { ok: true, trackNames: [] }; // already complete per Genius
+
+      const batchAsRows = trackNames.map((t, i) => ({ numId: i, artist: t.artist, title: t.title }));
+      const { claimedRowIndices } = matchEntriesToRows(missingEntries, batchAsRows);
+      return { ok: true, trackNames: trackNames.filter((_, i) => claimedRowIndices.has(i)) };
+    } catch (err) {
+      console.warn('[VK Multi Upload] resolveGeniusTracksToAdd failed:', err);
+      return { ok: false };
+    }
+  }
+
   // ─── auto-playlist flow ───────────────────────────────────────────────────────
   // Queues a completed batch for runAutoPlaylist instead of calling it
   // directly — a second batch (typically a retried track finishing upload
@@ -3002,13 +3134,32 @@
             // Falls through to the usual create-duplicate prompt if this is
             // off, or if the add itself fails for any reason.
             if (settings.autoAddToExistingPlaylist) {
-              showProgressToast(`Плейлист «${title.slice(0,30)}» уже есть — добавляем треки…`, { id: 'vmu-autoplaylist' });
-              const added = await addTracksToExistingPlaylist(match, trackNames);
-              if (added) {
-                showProgressToast(`Добавлено в «${title.slice(0,30)}»`, { id: 'vmu-autoplaylist', kind: 'done' });
-                return;
+              // Genius validation is a strict refinement in front of the
+              // blind add below: it can only narrow `namesToAdd` down to a
+              // Genius-confirmed subset, or skip the add entirely when
+              // Genius says the playlist is already complete — never widen
+              // it or invent a failure mode of its own. When Genius can't
+              // be resolved confidently (`g.ok === false`), namesToAdd stays
+              // the full batch, i.e. exactly today's behavior.
+              let namesToAdd = trackNames;
+              let skipAutoAdd = false;
+              if (settings.geniusValidateAutoAdd) {
+                showProgressToast('Сверяем с Genius…', { id: 'vmu-autoplaylist' });
+                const g = await resolveGeniusTracksToAdd(title, artists, trackNames, match);
+                if (g.ok) {
+                  if (g.trackNames.length) namesToAdd = g.trackNames;
+                  else skipAutoAdd = true;
+                }
               }
-              console.warn('[VK Multi Upload] auto-add to existing playlist failed, falling back to duplicate prompt');
+              if (!skipAutoAdd) {
+                showProgressToast(`Плейлист «${title.slice(0,30)}» уже есть — добавляем треки…`, { id: 'vmu-autoplaylist' });
+                const added = await addTracksToExistingPlaylist(match, namesToAdd);
+                if (added) {
+                  showProgressToast(`Добавлено в «${title.slice(0,30)}»`, { id: 'vmu-autoplaylist', kind: 'done' });
+                  return;
+                }
+                console.warn('[VK Multi Upload] auto-add to existing playlist failed, falling back to duplicate prompt');
+              }
             }
             const choice = await showDupPlaylistPrompt(title);
             if (choice.dontAskAgain) {
@@ -3018,6 +3169,8 @@
               if (dupToggle) dupToggle.checked = false;
               const autoAddRow = document.getElementById('vmu-autoadd-row');
               if (autoAddRow) autoAddRow.classList.add('vmu-row-disabled');
+              const geniusValidateRow = document.getElementById('vmu-geniusvalidate-row');
+              if (geniusValidateRow) geniusValidateRow.classList.add('vmu-row-disabled');
             }
             if (!choice.create) {
               showProgressToast(`Отменено: плейлист «${title.slice(0,30)}» уже есть`, { id: 'vmu-autoplaylist', kind: 'error' });
@@ -3250,84 +3403,77 @@
     });
   }
 
-  // Shared by both order sources (dropped files, Genius tracklist): entries
-  // is [{artist, title}] in the desired final order. Matches them against the
-  // playlist's current tracks by normalizeKey, unmatched tracks keep their
-  // relative order at the end, then persists via VKD_REORDER_PLAYLIST.
-  async function applyPlaylistOrderFromEntries(box, entries, sourceLabel) {
-    const plInfo = getPlaylistInfoFromUrl() || lastEditPlaylistIds;
-    if (!plInfo) { showToast('Не удалось определить плейлист (ownerId/playlistId)', true); return; }
+  // Title-first fuzzy word matching, shared by playlist-order sources
+  // (dropped files, Genius tracklist) AND by the Genius-validated top-up
+  // feature below (matching a Genius tracklist against an existing
+  // playlist's real tracks, and separately against a just-uploaded batch).
+  // Different sources format multi-artist credits too differently
+  // ("ЗАМАЙ, Слава КПСС" vs "ZAMAY & Слава КПСС") for exact artist matching
+  // to be safe as anything but a tiebreaker between rows sharing the same
+  // normalized title (remixes, alternate versions, "feat." variants).
+  function wordsOf(s) { return normalizeNamePart(s).split(/[^\p{L}\p{N}]+/u).filter(Boolean); }
+  function levenshtein(a, b) {
+    if (a === b) return 0;
+    const al = a.length, bl = b.length;
+    if (!al) return bl;
+    if (!bl) return al;
+    let prev = new Array(bl + 1);
+    let curr = new Array(bl + 1);
+    for (let j = 0; j <= bl; j++) prev[j] = j;
+    for (let i = 1; i <= al; i++) {
+      curr[0] = i;
+      for (let j = 1; j <= bl; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      }
+      [prev, curr] = [curr, prev];
+    }
+    return prev[bl];
+  }
+  // Tolerance scales with word length so short words still need to be
+  // exact (else "от" would "fuzzy-match" half the dictionary at 1 edit).
+  function wordsMatch(a, b) {
+    if (a === b) return true;
+    const minLen = Math.min(a.length, b.length);
+    if (minLen < 4) return false;
+    const maxEdits = minLen >= 8 ? 2 : 1;
+    return levenshtein(a, b) <= maxEdits;
+  }
+  function fuzzyTitleScore(wordsA, wordsB) {
+    if (wordsA.length < 2 || wordsB.length < 2) return 0; // too short to safely fuzzy-match
+    const used = new Array(wordsB.length).fill(false);
+    let common = 0;
+    for (const wa of wordsA) {
+      const idx = wordsB.findIndex((wb, j) => !used[j] && wordsMatch(wa, wb));
+      if (idx !== -1) { used[idx] = true; common++; }
+    }
+    return common / Math.min(wordsA.length, wordsB.length);
+  }
 
-    showProgressToast('Загружаю треки плейлиста…', { id: 'vmu-pl-sort' });
-    const trackRes = await fetchPlaylistTracksViaApi(plInfo);
-    if (!trackRes.ok) { showProgressToast('Ошибка: ' + (trackRes.error || '?'), { id: 'vmu-pl-sort', kind: 'error' }); return; }
-
-    const rows = trackRes.tracks;
-    if (!rows.length) { showToast('Не нашёл треки в плейлисте', true); return; }
-
-    // Title-first matching: different sources format multi-artist credits
-    // differently enough ("ЗАМАЙ, Слава КПСС" vs "ZAMAY & Слава КПСС") that
-    // requiring an exact artist match too would silently fail every track on
-    // collab albums. Artist only breaks ties between rows sharing the same
-    // normalized title (remixes, alternate versions, "feat." variants).
-    const wordsOf = s => normalizeNamePart(s).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  // entries: [{artist, title}] (desired order / the list being checked for).
+  // rows: [{numId, artist, title}] (what's actually there — numId is just an
+  // opaque handle a caller can use to identify which row matched; callers
+  // that don't need reordering can pass anything unique, e.g. an index).
+  // Below the normalized-title-equality tier, a looser fallback for titles
+  // that are clearly the same track but not byte-identical after
+  // normalization — one side appending extra credit text the stripping
+  // regexes above don't recognize, a homoglyph pair (Cyrillic/Latin
+  // look-alikes that read identical but are different code points), or a
+  // reuploader's own spelling variant of a name (verified live: Genius'
+  // "Vogifin" vs the actual VK track's "Voogifin" — one inserted letter).
+  // Scored as "what fraction of the SHORTER title's words also appear in
+  // the longer one" (relative to the smaller side, not a symmetric Jaccard
+  // over the union) — the same shape of heuristic selectTracksBySearch/
+  // trackMatchesItem already use in injected.js — rather than a single
+  // whole-string edit distance, since a whole appended credit phrase
+  // (several extra words) shouldn't tank the score the way it would
+  // penalize a length-normalized distance metric. Per-word comparison
+  // itself also tolerates a small edit distance rather than requiring
+  // exact equality, so a one-letter spelling variant on an otherwise
+  // identical title doesn't zero out that word's contribution.
+  const FUZZY_TITLE_THRESHOLD = 0.75;
+  function matchEntriesToRows(entries, rows) {
     const rowMeta = rows.map(r => ({ row: r, titleKey: normalizeNamePart(r.title), titleWords: wordsOf(r.title), artistWords: new Set(wordsOf(r.artist)) }));
-
-    // Below the normalized-title-equality tier, a looser fallback for titles
-    // that are clearly the same track but not byte-identical after
-    // normalization — one side appending extra credit text the stripping
-    // regexes above don't recognize, a homoglyph pair (Cyrillic/Latin
-    // look-alikes that read identical but are different code points), or a
-    // reuploader's own spelling variant of a name (verified live: Genius'
-    // "Vogifin" vs the actual VK track's "Voogifin" — one inserted letter).
-    // Scored as "what fraction of the SHORTER title's words also appear in
-    // the longer one" (relative to the smaller side, not a symmetric Jaccard
-    // over the union) — the same shape of heuristic selectTracksBySearch/
-    // trackMatchesItem already use in injected.js — rather than a single
-    // whole-string edit distance, since a whole appended credit phrase
-    // (several extra words) shouldn't tank the score the way it would
-    // penalize a length-normalized distance metric. Per-word comparison
-    // itself also tolerates a small edit distance rather than requiring
-    // exact equality, so a one-letter spelling variant on an otherwise
-    // identical title doesn't zero out that word's contribution.
-    const FUZZY_TITLE_THRESHOLD = 0.75;
-    function levenshtein(a, b) {
-      if (a === b) return 0;
-      const al = a.length, bl = b.length;
-      if (!al) return bl;
-      if (!bl) return al;
-      let prev = new Array(bl + 1);
-      let curr = new Array(bl + 1);
-      for (let j = 0; j <= bl; j++) prev[j] = j;
-      for (let i = 1; i <= al; i++) {
-        curr[0] = i;
-        for (let j = 1; j <= bl; j++) {
-          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-          curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
-        }
-        [prev, curr] = [curr, prev];
-      }
-      return prev[bl];
-    }
-    // Tolerance scales with word length so short words still need to be
-    // exact (else "от" would "fuzzy-match" half the dictionary at 1 edit).
-    function wordsMatch(a, b) {
-      if (a === b) return true;
-      const minLen = Math.min(a.length, b.length);
-      if (minLen < 4) return false;
-      const maxEdits = minLen >= 8 ? 2 : 1;
-      return levenshtein(a, b) <= maxEdits;
-    }
-    function fuzzyTitleScore(wordsA, wordsB) {
-      if (wordsA.length < 2 || wordsB.length < 2) return 0; // too short to safely fuzzy-match
-      const used = new Array(wordsB.length).fill(false);
-      let common = 0;
-      for (const wa of wordsA) {
-        const idx = wordsB.findIndex((wb, j) => !used[j] && wordsMatch(wa, wb));
-        if (idx !== -1) { used[idx] = true; common++; }
-      }
-      return common / Math.min(wordsA.length, wordsB.length);
-    }
 
     const claimed = new Set();
     // Parallel to entries (same order, same length) — slotNumId[i] is the
@@ -3390,8 +3536,26 @@
       });
     }
 
-    const matchedOrder = slotNumId.filter(id => id != null);
-    const leftovers = rows.filter((r, i) => !claimed.has(i)).map(r => r.numId);
+    return { entryResults, matchedNumIds: slotNumId, claimedRowIndices: claimed };
+  }
+
+  // entries is [{artist, title}] in the desired final order. Matches them
+  // against the playlist's current tracks, unmatched tracks keep their
+  // relative order at the end, then persists via VKD_REORDER_PLAYLIST.
+  async function applyPlaylistOrderFromEntries(box, entries, sourceLabel) {
+    const plInfo = getPlaylistInfoFromUrl() || lastEditPlaylistIds;
+    if (!plInfo) { showToast('Не удалось определить плейлист (ownerId/playlistId)', true); return; }
+
+    showProgressToast('Загружаю треки плейлиста…', { id: 'vmu-pl-sort' });
+    const trackRes = await fetchPlaylistTracksViaApi(plInfo);
+    if (!trackRes.ok) { showProgressToast('Ошибка: ' + (trackRes.error || '?'), { id: 'vmu-pl-sort', kind: 'error' }); return; }
+
+    const rows = trackRes.tracks;
+    if (!rows.length) { showToast('Не нашёл треки в плейлисте', true); return; }
+
+    const { entryResults, matchedNumIds, claimedRowIndices } = matchEntriesToRows(entries, rows);
+    const matchedOrder = matchedNumIds.filter(id => id != null);
+    const leftovers = rows.filter((r, i) => !claimedRowIndices.has(i)).map(r => r.numId);
     const finalOrder = [...matchedOrder, ...leftovers];
     const unmatched = entries.length - matchedOrder.length;
 
@@ -3691,6 +3855,224 @@
     `;
     anchor.insertAdjacentElement('afterend', wrap);
     wrap.querySelector('#vmu-covered-open').addEventListener('click', () => openCoverEditorPanel(box));
+  }
+
+  // Adds the "Добавить с Genius" trigger row into the edit-playlist dialog,
+  // after BOTH existing rows. injectPlaylistSortToggle's own wrap and
+  // injectCoverEditorRow's freshly-created wrap share the exact same class
+  // (.vmu-pl-sort-wrap) — a plain box.querySelector would resolve to the
+  // FIRST one (the sort row) and insert this new row between the sort and
+  // cover rows instead of after both, so anchor on the LAST match instead.
+  function injectGeniusFindRow(box) {
+    if (!box || box.dataset.vmuFindInjected) return;
+    const wraps = box.querySelectorAll('.vmu-pl-sort-wrap');
+    const anchor = wraps[wraps.length - 1];
+    if (!anchor) return;
+    box.dataset.vmuFindInjected = '1';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'vmu-pl-sort-wrap';
+    wrap.innerHTML = `
+      <div class="vmu-pl-sort-row">
+        <span class="vmu-pl-sort-label">Добавить с Genius${helpIcon('Ищет альбом на Genius, сравнивает его треклист с тем, что уже есть в этом плейлисте, ищет недостающие треки в общем каталоге сообщества и даёт выбрать, какие из найденных добавить.')}</span>
+        <button type="button" id="vmu-geniusfind-open" class="vmu-pick-btn">Открыть</button>
+      </div>
+    `;
+    anchor.insertAdjacentElement('afterend', wrap);
+    wrap.querySelector('#vmu-geniusfind-open').addEventListener('click', () => openGeniusFindPanel(box));
+  }
+
+  // Draggable floating panel, left-anchored like showParsedOrderPanel (same
+  // reason: doesn't stack on the cover-editor panel if that's also open).
+  // Two phases in one panel: an album search (own copy of the
+  // vmu-pl-genius-* search-and-pick UI injectPlaylistSortToggle already
+  // uses for reordering — a human picks the album here too, same as that
+  // feature) that swaps to a review checklist once a search finds matches
+  // in the community catalog.
+  function openGeniusFindPanel(box) {
+    document.getElementById('vmu-geniusfind-panel')?.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'vmu-geniusfind-panel';
+    panel.className = 'vmu-bulkops-panel vmu-geniusfind-panel';
+    panel.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Добавить с Genius</span>
+        <button type="button" class="vmu-check-close" id="vmu-geniusfind-close">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body">
+        <div id="vmu-geniusfind-search">
+          <div class="vmu-pl-genius-searchrow">
+            <input type="text" id="vmu-geniusfind-q" class="vmu-pl-genius-input" placeholder="Исполнитель альбом, или ссылка genius.com/albums/...">
+            <button type="button" id="vmu-geniusfind-go" class="vmu-pick-btn">Искать</button>
+          </div>
+          <div id="vmu-geniusfind-results" class="vmu-pl-genius-results"></div>
+        </div>
+        <div id="vmu-geniusfind-review" style="display:none"></div>
+      </div>
+    `;
+    document.body.appendChild(panel);
+    makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+    panel.querySelector('#vmu-geniusfind-close').addEventListener('click', () => panel.remove());
+
+    const searchBlock = panel.querySelector('#vmu-geniusfind-search');
+    const reviewBlock = panel.querySelector('#vmu-geniusfind-review');
+    const qInput = panel.querySelector('#vmu-geniusfind-q');
+    const goBtn = panel.querySelector('#vmu-geniusfind-go');
+    const results = panel.querySelector('#vmu-geniusfind-results');
+
+    const setStatus = text => {
+      results.innerHTML = text ? `<div class="vmu-pl-genius-status">${escHtml(text)}</div>` : '';
+    };
+
+    const renderAlbumResults = albums => {
+      results.innerHTML = albums.map((a, i) => `
+        <div class="vmu-pl-genius-result" data-idx="${i}">
+          ${a.cover ? `<img src="${escHtml(a.cover)}" alt="">` : ''}
+          <div class="vmu-pl-genius-result-info">
+            <span class="vmu-pl-genius-result-name">${escHtml(a.name)}</span>
+            <span class="vmu-pl-genius-result-meta">${escHtml(a.artist)}${a.release ? ' · ' + escHtml(a.release) : ''}</span>
+          </div>
+        </div>
+      `).join('');
+      results.querySelectorAll('.vmu-pl-genius-result').forEach(el => {
+        el.addEventListener('click', () => {
+          const album = albums[Number(el.dataset.idx)];
+          runGeniusFindFlow(album, { panel, searchBlock, reviewBlock, setStatus });
+        });
+      });
+    };
+
+    const runSearch = async () => {
+      const raw = qInput.value.trim();
+      if (!raw) return;
+      if (/^https?:\/\/(www\.)?genius\.com\/albums\//i.test(raw)) {
+        runGeniusFindFlow({ url: raw }, { panel, searchBlock, reviewBlock, setStatus });
+        return;
+      }
+      setStatus('Ищем на Genius…');
+      const res = await geniusMsg('VKD_GENIUS_SEARCH', { query: raw });
+      if (!res?.ok) { setStatus(res?.error || 'ничего не найдено'); return; }
+      renderAlbumResults(res.albums);
+    };
+    goBtn.addEventListener('click', runSearch);
+    qInput.addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
+
+    const titleInput = box.querySelector('input.ape_pl_input');
+    qInput.value = parseGeniusQueryFromTitle(titleInput?.value).query;
+  }
+
+  // Orchestrates the "review" half of the manual find-and-add flow: fetches
+  // the Genius tracklist, narrows it down to entries missing from this
+  // playlist's REAL current tracks (fetchPlaylistTracksViaHiddenTab +
+  // matchEntriesToRows — the exact same building blocks the automatic
+  // top-up feature uses), then asks injected.js to dry-run search the
+  // community catalog for just those missing entries.
+  async function runGeniusFindFlow(album, ui) {
+    const { searchBlock, reviewBlock, setStatus } = ui;
+    setStatus('Подтягиваем треклист…');
+    const tracksRes = await geniusMsg('VKD_GENIUS_TRACKS', { albumId: album.id, albumUrl: album.url });
+    if (!tracksRes?.ok || !tracksRes.tracks?.length) { setStatus(tracksRes?.error || 'не удалось получить треклист'); return; }
+    const geniusEntries = tracksRes.tracks.map(t => ({ artist: stripGeniusTranslation(t.artist), title: stripGeniusTranslation(t.title) }));
+
+    const plInfo = getPlaylistInfoFromUrl() || lastEditPlaylistIds;
+    if (!plInfo) { setStatus('Не удалось определить плейлист (ownerId/playlistId)'); return; }
+
+    setStatus('Загружаю треки плейлиста…');
+    const plTracksRes = await fetchPlaylistTracksViaHiddenTab(plInfo.ownerId, plInfo.playlistId);
+    if (!plTracksRes.ok) { setStatus('Не удалось загрузить треки плейлиста'); return; }
+
+    const { entryResults } = matchEntriesToRows(geniusEntries, plTracksRes.tracks.map((t, i) => ({ numId: i, ...t })));
+    const missing = entryResults.filter(e => !e.matched).map(e => ({ artist: e.artist, title: e.title }));
+    if (!missing.length) { setStatus('В плейлисте уже есть все треки альбома по Genius'); return; }
+
+    setStatus(`Ищем ${missing.length} недостающих треков в каталоге сообщества…`);
+    let findRes;
+    try {
+      findRes = await pageCall('VK_FIND_TRACKS_IN_COMMUNITY', 'VK_FIND_TRACKS_IN_COMMUNITY_DONE', {
+        reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        ownerId: plInfo.ownerId, playlistId: plInfo.playlistId, trackNames: missing,
+      }, 150000, 'reqId');
+    } catch (err) {
+      setStatus('Ошибка поиска: ' + err.message);
+      return;
+    }
+
+    renderGeniusFindReview({ panel: ui.panel, searchBlock, reviewBlock }, plInfo, findRes.matches || [], findRes.unmatched || []);
+  }
+
+  // Renders the checklist of what was found, and wires the confirm button
+  // that ticks exactly the checked tracks (by the stable ownerId_audioId
+  // handle injected.js captured during the dry run) in VK's own picker and
+  // saves. Checkboxes default CHECKED: the list is already pre-filtered to
+  // genuinely-missing tracks before this point, so every row is already a
+  // "should probably be added" candidate — the checkbox exists to let the
+  // user exclude a fuzzy-match false positive, not to make them opt into
+  // every track from zero.
+  function renderGeniusFindReview({ panel, searchBlock, reviewBlock }, plInfo, matches, unmatched) {
+    searchBlock.style.display = 'none';
+    reviewBlock.style.display = '';
+
+    const unmatchedHtml = unmatched.length ? `
+      <div class="vmu-pl-genius-status">Не нашлось в каталоге: ${unmatched.length}</div>
+      <div class="vmu-parsedorder-list">
+        ${unmatched.map(e => `
+          <div class="vmu-parsedorder-row vmu-parsedorder-row-miss">
+            <span class="vmu-parsedorder-text">${escHtml(e.artist)} — ${escHtml(e.title)}</span>
+            <span class="vmu-parsedorder-status">✕</span>
+          </div>
+        `).join('')}
+      </div>` : '';
+
+    if (!matches.length) {
+      reviewBlock.innerHTML = `<div class="vmu-pl-genius-status">Ничего не нашлось в каталоге сообщества.</div>${unmatchedHtml}`;
+      return;
+    }
+
+    reviewBlock.innerHTML = `
+      <div class="vmu-pl-genius-status">Найдено ${matches.length} — выберите, что добавить:</div>
+      <div class="vmu-parsedorder-list">
+        ${matches.map((m, i) => `
+          <label class="vmu-parsedorder-row" style="cursor:pointer">
+            <input type="checkbox" class="vmu-geniusfind-check" data-idx="${i}" checked>
+            <span class="vmu-parsedorder-text">${escHtml(m.artist)} — ${escHtml(m.title)}</span>
+          </label>
+        `).join('')}
+      </div>
+      <div style="display:flex;padding:8px 12px 4px">
+        <button type="button" id="vmu-geniusfind-confirm" class="vmu-pick-btn">Добавить выбранные</button>
+      </div>
+      ${unmatchedHtml}
+    `;
+
+    reviewBlock.querySelector('#vmu-geniusfind-confirm').addEventListener('click', async () => {
+      const checked = [...reviewBlock.querySelectorAll('.vmu-geniusfind-check:checked')]
+        .map(c => matches[Number(c.dataset.idx)].audioId)
+        .filter(Boolean);
+      if (!checked.length) { showToast('Ничего не выбрано', true); return; }
+
+      const confirmBtn = reviewBlock.querySelector('#vmu-geniusfind-confirm');
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Добавляем…';
+      try {
+        const res = await pageCall('VK_CONFIRM_ADD_TRACKS_FROM_COMMUNITY', 'VK_CONFIRM_ADD_TRACKS_FROM_COMMUNITY_DONE', {
+          reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+          playlistId: plInfo.playlistId, audioIds: checked,
+        }, 60000, 'reqId');
+        showToast(`Добавлено треков: ${res.selectedCount}`);
+        panel.remove();
+      } catch (err) {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Добавить выбранные';
+        const errBox = document.createElement('div');
+        errBox.className = 'vmu-pl-genius-status';
+        errBox.style.color = '#e64646';
+        errBox.textContent = err.message === 'dialog_closed'
+          ? 'Диалог плейлиста был закрыт — откройте его заново и повторите поиск'
+          : 'Ошибка: ' + err.message;
+        reviewBlock.insertBefore(errBox, reviewBlock.firstChild);
+      }
+    });
   }
 
   // Draggable floating panel: pick a source image (Genius album cover or a
@@ -4188,12 +4570,19 @@
     return null;
   }
 
-  async function expandPlaylistModal(onProgress, isCancelled) {
-    const modal = findOpenPlaylistModal();
+  // `container` lets a caller harvest a track list that isn't inside VK's
+  // own popup modal at all — e.g. the standalone /music/playlist/<id> page,
+  // which renders the same MusicTrackRow markup directly in the page body
+  // (verified live) and needs no "показать все" click since it isn't a
+  // collapsed preview to begin with. Every existing call keeps omitting
+  // this argument, so `findOpenPlaylistModal()` + `revealModalList` still
+  // run exactly as before for the popup case.
+  async function expandPlaylistModal(onProgress, isCancelled, container) {
+    const modal = container || findOpenPlaylistModal();
     if (!modal) return [];
 
     const declaredTotal = getPlaylistTotalFromModal(modal);
-    await revealModalList(modal);
+    if (!container) await revealModalList(modal);
 
     const collected = new Map();
 
@@ -4873,11 +5262,29 @@
     if (toolbarBtn) toolbarBtn.style.color = '#2688eb';
   }
 
+  let settingsActiveTab = 'general';
+  let vmuDdOutsideClickBound = false;
+
   function buildSettingsPanel() {
     const hasCover = !!settings.coverDataUrl;
     const isCheck = settings.workMode === 'check';
+    const tab = settingsActiveTab;
+    const slimOn = settings.slimEnabled;
+    const slimSjOk = slimOn && settings.slimSj;
+    const slimRdOk = slimOn && settings.slimRd;
+    const slimDcOk = slimOn && settings.slimDc;
+    const slimMpOk = slimOn && settings.slimMp;
+    const slimBdOk = slimOn && settings.slimBd;
+    const slimTagOk = slimOn && settings.slimCommunityTag;
+    const BROKEN_TYPES = ['HUGE (1–10 часов)', 'TINY (0–3 сек)', 'RANDOM (1–120 мин)', 'MAX'];
+    const QUALITY_PRESETS = ['320 kbps', '256 kbps', '192 kbps', '128 kbps'];
     return `
       <div id="vmu-settings-panel" style="display:none">
+        <div class="vmu-settings-tabs" id="vmu-settings-tabs">
+          <button class="vmu-settings-tab${tab === 'general' ? ' active' : ''}" data-vmu-settings-tab="general">Основные</button>
+          <button class="vmu-settings-tab${tab === 'slim' ? ' active' : ''}" data-vmu-settings-tab="slim">Обфускация</button>
+        </div>
+        <div id="vmu-settings-tab-general"${tab !== 'general' ? ' style="display:none"' : ''}>
         <div class="vmu-settings-section" id="vmu-general-section">
           <div class="vmu-setting-row vmu-setting-row-wide">
             <div class="vmu-setting-info">
@@ -5015,6 +5422,17 @@
             </label>
           </div>
 
+          <div class="vmu-setting-row ${settings.autoPlaylist && settings.dupPlaylistCheck && settings.autoAddToExistingPlaylist ? '' : 'vmu-row-disabled'}" id="vmu-geniusvalidate-row">
+            <div class="vmu-setting-info">
+              <span class="vmu-setting-label">Сверять с Genius перед добавлением</span>
+              <span class="vmu-setting-hint">Добавлять только треки, которых реально не хватает в плейлисте по треклисту с Genius (иначе просто спросит про дубликат). Медленнее — открывает ещё вкладки</span>
+            </div>
+            <label class="vmu-toggle">
+              <input type="checkbox" id="vmu-geniusvalidate-toggle" ${settings.geniusValidateAutoAdd ? 'checked' : ''}>
+              <span class="vmu-toggle-track"></span>
+            </label>
+          </div>
+
           <div id="vmu-cover-row" class="vmu-setting-row vmu-setting-row-wide ${settings.autoPlaylist ? '' : 'vmu-row-disabled'}">
             <div class="vmu-setting-info">
               <span class="vmu-setting-label">Обложка</span>
@@ -5052,6 +5470,190 @@
             </label>
           </div>
         </div>
+        </div><!-- /vmu-settings-tab-general -->
+        <div id="vmu-settings-tab-slim"${tab !== 'slim' ? ' style="display:none"' : ''}>
+          <div class="vmu-settings-section">
+            <div class="vmu-setting-row vmu-setting-row-wide">
+              <div class="vmu-setting-info">
+                <span class="vmu-setting-label">Обфускация аудио</span>
+              </div>
+              <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-enabled" ${slimOn ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+            </div>
+
+            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-sj-group">
+              <div class="vmu-slim-group-head">
+                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj" ${settings.slimSj ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                <span class="vmu-setting-label">Спектральный джиттер</span>
+              </div>
+              <div class="vmu-slim-group-body${slimSjOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-sj-body">
+                <div class="vmu-setting-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Режим</span></div>
+                  ${buildDropdownHtml('vmu-slim-sj-mode-dd', ['Случайные', 'Конструктор'], settings.slimSjMode)}
+                </div>
+                <div class="vmu-setting-row vmu-slider-row">
+                    <div class="vmu-setting-info"><span class="vmu-setting-label">Количество полос</span></div>
+                    <div class="vmu-slider-wrap">
+                      <input type="range" id="vmu-slim-sj-count" class="vmu-slider" min="1" max="50" step="1" value="${settings.slimSjCount}">
+                      <span class="vmu-slider-value" id="vmu-slim-sj-count-val">${settings.slimSjCount}</span>
+                    </div>
+                  </div>
+                  <div class="vmu-setting-row vmu-slider-row">
+                    <div class="vmu-setting-info"><span class="vmu-setting-label">Глубина аттенюации (дБ)</span></div>
+                    <div class="vmu-slider-wrap">
+                      <input type="range" id="vmu-slim-sj-att" class="vmu-slider" min="1" max="40" step="0.5" value="${settings.slimSjAtt}">
+                      <span class="vmu-slider-value" id="vmu-slim-sj-att-val">${settings.slimSjAtt} дБ</span>
+                    </div>
+                  </div>
+                  <div class="vmu-setting-row" id="vmu-slim-sj-adaptive-row">
+                    <div class="vmu-setting-info"><span class="vmu-setting-label">Адаптивные частоты (пики спектра)</span></div>
+                    <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj-adaptive" ${settings.slimSjAdaptive ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                  </div>
+                  <div class="vmu-setting-row">
+                    <div class="vmu-setting-info"><span class="vmu-setting-label">Временна́я модуляция (±1.5 дБ, 0.15 Гц)</span></div>
+                    <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj-temporal" ${settings.slimSjTemporal ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                  </div>
+                  <div class="vmu-setting-row">
+                    <div class="vmu-setting-info"><span class="vmu-setting-label">Компенсирующий буст (+0.5 дБ на F×1.5)</span></div>
+                    <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj-boost" ${settings.slimSjBoost ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                  </div>
+                <div class="vmu-setting-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Добавить шум</span></div>
+                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj-noise" ${settings.slimSjNoise ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                </div>
+                <div id="vmu-slim-sj-constructor"${settings.slimSjMode !== 1 ? ' style="display:none"' : ''}>
+                  <div class="vmu-slim-sj-presets">
+                    <span style="font-size:10px;color:var(--vmu-text-hint-2)">Пресет:</span>
+                    ${['Мягкий','Лёгкий','Средний','Сильный','Жёсткий','Максимум'].map((n,i) =>
+                      `<button class="vmu-slim-preset-btn" data-sj-preset="${i}">${n}</button>`).join('')}
+                  </div>
+                  <div class="vmu-slim-sj-table-hdr">
+                    <span>Частота (Гц)</span><span>Ослаб. (дБ)</span><span>Q</span><span></span>
+                  </div>
+                  <div id="vmu-slim-sj-rows">
+                    ${(settings.slimSjManualFilters || []).map((flt, i) => `
+                    <div class="vmu-slim-sj-row" data-sj-row="${i}">
+                      <input type="number" class="vmu-slim-sj-num vmu-slim-sj-freq" min="20" max="20000" step="50" value="${flt.freq}">
+                      <input type="number" class="vmu-slim-sj-num vmu-slim-sj-att-v" min="1" max="40" step="0.5" value="${flt.att}">
+                      <input type="number" class="vmu-slim-sj-num vmu-slim-sj-q" min="0.5" max="10" step="0.1" value="${flt.q}">
+                      <button class="vmu-slim-sj-del-btn" data-del-row="${i}">✕</button>
+                    </div>`).join('')}
+                  </div>
+                  <button id="vmu-slim-sj-add-row">+ Добавить фильтр</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-rd-group">
+              <div class="vmu-slim-group-head">
+                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-rd" ${settings.slimRd ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                <span class="vmu-setting-label">Дрейф ресемплинга</span>
+              </div>
+              <div class="vmu-slim-group-body${slimRdOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-rd-body">
+                <div class="vmu-setting-row vmu-slider-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Величина дрейфа (Гц)</span></div>
+                  <div class="vmu-slider-wrap">
+                    <input type="range" id="vmu-slim-rd-amount" class="vmu-slider" min="1" max="100" step="1" value="${settings.slimRdAmount}">
+                    <span class="vmu-slider-value" id="vmu-slim-rd-amount-val">${settings.slimRdAmount} Гц</span>
+                  </div>
+                </div>
+                <div class="vmu-setting-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Вибрато-модуляция</span></div>
+                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-rd-var" ${settings.slimRdVar ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                </div>
+              </div>
+            </div>
+
+            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-dc-group">
+              <div class="vmu-slim-group-head">
+                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-dc" ${settings.slimDc ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                <span class="vmu-setting-label">DC-смещение</span>
+              </div>
+              <div class="vmu-slim-group-body${slimDcOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-dc-body">
+                <div class="vmu-setting-row vmu-slider-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Величина смещения</span></div>
+                  <div class="vmu-slider-wrap">
+                    <input type="range" id="vmu-slim-dc-val" class="vmu-slider" min="1" max="1000" step="1" value="${Math.round(settings.slimDcVal * 1e6)}">
+                    <span class="vmu-slider-value" id="vmu-slim-dc-val-val">${(settings.slimDcVal).toExponential(1)}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-mp-group">
+              <div class="vmu-slim-group-head">
+                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-mp" ${settings.slimMp ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                <span class="vmu-setting-label">Микропитч</span>
+              </div>
+              <div class="vmu-slim-group-body${slimMpOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-mp-body">
+                <div class="vmu-setting-row vmu-slider-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Сдвиг (центы)</span></div>
+                  <div class="vmu-slider-wrap">
+                    <input type="range" id="vmu-slim-mp-cents" class="vmu-slider" min="0.1" max="50" step="0.1" value="${settings.slimMpCents}">
+                    <span class="vmu-slider-value" id="vmu-slim-mp-cents-val">${settings.slimMpCents} ¢</span>
+                  </div>
+                </div>
+                <div class="vmu-setting-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Случайное направление (±)</span></div>
+                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-mp-rand" ${settings.slimMpRand ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                </div>
+              </div>
+            </div>
+
+            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-bd-group">
+              <div class="vmu-slim-group-head">
+                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-bd" ${settings.slimBd ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                <span class="vmu-setting-label">Поддельная длительность (TLEN)</span>
+              </div>
+              <div class="vmu-slim-group-body${slimBdOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-bd-body">
+                <div class="vmu-setting-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Тип фальсификации</span></div>
+                  ${buildDropdownHtml('vmu-slim-bd-type-dd', BROKEN_TYPES, settings.slimBdType)}
+                </div>
+              </div>
+            </div>
+
+            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-output-group">
+              <div class="vmu-slim-group-head">
+                <span class="vmu-setting-label">OUTPUT</span>
+              </div>
+              <div class="vmu-slim-group-body">
+                <div class="vmu-setting-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Битрейт MP3</span></div>
+                  ${buildDropdownHtml('vmu-slim-bitrate-dd', QUALITY_PRESETS, [320,256,192,128].indexOf(settings.slimBitrate))}
+                </div>
+                <div class="vmu-setting-row vmu-slider-row vmu-setting-row-wide">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Громкость выхода</span></div>
+                  <div class="vmu-slider-wrap">
+                    <input type="range" id="vmu-slim-volume" class="vmu-slider" min="0" max="200" step="1" value="${settings.slimVolume}">
+                    <span class="vmu-slider-value" id="vmu-slim-volume-val">${settings.slimVolume}%</span>
+                  </div>
+                </div>
+                <div class="vmu-setting-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Сохранить метаданные</span></div>
+                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-preserve-meta" ${settings.slimPreserveMeta ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                </div>
+                <div class="vmu-setting-row">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Сохранить обложку</span></div>
+                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-preserve-cover" ${settings.slimPreserveCover ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                </div>
+              </div>
+            </div>
+
+            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-tag-group">
+              <div class="vmu-slim-group-head">
+                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-tag" ${settings.slimCommunityTag ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
+                <span class="vmu-setting-label">Тег сообщества</span>
+              </div>
+              <div class="vmu-slim-group-body${slimTagOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-tag-body">
+                <div class="vmu-setting-row vmu-setting-row-wide">
+                  <div class="vmu-setting-info"><span class="vmu-setting-label">Текст метки</span></div>
+                  <input type="text" id="vmu-slim-tag-text" class="vmu-slim-text-input" placeholder="@club123456" value="${settings.slimCommunityTagText ? settings.slimCommunityTagText.replace(/"/g,'&quot;') : ''}" maxlength="120">
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
       </div>`;
   }
 
@@ -5195,6 +5797,8 @@
         if (dupRow) dupRow.classList.toggle('vmu-row-disabled', !settings.autoPlaylist);
         const autoAddRow = document.getElementById('vmu-autoadd-row');
         if (autoAddRow) autoAddRow.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && settings.dupPlaylistCheck));
+        const geniusValidateRow = document.getElementById('vmu-geniusvalidate-row');
+        if (geniusValidateRow) geniusValidateRow.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && settings.dupPlaylistCheck && settings.autoAddToExistingPlaylist));
       });
     }
 
@@ -5205,6 +5809,8 @@
         saveSettings();
         const autoAddRow = document.getElementById('vmu-autoadd-row');
         if (autoAddRow) autoAddRow.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && settings.dupPlaylistCheck));
+        const geniusValidateRow = document.getElementById('vmu-geniusvalidate-row');
+        if (geniusValidateRow) geniusValidateRow.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && settings.dupPlaylistCheck && settings.autoAddToExistingPlaylist));
       });
     }
 
@@ -5212,6 +5818,16 @@
     if (autoAddToggle) {
       autoAddToggle.addEventListener('change', () => {
         settings.autoAddToExistingPlaylist = autoAddToggle.checked;
+        saveSettings();
+        const geniusValidateRow = document.getElementById('vmu-geniusvalidate-row');
+        if (geniusValidateRow) geniusValidateRow.classList.toggle('vmu-row-disabled', !(settings.autoPlaylist && settings.dupPlaylistCheck && settings.autoAddToExistingPlaylist));
+      });
+    }
+
+    const geniusValidateToggle = document.getElementById('vmu-geniusvalidate-toggle');
+    if (geniusValidateToggle) {
+      geniusValidateToggle.addEventListener('change', () => {
+        settings.geniusValidateAutoAdd = geniusValidateToggle.checked;
         saveSettings();
       });
     }
@@ -5269,14 +5885,225 @@
       });
     }
 
+    // ── Settings tab switching ─────────────────────────────────────────────
+    const settingsTabs = document.getElementById('vmu-settings-tabs');
+    if (settingsTabs) {
+      settingsTabs.addEventListener('click', e => {
+        const btn = e.target.closest('button[data-vmu-settings-tab]');
+        if (!btn) return;
+        const tab = btn.dataset.vmuSettingsTab;
+        settingsActiveTab = tab;
+        settingsTabs.querySelectorAll('button').forEach(b => {
+          b.classList.toggle('active', b.dataset.vmuSettingsTab === tab);
+        });
+        document.getElementById('vmu-settings-tab-general').style.display = tab === 'general' ? '' : 'none';
+        document.getElementById('vmu-settings-tab-slim').style.display = tab === 'slim' ? '' : 'none';
+      });
+    }
+
+    function refreshDisabledGroups() {
+      const on = settings.slimEnabled;
+      ['vmu-slim-sj-group','vmu-slim-rd-group','vmu-slim-dc-group','vmu-slim-mp-group',
+       'vmu-slim-bd-group','vmu-slim-output-group','vmu-slim-tag-group'].forEach(id => {
+        document.getElementById(id)?.classList.toggle('vmu-row-disabled', !on);
+      });
+      document.getElementById('vmu-slim-sj-body')?.classList.toggle('vmu-row-disabled', !(on && settings.slimSj));
+      document.getElementById('vmu-slim-rd-body')?.classList.toggle('vmu-row-disabled', !(on && settings.slimRd));
+      document.getElementById('vmu-slim-dc-body')?.classList.toggle('vmu-row-disabled', !(on && settings.slimDc));
+      document.getElementById('vmu-slim-mp-body')?.classList.toggle('vmu-row-disabled', !(on && settings.slimMp));
+      document.getElementById('vmu-slim-bd-body')?.classList.toggle('vmu-row-disabled', !(on && settings.slimBd));
+      document.getElementById('vmu-slim-tag-body')?.classList.toggle('vmu-row-disabled', !(on && settings.slimCommunityTag));
+    }
+
+    function bindToggle(id, key, parse) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const ev = el.tagName === 'INPUT' && el.type === 'range' ? 'input' : 'change';
+      el.addEventListener(ev, () => {
+        settings[key] = parse ? parse(el.value) : (el.type === 'checkbox' ? el.checked : el.value);
+        saveSettings();
+        refreshDisabledGroups();
+      });
+      if (el.type === 'range') el.addEventListener('change', saveSettings);
+    }
+
+    bindToggle('vmu-slim-enabled', 'slimEnabled');
+    bindToggle('vmu-slim-sj', 'slimSj');
+    bindToggle('vmu-slim-rd', 'slimRd');
+    bindToggle('vmu-slim-dc', 'slimDc');
+    bindToggle('vmu-slim-mp', 'slimMp');
+    bindToggle('vmu-slim-bd', 'slimBd');
+    bindToggle('vmu-slim-sj-noise', 'slimSjNoise');
+    bindToggle('vmu-slim-rd-var', 'slimRdVar');
+    bindToggle('vmu-slim-mp-rand', 'slimMpRand');
+    bindToggle('vmu-slim-preserve-meta', 'slimPreserveMeta');
+    bindToggle('vmu-slim-preserve-cover', 'slimPreserveCover');
+
+    initCustomDropdown('vmu-slim-sj-mode-dd', idx => {
+      settings.slimSjMode = idx;
+      saveSettings();
+      const ctor = document.getElementById('vmu-slim-sj-constructor');
+      if (ctor) ctor.style.display = idx === 1 ? '' : 'none';
+    });
+
+    bindToggle('vmu-slim-sj-adaptive', 'slimSjAdaptive');
+    bindToggle('vmu-slim-sj-temporal', 'slimSjTemporal');
+    bindToggle('vmu-slim-sj-boost',    'slimSjBoost');
+
+    const _SJ_PRESETS = [
+      [{freq:630,att:3.0,q:1.5},{freq:3150,att:4.0,q:1.5}],
+      [{freq:400,att:5.0,q:2.0},{freq:1600,att:6.0,q:2.0},{freq:6300,att:5.0,q:2.0}],
+      [{freq:250,att:8.0,q:2.5},{freq:800,att:9.0,q:2.5},{freq:2500,att:8.0,q:2.5},{freq:8000,att:7.0,q:2.0},{freq:12500,att:6.0,q:1.5}],
+      [{freq:120,att:12.0,q:3.0},{freq:400,att:14.0,q:3.0},{freq:1000,att:15.0,q:3.0},{freq:3150,att:14.0,q:3.0},{freq:6300,att:12.0,q:2.5},{freq:10000,att:10.0,q:2.0}],
+      [{freq:120,att:18.0,q:4.0},{freq:250,att:20.0,q:4.0},{freq:630,att:22.0,q:4.0},{freq:1200,att:20.0,q:4.0},{freq:2500,att:20.0,q:3.5},{freq:4000,att:18.0,q:3.5},{freq:8000,att:18.0,q:3.0},{freq:12500,att:15.0,q:3.0}],
+      [{freq:120,att:25.0,q:5.0},{freq:250,att:28.0,q:5.0},{freq:400,att:30.0,q:5.0},{freq:800,att:28.0,q:5.0},{freq:1200,att:30.0,q:5.0},{freq:2000,att:28.0,q:4.5},{freq:3150,att:28.0,q:4.5},{freq:5000,att:25.0,q:4.0},{freq:8000,att:25.0,q:4.0},{freq:10000,att:22.0,q:4.0},{freq:12500,att:20.0,q:3.5}],
+    ];
+
+    document.querySelectorAll('[data-sj-preset]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const preset = _SJ_PRESETS[parseInt(btn.dataset.sjPreset)];
+        if (!preset) return;
+        settings.slimSjManualFilters = preset.map(f => ({...f}));
+        settings.slimSjMode = 1;
+        settings.slimSjCount = settings.slimSjManualFilters.length;
+        saveSettings();
+        rebuildSettingsPanel();
+      });
+    });
+
+    const _addSjRow = document.getElementById('vmu-slim-sj-add-row');
+    if (_addSjRow) {
+      _addSjRow.addEventListener('click', () => {
+        settings.slimSjManualFilters = [...(settings.slimSjManualFilters || []), {freq: 1000, att: settings.slimSjAtt, q: 2.0}];
+        settings.slimSjCount = settings.slimSjManualFilters.length;
+        saveSettings();
+        rebuildSettingsPanel();
+      });
+    }
+
+    document.querySelectorAll('[data-del-row]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const i = parseInt(btn.dataset.delRow);
+        settings.slimSjManualFilters = (settings.slimSjManualFilters || []).filter((_, j) => j !== i);
+        settings.slimSjCount = settings.slimSjManualFilters.length;
+        saveSettings();
+        rebuildSettingsPanel();
+      });
+    });
+
+    document.querySelectorAll('.vmu-slim-sj-row').forEach((row, i) => {
+      const freqEl = row.querySelector('.vmu-slim-sj-freq');
+      const attEl  = row.querySelector('.vmu-slim-sj-att-v');
+      const qEl    = row.querySelector('.vmu-slim-sj-q');
+      const save = () => {
+        if (!settings.slimSjManualFilters[i]) return;
+        settings.slimSjManualFilters[i] = {
+          freq: parseFloat(freqEl.value) || 1000,
+          att:  parseFloat(attEl.value)  || 7,
+          q:    parseFloat(qEl.value)    || 2,
+        };
+        saveSettings();
+      };
+      [freqEl, attEl, qEl].forEach(el => el && el.addEventListener('change', save));
+    });
+
+    initCustomDropdown('vmu-slim-bd-type-dd', idx => {
+      settings.slimBdType = idx;
+      saveSettings();
+    });
+    initCustomDropdown('vmu-slim-bitrate-dd', idx => {
+      settings.slimBitrate = [320, 256, 192, 128][idx] || 320;
+      saveSettings();
+    });
+    if (!vmuDdOutsideClickBound) {
+      vmuDdOutsideClickBound = true;
+      document.addEventListener('click', e => {
+        if (e.target.closest('.vmu-fx-dd')) return;
+        document.querySelectorAll('.vmu-fx-dd-list').forEach(l => {
+          l.style.display = 'none';
+          l.closest('.vmu-fx-dd')?.classList.remove('vmu-fx-dd-open');
+        });
+      });
+    }
+
+    function bindSlider(id, key, parse, fmt) {
+      const el = document.getElementById(id);
+      const lbl = document.getElementById(id + '-val');
+      if (!el) return;
+      el.addEventListener('input', () => {
+        settings[key] = parse(el.value);
+        if (lbl) lbl.textContent = fmt(settings[key]);
+      });
+      el.addEventListener('change', saveSettings);
+    }
+    {
+      const _SJ_FREQ_POOL = [60,80,120,160,200,250,315,400,500,630,800,1000,1250,1600,2000,2500,3150,4000,5000,6300,7000,8000,9000,10000,12500,14000,16000,18000,20000];
+      const _cntEl  = document.getElementById('vmu-slim-sj-count');
+      const _cntLbl = document.getElementById('vmu-slim-sj-count-val');
+      if (_cntEl) {
+        _cntEl.addEventListener('input', () => {
+          settings.slimSjCount = parseInt(_cntEl.value, 10);
+          if (_cntLbl) _cntLbl.textContent = String(settings.slimSjCount);
+        });
+        _cntEl.addEventListener('change', () => {
+          saveSettings();
+          if (settings.slimSjMode !== 1) return;
+          const target  = settings.slimSjCount;
+          const filters = settings.slimSjManualFilters || [];
+          const current = filters.length;
+          if (target > current) {
+            const used  = new Set(filters.map(f => f.freq));
+            const avail = _SJ_FREQ_POOL.filter(f => !used.has(f));
+            for (let n = 0; n < target - current; n++) {
+              const pool = avail.length > 0 ? avail : [..._SJ_FREQ_POOL];
+              const idx  = Math.floor(Math.random() * pool.length);
+              const freq = pool[idx];
+              if (avail.length > 0) avail.splice(idx, 1);
+              const att  = parseFloat((settings.slimSjAtt / 2 + Math.random() * (settings.slimSjAtt / 2)).toFixed(1));
+              filters.push({freq, att, q: 2.0});
+            }
+            settings.slimSjManualFilters = filters;
+            saveSettings();
+            rebuildSettingsPanel();
+          } else if (target < current) {
+            settings.slimSjManualFilters = filters.slice(0, target);
+            saveSettings();
+            rebuildSettingsPanel();
+          }
+        });
+      }
+    }
+    bindSlider('vmu-slim-sj-att', 'slimSjAtt', v => parseFloat(v), v => `${v} дБ`);
+    bindSlider('vmu-slim-rd-amount', 'slimRdAmount', v => parseInt(v,10), v => `${v} Гц`);
+    bindSlider('vmu-slim-dc-val', 'slimDcVal', v => parseInt(v,10) * 1e-6, v => v.toExponential(1));
+    bindSlider('vmu-slim-mp-cents', 'slimMpCents', v => parseFloat(v), v => `${v} ¢`);
+    bindSlider('vmu-slim-volume', 'slimVolume', v => parseInt(v,10), v => `${v}%`);
+
+    const slimTag = document.getElementById('vmu-slim-tag');
+    if (slimTag) {
+      slimTag.addEventListener('change', () => {
+        settings.slimCommunityTag = slimTag.checked;
+        saveSettings();
+        document.getElementById('vmu-slim-tag-body')?.classList.toggle('vmu-row-disabled', !(settings.slimEnabled && slimTag.checked));
+      });
+    }
+    const slimTagText = document.getElementById('vmu-slim-tag-text');
+    if (slimTagText) {
+      slimTagText.addEventListener('input', () => { settings.slimCommunityTagText = slimTagText.value; });
+      slimTagText.addEventListener('change', saveSettings);
+    }
+
   }
 
   function rebuildSettingsPanel() {
     const panel = document.getElementById('vmu-settings-panel');
     if (!panel) return;
+    const wasVisible = panel.style.display !== 'none';
     const newPanel = document.createElement('div');
     newPanel.innerHTML = buildSettingsPanel();
-    panel.replaceWith(newPanel.firstElementChild);
+    const newEl = newPanel.firstElementChild;
+    panel.replaceWith(newEl);
+    if (wasVisible) newEl.style.display = 'block';
     attachSettingsHandlers();
   }
 
@@ -5587,6 +6414,373 @@
     document.getElementById('vmu-embedded')?.remove();
   }
 
+  function floatToInt16(f32) {
+    const out = new Int16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) {
+      const s = Math.max(-1, Math.min(1, f32[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return out;
+  }
+
+  const SPECTRAL_FREQ_POOL = [
+    60, 80, 100, 120, 160, 200, 250, 315,
+    400, 500, 630, 800, 1000, 1250, 1600, 2000,
+    2500, 3150, 4000, 5000, 6300, 7000, 8000, 9000,
+    10000, 11000, 12500, 14000, 16000, 18000, 19000, 20000,
+  ];
+
+  function findSpectralPeaks(samples, sampleRate, n) {
+    const maxSamples = Math.min(samples.length, sampleRate * 5);
+    const energies = SPECTRAL_FREQ_POOL
+      .filter(f => f < sampleRate / 2)
+      .map(freq => {
+        const omega = 2 * Math.PI * freq / sampleRate;
+        const coeff = 2 * Math.cos(omega);
+        let s1 = 0, s2 = 0;
+        for (let i = 0; i < maxSamples; i++) {
+          const s0 = samples[i] + coeff * s1 - s2;
+          s2 = s1; s1 = s0;
+        }
+        return { freq, energy: s1 * s1 + s2 * s2 - coeff * s1 * s2 };
+      });
+    energies.sort((a, b) => b.energy - a.energy);
+    const picked = [];
+    for (const { freq } of energies) {
+      if (picked.every(p => Math.abs(Math.log2(freq / p)) >= 0.5)) {
+        picked.push(freq);
+        if (picked.length >= n) break;
+      }
+    }
+    return picked.length > 0 ? picked : null;
+  }
+
+  function pickSpectralFreqs(pool, n, minOctaveGap) {
+    const tryPick = (gap) => {
+      const picked = [];
+      const shuffled = pool.slice().sort(() => Math.random() - 0.5);
+      for (const f of shuffled) {
+        if (picked.every(p => Math.abs(Math.log2(f / p)) >= gap)) {
+          picked.push(f);
+          if (picked.length >= n) break;
+        }
+      }
+      return picked;
+    };
+    let result = tryPick(minOctaveGap);
+    if (result.length < n && minOctaveGap > 0.1) result = tryPick(minOctaveGap * 0.5);
+    if (result.length < n) result = tryPick(0);
+    return result;
+  }
+
+  function resampleLinear(samples, fromRate, toRate) {
+    if (fromRate === toRate) return samples;
+    const ratio = fromRate / toRate;
+    const outLen = Math.round(samples.length * toRate / fromRate);
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const src = i * ratio;
+      const lo = Math.floor(src);
+      const hi = Math.min(lo + 1, samples.length - 1);
+      const t = src - lo;
+      out[i] = samples[lo] * (1 - t) + samples[hi] * t;
+    }
+    return out;
+  }
+
+  async function applyAudioProcessing(file, onProgress) {
+    const buf = await file.arrayBuffer();
+    const originalBuf = buf.slice();
+
+    const tmpCtx = new AudioContext();
+    let audioBuffer;
+    try {
+      audioBuffer = await tmpCtx.decodeAudioData(buf.slice());
+    } finally {
+      tmpCtx.close();
+    }
+
+    const channels = Math.min(audioBuffer.numberOfChannels, 2);
+    const sampleRate = audioBuffer.sampleRate;
+    const numSamples = audioBuffer.length;
+
+    const needsAudioPass = settings.slimSj || settings.slimVolume !== 100;
+    let renderedBuffer = audioBuffer;
+    if (needsAudioPass) {
+      const offCtx = new OfflineAudioContext(channels, numSamples, sampleRate);
+      const src = offCtx.createBufferSource();
+      src.buffer = audioBuffer;
+      let lastNode = src;
+
+      if (settings.slimVolume !== 100) {
+        const gain = offCtx.createGain();
+        gain.gain.value = settings.slimVolume / 100;
+        lastNode.connect(gain);
+        lastNode = gain;
+      }
+
+      if (settings.slimSj) {
+        let filterDefs = [];
+        if (settings.slimSjMode === 1 && settings.slimSjManualFilters?.length > 0) {
+          filterDefs = settings.slimSjManualFilters.map(flt => ({
+            freq: flt.freq, att: flt.att, q: flt.q,
+          }));
+        } else {
+          const n = Math.max(1, settings.slimSjCount | 0);
+          const att = settings.slimSjAtt;
+          let freqs = null;
+          if (settings.slimSjAdaptive) {
+            freqs = findSpectralPeaks(audioBuffer.getChannelData(0), sampleRate, n);
+          }
+          if (!freqs) freqs = pickSpectralFreqs(SPECTRAL_FREQ_POOL, n, 0.5);
+          filterDefs = freqs.map(freq => ({
+            freq,
+            att: att / 2 + Math.random() * att / 2,
+            q: Math.max(0.8, Math.min(6.0, 2.0 + 0.4 * Math.log2(freq / 1000))) + (Math.random() * 0.4 - 0.2),
+          }));
+        }
+        const nFilters = filterDefs.length;
+        for (let fi = 0; fi < nFilters; fi++) {
+          const { freq, att, q } = filterDefs[fi];
+          if (freq > sampleRate / 2 - 200) continue;
+          const f = offCtx.createBiquadFilter();
+          f.type = 'peaking';
+          f.frequency.value = freq;
+          f.gain.value = -att;
+          f.Q.value = q;
+          if (settings.slimSjTemporal) {
+            const osc = offCtx.createOscillator();
+            osc.frequency.value = 0.15;
+            const phi = fi * 2 * Math.PI / nFilters;
+            osc.setPeriodicWave(offCtx.createPeriodicWave(
+              new Float32Array([0, Math.sin(phi)]),
+              new Float32Array([0, Math.cos(phi)])
+            ));
+            const modG = offCtx.createGain();
+            // Negative sign matches desktop: gain = -(att + 1.5*sin(...))
+            // Clamp depth so effective gain never exceeds -0.3 dB (mirrors desktop's min(-0.3, ...))
+            modG.gain.value = -Math.min(1.5, Math.max(0, att - 0.3));
+            osc.connect(modG);
+            modG.connect(f.gain);
+            osc.start(0);
+          }
+          lastNode.connect(f);
+          lastNode = f;
+          if (settings.slimSjBoost) {
+            const boostFreq = Math.min(Math.round(freq * 1.5), 20000);
+            if (boostFreq < sampleRate / 2 - 200) {
+              const bf = offCtx.createBiquadFilter();
+              bf.type = 'peaking';
+              bf.frequency.value = boostFreq;
+              bf.gain.value = 0.5;
+              bf.Q.value = Math.max(0.8, Math.min(6.0, 2.0 + 0.4 * Math.log2(boostFreq / 1000)));
+              lastNode.connect(bf);
+              lastNode = bf;
+            }
+          }
+        }
+      }
+
+      lastNode.connect(offCtx.destination);
+      src.start(0);
+      renderedBuffer = await offCtx.startRendering();
+    }
+
+    if (onProgress) { onProgress(0.35); await new Promise(r => setTimeout(r, 0)); }
+
+    let leftF32 = renderedBuffer.getChannelData(0).slice();
+    let rightF32 = channels > 1 ? renderedBuffer.getChannelData(1).slice() : leftF32;
+    let encSampleRate = sampleRate;
+
+    if (settings.slimMp) {
+      let cents = settings.slimMpCents;
+      if (settings.slimMpRand && Math.random() < 0.5) cents = -cents;
+      const shiftedSr = Math.round(sampleRate * Math.pow(2, cents / 1200));
+      leftF32 = resampleLinear(leftF32, sampleRate, shiftedSr);
+      if (channels > 1) rightF32 = resampleLinear(rightF32, sampleRate, shiftedSr);
+      encSampleRate = sampleRate;
+    }
+
+    if (settings.slimRd) {
+      const drift = settings.slimRdAmount | 0;
+      const driftedSr = sampleRate + drift;
+      leftF32 = resampleLinear(leftF32, sampleRate, driftedSr);
+      if (channels > 1) rightF32 = resampleLinear(rightF32, sampleRate, driftedSr);
+      if (settings.slimRdVar) {
+        const wRate = 0.08 * 2 * Math.PI / driftedSr;
+        const depth = 0.002;
+        for (let i = 0; i < leftF32.length; i++) {
+          const mod = 1.0 + depth * Math.sin(i * wRate);
+          leftF32[i] *= mod;
+          if (channels > 1) rightF32[i] *= mod;
+        }
+      }
+    }
+
+    if (settings.slimSj && settings.slimSjNoise) {
+      for (let i = 0; i < leftF32.length; i++) {
+        leftF32[i] += 0.00145 * (Math.random() - 0.5) + 0.00075 * (Math.random() - 0.5);
+        if (channels > 1) rightF32[i] += 0.00145 * (Math.random() - 0.5) + 0.00075 * (Math.random() - 0.5);
+      }
+    }
+
+    if (settings.slimDc) {
+      const dcVal = settings.slimDcVal;
+      for (let i = 0; i < leftF32.length; i++) {
+        leftF32[i] += dcVal;
+        if (channels > 1) rightF32[i] += dcVal;
+      }
+    }
+
+    if (onProgress) { onProgress(0.65); await new Promise(r => setTimeout(r, 0)); }
+
+    const bitrate = settings.slimBitrate || 320;
+    const encoder = new lamejs.Mp3Encoder(channels, encSampleRate, bitrate);
+    const CHUNK = 1152;
+    const mp3Parts = [];
+    const totalSamples = leftF32.length;
+
+    for (let i = 0; i < totalSamples; i += CHUNK) {
+      const L = floatToInt16(leftF32.subarray(i, i + CHUNK));
+      const R = floatToInt16((channels > 1 ? rightF32 : leftF32).subarray(i, i + CHUNK));
+      const chunk = channels > 1 ? encoder.encodeBuffer(L, R) : encoder.encodeBuffer(L);
+      if (chunk.length > 0) mp3Parts.push(new Uint8Array(chunk));
+      if (onProgress && i % (CHUNK * 60) === 0) {
+        onProgress(0.65 + 0.3 * (i / totalSamples));
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+    const tail = encoder.flush();
+    if (tail.length > 0) mp3Parts.push(new Uint8Array(tail));
+
+    const totalLen = mp3Parts.reduce((s, c) => s + c.length, 0);
+    let mp3Data = new Uint8Array(totalLen);
+    let off = 0;
+    for (const p of mp3Parts) { mp3Data.set(p, off); off += p.length; }
+
+    let id3Frames = [];
+    if (settings.slimPreserveMeta || settings.slimPreserveCover) {
+      try {
+        const origView = new DataView(originalBuf);
+        if (origView.getUint8(0) === 0x49 && origView.getUint8(1) === 0x44 && origView.getUint8(2) === 0x33) {
+          const origTagSize = ((origView.getUint8(6)&0x7f)<<21)|((origView.getUint8(7)&0x7f)<<14)|
+                              ((origView.getUint8(8)&0x7f)<<7)|(origView.getUint8(9)&0x7f);
+          const id3Version = origView.getUint8(3);
+          let pos = 10;
+          const origBytes = new Uint8Array(originalBuf);
+          while (pos + 10 < 10 + origTagSize) {
+            const fid = String.fromCharCode(origBytes[pos],origBytes[pos+1],origBytes[pos+2],origBytes[pos+3]);
+            const b4=origBytes[pos+4],b5=origBytes[pos+5],b6=origBytes[pos+6],b7=origBytes[pos+7];
+            const fsize = id3Version >= 4
+              ? ((b4&0x7f)<<21)|((b5&0x7f)<<14)|((b6&0x7f)<<7)|(b7&0x7f)
+              : (b4<<24)|(b5<<16)|(b6<<8)|b7;
+            if (fsize <= 0 || pos + 10 + fsize > 10 + origTagSize) break;
+            const frameData = origBytes.subarray(pos + 10, pos + 10 + fsize);
+            if (settings.slimPreserveMeta && fid !== 'TLEN' && fid !== 'APIC') {
+              id3Frames.push(rawID3Frame(fid, frameData));
+            }
+            if (settings.slimPreserveCover && fid === 'APIC') {
+              id3Frames.push(rawID3Frame(fid, frameData));
+            }
+            pos += 10 + fsize;
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (settings.slimBd) {
+      const type = settings.slimBdType;
+      let fakeDurMs;
+      if (type === 0) fakeDurMs = Math.floor(Math.random() * (10*3600 - 3600) + 3600) * 1000;
+      else if (type === 1) fakeDurMs = Math.floor(Math.random() * 2901) + 100;
+      else if (type === 2) fakeDurMs = Math.floor(Math.random() * (120*60 - 60) + 60) * 1000;
+      else fakeDurMs = 16777215 * 1000;
+      id3Frames.push(makeID3Frame('TLEN', String(fakeDurMs)));
+    }
+
+    if (settings.slimCommunityTag && settings.slimCommunityTagText) {
+      id3Frames.push(makeID3Frame('TCOM', settings.slimCommunityTagText));
+    }
+
+    if (id3Frames.length > 0) {
+      let audioStart = 0;
+      if (mp3Data[0] === 0x49 && mp3Data[1] === 0x44 && mp3Data[2] === 0x33) {
+        const tagSize = ((mp3Data[6]&0x7f)<<21)|((mp3Data[7]&0x7f)<<14)|((mp3Data[8]&0x7f)<<7)|(mp3Data[9]&0x7f);
+        audioStart = 10 + tagSize;
+      }
+      const newTag = buildID3v2(id3Frames);
+      const combined = new Uint8Array(newTag.length + mp3Data.length - audioStart);
+      combined.set(newTag, 0);
+      combined.set(mp3Data.subarray(audioStart), newTag.length);
+      mp3Data = combined;
+    }
+
+    if (onProgress) onProgress(1);
+    return new File([mp3Data], file.name, { type: 'audio/mpeg' });
+  }
+
+  function rawID3Frame(fid, data) {
+    const frame = new Uint8Array(10 + data.length);
+    for (let i = 0; i < 4; i++) frame[i] = fid.charCodeAt(i);
+    const s = data.length;
+    frame[4]=(s>>24)&0xff; frame[5]=(s>>16)&0xff; frame[6]=(s>>8)&0xff; frame[7]=s&0xff;
+    frame[8]=0; frame[9]=0;
+    frame.set(data, 10);
+    return frame;
+  }
+
+  // Renders in place of our own #vmu-dropzone, inside whatever native VK
+  // dialog is already open (same host buildEmbeddedUI mounts into for both
+  // old- and new-VK markup) — not a page-covering overlay. The dialog's own
+  // header/footer chrome stays put, so this reads as native progress rather
+  // than a separate popup stacked on top of it.
+  function showProcessingUI(totalFiles) {
+    let box = document.getElementById('vmu-slim-processing');
+    if (box) {
+      document.getElementById('vmu-slim-counter').textContent = `0 / ${totalFiles}`;
+      return;
+    }
+    box = document.createElement('div');
+    box.id = 'vmu-slim-processing';
+    box.className = 'vmu-slim-processing';
+    box.innerHTML = `
+      <div class="vmu-slim-processing-title">Обработка треков…</div>
+      <div class="vmu-slim-processing-file" id="vmu-slim-file-name"></div>
+      <div class="vmu-slim-track"><div class="vmu-slim-fill" id="vmu-slim-fill"></div></div>
+      <div class="vmu-slim-counter" id="vmu-slim-counter">0 / ${totalFiles}</div>`;
+    const dropzone = document.getElementById('vmu-dropzone');
+    if (dropzone) {
+      dropzone.style.display = 'none';
+      dropzone.insertAdjacentElement('afterend', box);
+    } else {
+      // No dialog mounted (shouldn't normally happen — files only reach
+      // handoffFilesNatively through our embedded dropzone or its drop
+      // target) — fall back to a small floating card so progress still
+      // has somewhere to show.
+      box.classList.add('vmu-slim-processing-floating');
+      document.body.appendChild(box);
+    }
+  }
+
+  function updateProcessingUI(fileName, fileIdx, totalFiles, filePct) {
+    const nameEl = document.getElementById('vmu-slim-file-name');
+    const fillEl = document.getElementById('vmu-slim-fill');
+    const cntEl = document.getElementById('vmu-slim-counter');
+    const short = fileName.replace(/\.mp3$/i, '');
+    if (nameEl) nameEl.textContent = short.length > 52 ? short.slice(0, 50) + '…' : short;
+    const overall = ((fileIdx - 1) + (filePct || 0)) / totalFiles;
+    if (fillEl) fillEl.style.width = `${Math.round(overall * 100)}%`;
+    if (cntEl) cntEl.textContent = `${fileIdx} / ${totalFiles}`;
+  }
+
+  function hideProcessingUI() {
+    const box = document.getElementById('vmu-slim-processing');
+    if (!box) return;
+    const dropzone = document.getElementById('vmu-dropzone');
+    if (dropzone) dropzone.style.display = '';
+    box.remove();
+  }
+
   // Reads ID3 (for auto-meta), then hands every file straight to VK's own
   // hidden native file input (see VK_HANDOFF_FILES in injected.js) and lets
   // VK's own dialog do the rest — no progress/status tracking on our side.
@@ -5613,10 +6807,31 @@
     if (shouldTrackPlaylist) autoPlaylistClaimed = true;
     const startCountEarly = shouldTrackPlaylist ? getPageTrackCount() : null;
 
+    // Best-effort per-file failure tracking for this batch: injected.js's
+    // upload-response interception posts VK_UPLOAD_DONE with
+    // {fileName, error} whenever it manages to correlate a response back to
+    // a specific file. That correlation isn't guaranteed under native
+    // handoff (VK's newer transport sometimes hands back fileName: null —
+    // see NATIVE_HANDOFF_ONLY above), so this is a bonus, not a primary
+    // signal: when it DOES resolve, it lets us drop a track that's known to
+    // have failed (VK's own "не удалось загрузить" rejection, e.g. a
+    // duplicate) from the auto-playlist search instead of scrolling the
+    // whole community catalog to the bottom hunting for it.
+    const failedNames = new Set();
+    const onUploadDone = (e) => {
+      if (e.source !== window || e.data?.type !== 'VK_UPLOAD_DONE') return;
+      if (e.data.error && e.data.fileName) failedNames.add(e.data.fileName);
+    };
+    if (startCountEarly != null) window.addEventListener('message', onUploadDone);
+
     const items = [];
     const batchItems = [];
+    const slimActive = settings.slimEnabled;
+    if (slimActive) showProcessingUI(files.length);
+    let slimIdx = 0;
     for (const f of files) {
       let file = f;
+      slimIdx++;
       // Read unconditionally (not just under autoMeta) — auto-playlist needs
       // these tags for its title/description/track-order logic below even
       // when the user doesn't want tags rewritten into the file itself.
@@ -5632,14 +6847,35 @@
             const parsed = parseMetaFromFilename(f.name);
             const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : joinWithJunk(parsed.artist, artistSplit.junk);
             const title = hasTitle ? tags.TIT2 : joinWithJunk(parsed.title, titleSplit.junk);
-            if (artist || title) file = await patchID3(f, artist, title);
+            if (artist || title) {
+              file = await patchID3(f, artist, title);
+              // Keep `tags` in sync with what actually got embedded/uploaded.
+              // runAutoPlaylist reads tags.TPE1/TIT2 straight off this object
+              // for the playlist title AND for trackNames (what the edit
+              // dialog gets searched for) — left pointing at the raw
+              // pre-patch tag, a source file with a missing or junk-only
+              // title (e.g. TIT2 = "[vk.com/reuploadunder]", common on this
+              // community's reuploads) made the search hunt for that literal
+              // junk instead of the real corrected title, matching nothing
+              // and scrolling the whole catalog to the bottom.
+              tags = { ...tags, TPE1: artist, TIT2: title };
+            }
           }
         } catch {}
+      }
+      if (slimActive) {
+        try {
+          updateProcessingUI(file.name, slimIdx, files.length, 0);
+          file = await applyAudioProcessing(file, pct => {
+            updateProcessingUI(file.name, slimIdx, files.length, pct);
+          });
+        } catch (e) { console.error('[VMU Slim] processing error:', e); }
       }
       const buffer = await file.arrayBuffer();
       items.push({ name: file.name, mimeType: file.type || 'audio/mpeg', buffer });
       batchItems.push({ file, tags, status: 'done' });
     }
+    if (slimActive) hideProcessingUI();
     // Optimistic count — without per-file confirmation from VK we can't know
     // exactly how many actually landed, only how many we handed off. Close
     // enough for the "you're approaching VK's 70/day cap" warning this is for.
@@ -5653,11 +6889,34 @@
       waitForTrackCountIncrease(startCount, items.length)
         .then(gained => {
           autoPlaylistClaimed = false; // decided — a new upload can claim the next slot now
-          if (gained > 0) { enqueueAutoPlaylist(batchItems); return; }
-          showProgressToast('Ошибка: загрузка не подтвердилась, плейлист не создан', { id: 'vmu-autoplaylist', kind: 'error' });
+          window.removeEventListener('message', onUploadDone);
+          if (gained <= 0) {
+            showProgressToast('Ошибка: загрузка не подтвердилась, плейлист не создан', { id: 'vmu-autoplaylist', kind: 'error' });
+            return;
+          }
+          if (gained < items.length) {
+            // Fewer tracks landed than we sent — at least one failed
+            // server-side after leaving our code (duplicate, rejected by
+            // VK, etc). If VK_UPLOAD_DONE positively identified enough
+            // failures to account for the whole shortfall, drop exactly
+            // those and search for the rest as usual; otherwise we can't
+            // tell WHICH ones are missing, and searching for all of them
+            // would scroll the whole catalog hunting for tracks that were
+            // never actually added.
+            const survivors = batchItems.filter(b => !failedNames.has(b.file.name));
+            if (survivors.length === gained) {
+              showProgressToast(`${items.length - gained} из ${items.length} не загрузились — пропускаем их и добавляем остальные…`, { id: 'vmu-autoplaylist' });
+              enqueueAutoPlaylist(survivors);
+              return;
+            }
+            showProgressToast(`Загружено ${gained} из ${items.length} — часть треков не удалось загрузить, плейлист не создан автоматически`, { id: 'vmu-autoplaylist', kind: 'error' });
+            return;
+          }
+          enqueueAutoPlaylist(batchItems);
         })
         .catch(err => {
           autoPlaylistClaimed = false;
+          window.removeEventListener('message', onUploadDone);
           showProgressToast(`Ошибка: ${translateError(err.message)}`, { id: 'vmu-autoplaylist', kind: 'error' });
         });
     }
@@ -8798,6 +10057,7 @@
           const editBox = getEditPlaylistBox();
           injectPlaylistSortToggle(editBox);
           injectCoverEditorRow(editBox);
+          injectGeniusFindRow(editBox);
         }, 250);
       }
     }
