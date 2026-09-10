@@ -3156,6 +3156,10 @@
                 const added = await addTracksToExistingPlaylist(match, namesToAdd);
                 if (added) {
                   showProgressToast(`Добавлено в «${title.slice(0,30)}»`, { id: 'vmu-autoplaylist', kind: 'done' });
+                  // Reload so the freshly-added tracks are visible in the
+                  // playlist (VK's own DOM lags behind its API here — same
+                  // reason reloadAfterBatchIfNeeded reloads after uploads).
+                  setTimeout(() => location.reload(), 1500);
                   return;
                 }
                 console.warn('[VK Multi Upload] auto-add to existing playlist failed, falling back to duplicate prompt');
@@ -3230,6 +3234,13 @@
       }, 60000, 'reqId');
 
       showProgressToast(`Плейлист «${title.slice(0,30)}» создан!`, { id: 'vmu-autoplaylist', kind: 'done' });
+      // Extra reload after playlist creation: VK caches the owner's
+      // playlist list and won't show the fresh one until a full reload,
+      // and its track ordering/counts on the newly-created playlist are
+      // often stale in the current DOM. The outer reloadAfterBatchIfNeeded
+      // fires around the same 1.5s mark — whichever setTimeout wins tears
+      // down the page, the other never runs.
+      setTimeout(() => location.reload(), 1500);
     } catch (err) {
       showProgressToast(`Ошибка: ${translateError(err.message)}`, { id: 'vmu-autoplaylist', kind: 'error' });
       console.error('[VK Multi Upload]', err);
@@ -8644,16 +8655,20 @@
     processQueue();
   }
 
-  // Native uploads (the normal case now) update VK's own store directly, so
-  // the visible list is already correct — just release the close lock. Only
-  // the frozen/DOM-input fallback paths in VK_INJECT_FILES never touch VK's
-  // store, so THEY still need the page-reload workaround to show up.
+  // Reload the page unconditionally after every completed batch. Even native
+  // uploads (which do update VK's own store) leave the visible audio list
+  // and the playlist modal DOM stale — a track can succeed at the API level
+  // and remain invisible until reload, which then breaks the duplicate scan
+  // on the next click since it can only see rows VK has actually mounted.
+  // Called from processQueue AFTER runAutoPlaylist finishes (via
+  // enqueueAutoPlaylist's onSettled), so the auto-playlist flow — which
+  // drives VK's own create-playlist dialog off trackNames metadata, not the
+  // background page's DOM — completes first and isn't torn down by the
+  // reload. A short delay lets the final "готово / плейлист создан" toast
+  // register visually before the page tears down.
   function reloadAfterBatchIfNeeded() {
-    if (lastBatchNative) {
-      setBlockAudioHide(false);
-      return;
-    }
-    location.reload();
+    setBlockAudioHide(false);
+    setTimeout(() => location.reload(), 1500);
   }
 
   // ─── Embed full UI into VK's native upload dialog ────────────────────────────
@@ -9053,6 +9068,33 @@
   const ICON_DUPES_SCAN = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="10" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>`;
   const ICON_DUPES_STOP = `<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`;
 
+  // sessionStorage key for the dupes-scan pre-reload → auto-resume flow.
+  // A first click on "Проверить на дубликаты" stores the target playlist
+  // here and reloads the page; on the next load, tryInjectDupesIntoEditDialog
+  // sees a matching entry and auto-clicks the freshly-injected button,
+  // which then finds the flag still present and runs the actual scan. This
+  // guarantees the scan runs against a freshly-mounted playlist modal
+  // instead of whatever stale DOM state accumulated since the page loaded
+  // (highlights from a prior scan, tracks uploaded during this session but
+  // not yet reflected in VK's popup, etc.).
+  const DUPES_SCAN_RESUME_KEY = 'vmu-dupes-scan-resume';
+  const DUPES_SCAN_RESUME_MAX_AGE_MS = 60_000;
+
+  function readDupesScanResume() {
+    try {
+      const raw = sessionStorage.getItem(DUPES_SCAN_RESUME_KEY);
+      if (!raw) return null;
+      const saved = JSON.parse(raw);
+      if (!saved || (Date.now() - (saved.ts || 0)) > DUPES_SCAN_RESUME_MAX_AGE_MS) {
+        sessionStorage.removeItem(DUPES_SCAN_RESUME_KEY);
+        return null;
+      }
+      return saved;
+    } catch {
+      return null;
+    }
+  }
+
   function makeDupesBtn(plInfo) {
     const btn = document.createElement('button');
     btn.className = 'vmu-dupes-dialog-btn';
@@ -9068,6 +9110,29 @@
         // collected so far instead of starting a new scan.
         cancelToken.cancelled = true;
         btn.disabled = true;
+        return;
+      }
+      const resume = readDupesScanResume();
+      const matches = resume
+        && resume.ownerId === (plInfo?.ownerId ?? null)
+        && resume.playlistId === (plInfo?.playlistId ?? null);
+      if (matches) {
+        // Second click after reload (either the auto-click below or the
+        // user retrying) — clear the flag and run the actual scan against
+        // this fresh DOM.
+        sessionStorage.removeItem(DUPES_SCAN_RESUME_KEY);
+      } else {
+        // First click — remember the target playlist, reload so the scan
+        // runs against fresh VK state, and let the auto-resume path below
+        // trigger the click again once the button is re-injected.
+        try {
+          sessionStorage.setItem(DUPES_SCAN_RESUME_KEY, JSON.stringify({
+            ownerId: plInfo?.ownerId ?? null,
+            playlistId: plInfo?.playlistId ?? null,
+            ts: Date.now(),
+          }));
+        } catch {}
+        location.reload();
         return;
       }
       cancelToken = { cancelled: false };
@@ -9143,9 +9208,25 @@
 
     const newRow = document.createElement('div');
     newRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;padding:8px 0 0;';
-    newRow.appendChild(makeDupesBtn(plInfo));
+    const dupesBtn = makeDupesBtn(plInfo);
+    newRow.appendChild(dupesBtn);
     newRow.appendChild(makeDlDialogBtn(plInfo, 'individual'));
     newRow.appendChild(makeDlDialogBtn(plInfo, 'zip'));
+
+    // Auto-resume: if the user clicked "Проверить на дубликаты" just before
+    // this reload, and VK has restored the same playlist modal via its
+    // hashed URL, click the freshly-injected button once so the scan runs
+    // without a second manual click. makeDupesBtn's own click handler sees
+    // the still-present sessionStorage flag and treats this as the actual
+    // scan (not another reload) — see readDupesScanResume above.
+    const resume = readDupesScanResume();
+    if (resume
+        && resume.ownerId === (plInfo?.ownerId ?? null)
+        && resume.playlistId === (plInfo?.playlistId ?? null)) {
+      setTimeout(() => {
+        if (document.body.contains(dupesBtn)) dupesBtn.click();
+      }, 300);
+    }
 
     // Appending inside flexParent used to be enough to have the row sit below
     // VK's own buttons, but VK's header (MusicPlaylistModal_Header, was
