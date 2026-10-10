@@ -30,21 +30,34 @@
   // let that first event through, the coordinate check on 'drop' then fails
   // because #vmu-embedded no longer exists.
   let dndCounter = 0;
+  // Detect any incarnation of our upload UI: VK's native dialog, the held-open
+  // protected zombie, or just the presence of our injected panel.
+  // After the first file VK strips its own audio input + SelectFileButton,
+  // so the original (input/testid-based) check fails — we'd miss subsequent
+  // drops onto the still-open dialog.
+  const findUploadBox = () => document.querySelector('.audio_add_box') ||
+    document.querySelector('[data-vmu-protected]') ||
+    document.getElementById('vmu-embedded')?.closest('[class*="vkitInternalModalBox"]') ||
+    [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+      .find(m => m.getBoundingClientRect().width > 0 &&
+                 (m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
+                  m.querySelector('[data-testid="UploadAudio_SelectFileButton"]') ||
+                  m.querySelector('#vmu-embedded')));
+  // dragover fires every ~50ms for the whole time anything is dragged over
+  // ANY vk.com page (chat attachments, images, text selections, ...) and the
+  // lookup above includes a document-wide attribute scan plus
+  // getBoundingClientRect (forced layout) — so dragover reuses a lookup at
+  // most 150ms old. dragenter/dragleave/drop (a handful per gesture) always
+  // look fresh, and only truthiness of the result is ever used.
+  let lastBox = null, lastBoxAt = -Infinity;
   for (const evt of ['dragenter', 'dragover', 'dragleave', 'drop']) {
     window.addEventListener(evt, e => {
-      // Detect any incarnation of our upload UI: VK's native dialog, the held-open
-      // protected zombie, or just the presence of our injected panel.
-      // After the first file VK strips its own audio input + SelectFileButton,
-      // so the original (input/testid-based) check fails — we'd miss subsequent
-      // drops onto the still-open dialog.
-      const box = document.querySelector('.audio_add_box') ||
-        document.querySelector('[data-vmu-protected]') ||
-        document.getElementById('vmu-embedded')?.closest('[class*="vkitInternalModalBox"]') ||
-        [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-          .find(m => m.getBoundingClientRect().width > 0 &&
-                     (m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
-                      m.querySelector('[data-testid="UploadAudio_SelectFileButton"]') ||
-                      m.querySelector('#vmu-embedded')));
+      const now = performance.now();
+      if (evt !== 'dragover' || now - lastBoxAt > 150) {
+        lastBox = findUploadBox();
+        lastBoxAt = now;
+      }
+      const box = lastBox;
       if (!box) return;
       e.preventDefault();
       e.stopPropagation();

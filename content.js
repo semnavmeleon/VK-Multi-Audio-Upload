@@ -1288,6 +1288,142 @@
     if (label && options[idx] !== undefined) label.textContent = options[idx];
   }
 
+  // Themed stand-in for a native <select> in the extension's panels. A native
+  // select's popup is OS chrome: in the dark theme its options inherit the
+  // select's light text colour onto the popup's white background and become
+  // unreadable (reported on the 216-playlist picker), and it can't be styled.
+  // The real <select> stays in the DOM, hidden — its `value`, `options` and
+  // `change` event are what the callers already use — and this just adds a
+  // button + list in front of it:
+  //  - the list is a body-level fixed popover, so a panel's overflow:hidden
+  //    can't clip it (the FX dropdown above is absolutely positioned inside
+  //    its panel, which is fine for two short lists, not here);
+  //  - long lists (>12 options, or opts.search) get a filter box, since
+  //    scrolling 200+ playlists by eye isn't workable;
+  //  - programmatic `select.value = x` / `selectedIndex = n` and rebuilding
+  //    the options (the playlist picker does) keep the button label in sync.
+  function vmuEnhanceSelect(select, opts) {
+    if (!select || select.dataset.vmuEnhanced) return;
+    select.dataset.vmuEnhanced = '1';
+    const maxW = getComputedStyle(select).maxWidth;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'vmu-sel';
+    if (maxW && maxW !== 'none') wrap.style.maxWidth = maxW;
+    wrap.innerHTML = `<button type="button" class="vmu-sel-btn"><span class="vmu-sel-label"></span>${ICON_DD_CHEVRON}</button>`;
+    const btn = wrap.firstElementChild;
+    const label = btn.querySelector('.vmu-sel-label');
+    if (select.title) btn.title = select.title;
+    select.before(wrap);
+    select.style.display = 'none';
+
+    const syncLabel = () => {
+      label.textContent = select.selectedOptions[0]?.textContent || '';
+      btn.disabled = select.disabled;
+    };
+    for (const prop of ['value', 'selectedIndex']) {
+      const d = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, prop);
+      Object.defineProperty(select, prop, {
+        configurable: true,
+        get() { return d.get.call(this); },
+        set(v) { d.set.call(this, v); syncLabel(); },
+      });
+    }
+    new MutationObserver(syncLabel).observe(select, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled'] });
+    syncLabel();
+
+    let list = null;
+    let teardown = null;
+    const close = () => {
+      if (!list) return;
+      teardown?.();
+      list.remove();
+      list = null;
+      teardown = null;
+      wrap.classList.remove('vmu-sel-open');
+    };
+    const open = () => {
+      if (list || select.disabled) return;
+      const options = [...select.options];
+      const searchable = opts?.search ?? options.length > 12;
+      list = document.createElement('div');
+      list.className = 'vmu-sel-list';
+      list.innerHTML = `${searchable ? '<input type="text" class="vmu-sel-search" placeholder="Поиск…" spellcheck="false">' : ''}<div class="vmu-sel-items"></div>`;
+      const itemsEl = list.querySelector('.vmu-sel-items');
+      const searchEl = list.querySelector('.vmu-sel-search');
+      let shown = [];
+      let hi = 0;
+      const paintHi = () => {
+        itemsEl.querySelectorAll('.vmu-sel-item').forEach((el, i) => el.classList.toggle('vmu-sel-hi', i === hi));
+        itemsEl.querySelectorAll('.vmu-sel-item')[hi]?.scrollIntoView({ block: 'nearest' });
+      };
+      const render = query => {
+        const needle = (query || '').trim().toLowerCase();
+        shown = options.filter(o => !needle || o.textContent.toLowerCase().includes(needle));
+        itemsEl.innerHTML = shown.length
+          ? shown.map(o => `<button type="button" class="vmu-sel-item${o.index === select.selectedIndex ? ' active' : ''}" data-i="${o.index}">${escHtml(o.textContent)}</button>`).join('')
+          : '<div class="vmu-sel-empty">Ничего не найдено</div>';
+        hi = Math.max(0, shown.findIndex(o => o.index === select.selectedIndex));
+        if (needle) hi = 0;
+        paintHi();
+      };
+      const pick = idx => {
+        close();
+        if (idx === select.selectedIndex) return;
+        select.selectedIndex = idx;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      };
+      render('');
+      document.body.appendChild(list);
+
+      const r = btn.getBoundingClientRect();
+      const width = Math.min(Math.max(r.width, 220), window.innerWidth - 16);
+      list.style.width = width + 'px';
+      list.style.left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8)) + 'px';
+      const below = window.innerHeight - r.bottom - 12;
+      const above = r.top - 12;
+      const openUp = below < Math.min(list.scrollHeight, 200) && above > below;
+      list.style.maxHeight = Math.max(120, Math.min(340, openUp ? above : below)) + 'px';
+      if (openUp) list.style.bottom = (window.innerHeight - r.top + 4) + 'px';
+      else list.style.top = (r.bottom + 4) + 'px';
+      wrap.classList.add('vmu-sel-open');
+      paintHi(); // scroll the current option into view now that the list is laid out
+
+      list.addEventListener('click', e => {
+        const it = e.target.closest('.vmu-sel-item');
+        if (it) pick(Number(it.dataset.i));
+      });
+      if (searchEl) {
+        searchEl.addEventListener('input', () => render(searchEl.value));
+        searchEl.addEventListener('keydown', e => {
+          if (e.key === 'ArrowDown') { e.preventDefault(); hi = Math.min(shown.length - 1, hi + 1); paintHi(); }
+          else if (e.key === 'ArrowUp') { e.preventDefault(); hi = Math.max(0, hi - 1); paintHi(); }
+          else if (e.key === 'Enter') { e.preventDefault(); if (shown[hi]) pick(shown[hi].index); }
+        });
+        searchEl.focus();
+      }
+
+      const onDown = e => { if (!list.contains(e.target) && !wrap.contains(e.target)) close(); };
+      const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); btn.focus(); } };
+      const onScroll = e => { if (!list.contains(e.target)) close(); };
+      // The panel can be closed (or VK can re-render it away) while the list is open.
+      const gone = new MutationObserver(() => { if (!wrap.isConnected) close(); });
+      document.addEventListener('pointerdown', onDown, true);
+      document.addEventListener('keydown', onKey, true);
+      window.addEventListener('scroll', onScroll, true);
+      window.addEventListener('resize', close);
+      gone.observe(document.body, { childList: true, subtree: true });
+      teardown = () => {
+        document.removeEventListener('pointerdown', onDown, true);
+        document.removeEventListener('keydown', onKey, true);
+        window.removeEventListener('scroll', onScroll, true);
+        window.removeEventListener('resize', close);
+        gone.disconnect();
+      };
+    };
+    btn.addEventListener('click', () => { if (list) close(); else open(); });
+  }
+
   function buildAudioFxPanel() {
     const limiterRow = (id, label, min, max, step, value, unit, help) => `
       <div class="vmu-setting-row vmu-slider-row">
@@ -1618,9 +1754,13 @@
 
   function positionAudioFxUI() {
     const panel = document.getElementById('vmu-audiofx-panel');
-    const btn = getVisibleAudioFxBtn();
-    if (!btn || !panel || !panel.classList.contains('vmu-audiofx-panel-open')) return;
+    // Panel-state checks first: getVisibleAudioFxBtn() reads button rects
+    // (forced reflow), and this runs on every throttled page mutation even
+    // while the panel is closed — which is nearly always.
+    if (!panel || !panel.classList.contains('vmu-audiofx-panel-open')) return;
     if (panel.dataset.vmuUserMoved) return;
+    const btn = getVisibleAudioFxBtn();
+    if (!btn) return;
     const margin = 12;
     const r = btn.getBoundingClientRect();
     // Anchor under the button's own live position rather than guessing from
@@ -2204,38 +2344,51 @@
   // while engaged, so content doesn't jump.
   function applyTabsBarPin() {
     const sections = document.querySelectorAll('[data-testid="AudioCatalog_Header"]');
-    const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
-    const topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
-    // AudioPage_PlayerBlock (album art / transport controls under the nav
-    // bar) is VK's persistent mini-player — confirmed live it stays fixed at
-    // the same viewport position no matter how far you scroll. VK actually
-    // renders *two* instances sharing this testid (a normal-flow one that
-    // scrolls away, plus the fixed one that's actually on screen); querying
-    // just the first one picked the wrong copy and made the anchor collapse
-    // back too early, overlapping the real bar. Taking the max bottom across
-    // all matches always lands on whichever is actually visible.
-    let playerBottom = 0;
-    let visiblePlayerBlock = null;
-    for (const pb of document.querySelectorAll('[data-testid="AudioPage_PlayerBlock"]')) {
-      const b = pb.getBoundingClientRect().bottom;
-      if (b > playerBottom) { playerBottom = b; visiblePlayerBlock = pb; }
-    }
-    const anchor = Math.round(Math.max(48, topBarBottom, playerBottom));
+    // This runs on every throttled page mutation (see onPageMutated), on
+    // EVERY vk.com page — feed, messenger, everywhere — and the rects/computed
+    // style read below each force a synchronous reflow in the middle of
+    // VK's own DOM writes. All of it only feeds the pinning maths, which
+    // needs both the setting on and a catalog header to pin, so skip the
+    // reads entirely otherwise. With pinning off the loop below only ever
+    // unpins and the flat-card class only ever gets removed — the same end
+    // state the full path reached, minus the layout thrash.
+    const needLayout = !!settings.pinTabsBar && sections.length > 0;
+    let anchor = 0;
+    let mmCard = null;
+    if (needLayout) {
+      const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
+      const topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
+      // AudioPage_PlayerBlock (album art / transport controls under the nav
+      // bar) is VK's persistent mini-player — confirmed live it stays fixed at
+      // the same viewport position no matter how far you scroll. VK actually
+      // renders *two* instances sharing this testid (a normal-flow one that
+      // scrolls away, plus the fixed one that's actually on screen); querying
+      // just the first one picked the wrong copy and made the anchor collapse
+      // back too early, overlapping the real bar. Taking the max bottom across
+      // all matches always lands on whichever is actually visible.
+      let playerBottom = 0;
+      let visiblePlayerBlock = null;
+      for (const pb of document.querySelectorAll('[data-testid="AudioPage_PlayerBlock"]')) {
+        const b = pb.getBoundingClientRect().bottom;
+        if (b > playerBottom) { playerBottom = b; visiblePlayerBlock = pb; }
+      }
+      anchor = Math.round(Math.max(48, topBarBottom, playerBottom));
 
-    // The multimedia card (AudioPage_PlayerBlock's own vkitInternalGroupCard
-    // wrapper) draws its "border" via a uniform inset box-shadow on ::before,
-    // not a real border property. While merged, .vmu-multimedia-flat (CSS)
-    // disables that and substitutes a top+left+right-only version — keeps
-    // the outer edges bordered but drops the bottom line where it now
-    // touches our panel, so the two read as one continuous outline instead
-    // of a seam. Borrow the exact same color for both so it still looks
-    // intentional, instead of hardcoding a color that'd drift from whatever
-    // theme VK is currently rendering.
-    const mmCard = visiblePlayerBlock ? visiblePlayerBlock.closest('section') : null;
-    if (mmCard) {
-      const mmBorder = getComputedStyle(mmCard, '::before').boxShadow;
-      const m = mmBorder.match(/rgba?\([^)]+\)/);
-      if (m) document.documentElement.style.setProperty('--vmu-pin-border', m[0]);
+      // The multimedia card (AudioPage_PlayerBlock's own vkitInternalGroupCard
+      // wrapper) draws its "border" via a uniform inset box-shadow on ::before,
+      // not a real border property. While merged, .vmu-multimedia-flat (CSS)
+      // disables that and substitutes a top+left+right-only version — keeps
+      // the outer edges bordered but drops the bottom line where it now
+      // touches our panel, so the two read as one continuous outline instead
+      // of a seam. Borrow the exact same color for both so it still looks
+      // intentional, instead of hardcoding a color that'd drift from whatever
+      // theme VK is currently rendering.
+      mmCard = visiblePlayerBlock ? visiblePlayerBlock.closest('section') : null;
+      if (mmCard) {
+        const mmBorder = getComputedStyle(mmCard, '::before').boxShadow;
+        const m = mmBorder.match(/rgba?\([^)]+\)/);
+        if (m) document.documentElement.style.setProperty('--vmu-pin-border', m[0]);
+      }
     }
     let anyEngaged = false;
 
@@ -2300,6 +2453,9 @@
     }
 
     if (mmCard) mmCard.classList.toggle('vmu-multimedia-flat', anyEngaged);
+    // Layout reads were skipped: nothing can be engaged, so just make sure a
+    // flat-card class left over from an earlier pinned state is cleared.
+    else if (!needLayout) document.querySelector('.vmu-multimedia-flat')?.classList.remove('vmu-multimedia-flat');
   }
 
   function applyAudioCatalogLayout() {
@@ -2733,6 +2889,30 @@
     return null;
   }
 
+  // Scrolls to the bottom repeatedly — that's what drives the catalog's lazy
+  // loading — until countFn() stops growing for stableLimit checks in a row.
+  //
+  // foreground: for a scan the user is watching in their own tab. A
+  // backgrounded tab never runs VK's lazy loader (confirmed live — the count
+  // sits still for as long as the tab is hidden), so ticks spent hidden are
+  // skipped instead of read as "the list ended". Left off for the
+  // hidden-window scan, where document.hidden may never clear.
+  async function scrollUntilCountStable(countFn, { sleepMs = 600, stableLimit = 4, maxIter = 60, foreground = false, onCount, shouldStop } = {}) {
+    let lastCount = -1, stable = 0, iter = 0;
+    while (iter < maxIter && stable < stableLimit) {
+      if (shouldStop?.()) break;
+      if (foreground && document.hidden) { await sleep(sleepMs); continue; }
+      window.scrollTo(0, document.body.scrollHeight);
+      await sleep(sleepMs);
+      if (foreground && document.hidden) continue;
+      iter++;
+      const n = countFn();
+      stable = (n === lastCount) ? stable + 1 : 0;
+      lastCount = n;
+      onCount?.(n);
+    }
+  }
+
   // Returns [{id: "ownerId_playlistId", title}] — the id is what the
   // auto-add-to-existing-playlist feature needs to actually add tracks
   // (VK_ADD_TRACKS_TO_PLAYLIST), not just detect a name collision.
@@ -2752,15 +2932,7 @@
       await waitForElement(CELL_SEL, 5000);
     }
 
-    let lastCount = -1, stable = 0;
-    const MAX_ITER = 60, STABLE_LIMIT = 4;
-    for (let i = 0; i < MAX_ITER && stable < STABLE_LIMIT; i++) {
-      window.scrollTo(0, document.body.scrollHeight);
-      await sleep(600);
-      const n = document.querySelectorAll(CELL_SEL).length;
-      stable = (n === lastCount) ? stable + 1 : 0;
-      lastCount = n;
-    }
+    await scrollUntilCountStable(() => document.querySelectorAll(CELL_SEL).length);
 
     return [...document.querySelectorAll(CELL_SEL)]
       .map(cell => ({
@@ -2778,10 +2950,46 @@
   // scroll loop works unchanged here since callPlaylistTailLoader/
   // markRowTrackData (injected.js) already query `document` globally rather
   // than a specific modal element.
+  // The standalone playlist page renders only a collapsed preview (5 rows,
+  // "Показать все" under it — verified live on a 32-track playlist), same as
+  // the popup does. expandPlaylistModal skips revealModalList when handed a
+  // container (an older note here said this page needed no click; VK has since
+  // collapsed it), so without this step a scan only ever saw the preview.
+  // Scoped to the tracks block so an unrelated "Показать все" elsewhere on the
+  // page can't be hit; VK marks the button with an audiolistitems-expandbutton
+  // attribute, with its text as the fallback.
+  async function revealPlaylistPageList() {
+    const scope = document.querySelector('[data-testid="MusicPlaylistPage_Tracks"], [data-testid="MusicPlaylistTracks_Items"]');
+    if (!scope) return false;
+    const btn = scope.querySelector('[audiolistitems-expandbutton]')
+      || [...scope.querySelectorAll('span, a, button, div')].find(el =>
+        el.children.length === 0 && /^показать (все|всё)$/i.test((el.textContent || '').trim()));
+    if (!btn) return false;
+    btn.click();
+    await sleep(900);
+    return true;
+  }
+
   async function scanPlaylistTracksOnPage() {
     await waitForElement(VMU_MODAL_ROW_SEL, 8000); // null on timeout = legitimately empty playlist
+    await revealPlaylistPageList();
     const items = await expandPlaylistModal(null, null, document.body);
-    return items.map(it => ({ artist: it.artist || '', title: it.title || '' }));
+    // artist/title are what the original callers read. id/isBlocked/duration
+    // are extras for the playlist collector: isBlocked already comes off each
+    // row's stamp (expandPlaylistModal), and durations are read from those
+    // same stamps here — expandPlaylistModal's own items deliberately don't
+    // carry one (its other callers' duplicate matching is tuned without it).
+    const durationById = new Map();
+    for (const row of document.querySelectorAll('[data-vmu-track]')) {
+      try {
+        const d = JSON.parse(row.dataset.vmuTrack);
+        if (d?.id) durationById.set(d.id, d.duration || 0);
+      } catch {}
+    }
+    return items.map(it => ({
+      artist: it.artist || '', title: it.title || '',
+      id: it.id || null, isBlocked: !!it.isBlocked, duration: durationById.get(it.id) || 0,
+    }));
   }
 
   if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
@@ -2809,6 +3017,9 @@
       save_btn_not_found: 'Кнопка "Сохранить" не найдена в диалоге.',
       save_playlist_timeout: 'Плейлист не был сохранён за 20 секунд.',
       playlist_id_not_found: 'Не удалось получить ID созданного плейлиста.',
+      edit_button_not_found: 'Не нашёл плейлист на открытой странице (нужна его кнопка «Редактировать»). Открой страницу, где плейлист виден, и повтори.',
+      add_audios_btn_not_found: 'В диалоге плейлиста нет кнопки «Добавить аудиозаписи».',
+      audio_item_list_not_found: 'Список «Добавить аудиозаписи» не открылся.',
     };
     return map[msg] || msg;
   }
@@ -3389,6 +3600,73 @@
     return boxes[boxes.length - 1] || null;
   }
 
+  function isEditPlaylistBoxOpen(box) {
+    return !!box && box.isConnected
+      && getComputedStyle(box).display !== 'none'
+      && !!box.querySelector('.audio_pl_edit_box');
+  }
+
+  // The edit dialog's own primary "Сохранить" button — same lookup
+  // createPlaylistViaUI / addTracksToExistingPlaylistViaUI do on the
+  // injected.js side, scoped to the dialog's own .box_layout so a
+  // .FlatButton--primary elsewhere on the page can't match.
+  function findEditPlaylistSaveBtn(box) {
+    const dialog = box?.querySelector('.audio_pl_edit_box');
+    const scope = dialog?.closest('.box_layout') || dialog?.closest('.box_body')?.parentElement || box;
+    if (!scope) return null;
+    const prim = [...scope.querySelectorAll('.FlatButton--primary')].filter(b => b.offsetParent !== null);
+    return prim.find(b => /сохран/i.test(b.textContent || '')) || prim[0] || null;
+  }
+
+  // Saves the edit-playlist dialog after a cover was set in it. injected.js's
+  // injectCoverFile deliberately never clicks this dialog's own Save (see
+  // its `preExisting` snapshot — that used to close the dialog by accident
+  // mid-upload), so without this the new cover was never persisted and the
+  // reload that follows threw it away. Waits for the cover upload to finish
+  // first (verified live: right after the file input's change event VK
+  // swaps in a local blob: preview WITH a progress indicator inside
+  // .ape_cover, fires a photo/v2/upload fetch, and only then drops the
+  // indicator — the thumbnail alone appears ~100ms in, long before the
+  // upload is done, so it can't be the signal), then for the dialog to
+  // actually close — VK closes it only once the save request succeeds, so a
+  // still-open dialog after the timeout means the save failed and the
+  // caller must NOT reload.
+  async function saveEditPlaylistDialog(box) {
+    const current = () => (isEditPlaylistBoxOpen(box) ? box : getEditPlaylistBox());
+    const coverBusy = b => !!b.querySelector('.ape_cover [class*="progress"], .ape_cover [class*="loading"], .ape_cover [class*="pinner"]');
+
+    let deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const b = current();
+      if (!b) throw new Error('Диалог плейлиста был закрыт до сохранения обложки');
+      if (b.querySelector('.ape_cover img, .ape_cover [style*="background"]') && !coverBusy(b)) break;
+      await sleep(300);
+    }
+    await sleep(500); // settle: let VK's own form state register the finished upload before Save reads it
+
+    let saveBtn = null;
+    deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      const b = current();
+      if (!b) throw new Error('Диалог плейлиста был закрыт до сохранения обложки');
+      const btn = findEditPlaylistSaveBtn(b);
+      if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true' && !btn.classList.contains('FlatButton--disabled')) {
+        saveBtn = btn;
+        break;
+      }
+      await sleep(300);
+    }
+    if (!saveBtn) throw new Error('Кнопка "Сохранить" не найдена в диалоге плейлиста');
+    saveBtn.click();
+
+    deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      await sleep(300);
+      if (!isEditPlaylistBoxOpen(box) && !getEditPlaylistBox()) return;
+    }
+    throw new Error('Плейлист не сохранился — диалог не закрылся. Проверьте его вручную.');
+  }
+
   // Reads the playlist's current track list+order straight from VK's API
   // (audio.get via injected.js) instead of the popup's DOM. The row list
   // there lazy-appends in batches as its inner .ape_item_list is scrolled —
@@ -3599,7 +3877,16 @@
 
     if (result.ok) {
       showProgressToast(`Готово (${sourceLabel}): переставлено ${matchedOrder.length}, не сопоставлено: ${unmatched}`, { id: 'vmu-pl-sort', kind: 'done' });
-      await refreshPlaylistEditDialog();
+      // Full reload instead of closing/reopening the dialog: the popup's own
+      // track-row list (React state, populated once when the dialog opened)
+      // never hears about the server-side reorder otherwise (verified live:
+      // reload the page and the new order is there) — same reason
+      // reloadAfterBatchIfNeeded reloads after uploads. Closing+reopening
+      // used to do this instead, but that only works when the dialog was
+      // reached via the playlist's view popup (pencil icon) — opened
+      // straight from a playlist card, there's nothing to reopen it with and
+      // it just stayed closed (see the injected.js vkApiFetch fix above).
+      setTimeout(() => location.reload(), 1500);
     } else {
       showProgressToast('Ошибка сортировки: ' + (result.error || '?'), { id: 'vmu-pl-sort', kind: 'error' });
     }
@@ -3645,29 +3932,6 @@
     document.body.appendChild(panel);
     makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
     panel.querySelector('#vmu-parsedorder-close').addEventListener('click', () => panel.remove());
-  }
-
-  // reorderPlaylistViaApi goes straight through VK's audio.editPlaylist —
-  // the popup's own track-row list (React state, populated once when the
-  // dialog opened) never hears about it, so without this the rows stay in
-  // the pre-sort order even though the server-side order already changed
-  // (verified live: reload the page and the new order is there). DOM-level
-  // reordering of the rows themselves isn't an option — see the comment on
-  // fetchPlaylistTracksViaApi above for why that list is virtualized and
-  // only partially mounted. Closing and reopening the dialog is the
-  // reliable way to make VK refetch+re-render it with the real order.
-  async function refreshPlaylistEditDialog() {
-    const container = getEditPlaylistBox();
-    const closeBtn = container?.querySelector('.box_x_button');
-    if (!closeBtn) return;
-    closeBtn.click();
-    await sleep(400);
-    // Present when the edit box was opened from the playlist's own view
-    // popup (pencil icon) — closing edit mode drops back to that popup,
-    // which is still mounted underneath. If the edit box was reached some
-    // other way and nothing is left to click, this just leaves it closed;
-    // the reorder itself already succeeded and persisted regardless.
-    document.querySelector('[data-testid="Action_Edit"]')?.click();
   }
 
   async function applyPlaylistSortFromFiles(box, files) {
@@ -3773,7 +4037,7 @@
       setActiveSortSrc(btn.dataset.vmuSortsrc);
     });
 
-    // ── Genius block ──
+    // ─── Genius block ──
     const gPanel = wrap.querySelector('#vmu-pl-genius-panel');
     const gInput = wrap.querySelector('#vmu-pl-genius-q');
     const gGo = wrap.querySelector('#vmu-pl-genius-go');
@@ -4072,6 +4336,10 @@
         }, 60000, 'reqId');
         showToast(`Добавлено треков: ${res.selectedCount}`);
         panel.remove();
+        // Same reason reloadAfterBatchIfNeeded reloads after uploads: the
+        // edit dialog's own track list won't show the newly-added tracks
+        // until VK refetches, which only happens on a real reload.
+        setTimeout(() => location.reload(), 1500);
       } catch (err) {
         confirmBtn.disabled = false;
         confirmBtn.textContent = 'Добавить выбранные';
@@ -4091,9 +4359,10 @@
   // text_overlay_app's render pipeline, see vmuBuildTextLayerPipeline
   // above), then hand the composited 1000×1000 result to
   // uploadCoverViaDialog — the same primitive the auto-playlist flow uses,
-  // which clicks .ape_cover, intercepts the file input VK opens, and
-  // confirms any crop step on its own. That's what makes "Применить" end
-  // with the playlist's cover already selected, no manual file dialog.
+  // which drops the file into .ape_cover's input and confirms any crop step
+  // on its own, then saveEditPlaylistDialog clicks the edit dialog's own
+  // Save. That's what makes "Применить" end with the cover persisted, no
+  // manual file dialog or Save click.
   function openCoverEditorPanel(box) {
     document.getElementById('vmu-covered-panel')?.remove();
 
@@ -4220,6 +4489,7 @@
       download: panel.querySelector('#vmu-covered-download'),
       status: panel.querySelector('#vmu-covered-status'),
     };
+    panel.querySelectorAll('select.vmu-covered-select').forEach(s => vmuEnhanceSelect(s));
 
     for (const [id, def, unit] of [
       ['vmu-covered-fontsize', 176, ''], ['vmu-covered-outlinewidth', 3, ''],
@@ -4334,7 +4604,7 @@
       scheduleRender();
     });
 
-    // ── source: Genius album cover ──
+    // ─── source: Genius album cover ──
     const srcSwitch = panel.querySelector('#vmu-covered-src-switch');
     const geniusBlock = panel.querySelector('#vmu-covered-genius-block');
     const fileBlock = panel.querySelector('#vmu-covered-file-block');
@@ -4381,7 +4651,7 @@
     gGo.addEventListener('click', runGeniusSearch);
     gInput.addEventListener('keydown', e => { if (e.key === 'Enter') runGeniusSearch(); });
 
-    // ── source: local file ──
+    // ─── source: local file ──
     const dz = panel.querySelector('#vmu-covered-dz');
     const fileInput = panel.querySelector('#vmu-covered-file-input');
     const handleImageFile = file => {
@@ -4395,7 +4665,7 @@
     dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('vmu-over'); handleImageFile(e.dataTransfer?.files?.[0]); });
     fileInput.addEventListener('change', () => { handleImageFile(fileInput.files?.[0]); fileInput.value = ''; });
 
-    // ── apply / download ──
+    // ─── apply / download ──
     els.apply.addEventListener('click', async () => {
       const source = state.resultCanvas || state.baseCanvas;
       if (!source) return;
@@ -4406,8 +4676,16 @@
       setStatus('Ставим обложку плейлиста…');
       try {
         await uploadCoverViaDialog(blob);
+        setStatus('Сохраняем плейлист…');
+        await saveEditPlaylistDialog(box);
         setStatus('Обложка применена');
         showToast('Обложка плейлиста обновлена');
+        // Same reason reloadAfterBatchIfNeeded reloads after uploads: the
+        // playlist's cover thumbnail elsewhere on the page (grid, edit
+        // dialog) stays stale until VK refetches, which only happens on a
+        // real reload. Only reached once the save above went through — an
+        // unsaved dialog would lose the cover on reload.
+        setTimeout(() => location.reload(), 1500);
       } catch (err) {
         setStatus(err.message || 'ошибка', true);
       } finally {
@@ -4991,7 +5269,7 @@
     panel.id = 'vmu-issue-panel';
     panel.classList.toggle('vmu-ip-has-list', hasListContent);
 
-    // ── marker column ────────────────────────────────────────────────────
+    // ─── marker column ────────────────────────────────────────────────────
     const mm = document.createElement('div');
     mm.className = 'vmu-ip-mm';
     // Show numeric badge only when there is no separate list to label things
@@ -5031,7 +5309,7 @@
     }
     panel.appendChild(mm);
 
-    // ── list column (blocked + duplicate groups) ─────────────────────────
+    // ─── list column (blocked + duplicate groups) ─────────────────────────
     if (hasListContent) {
       const right = document.createElement('div');
       right.className = 'vmu-ip-listcol';
@@ -5896,7 +6174,7 @@
       });
     }
 
-    // ── Settings tab switching ─────────────────────────────────────────────
+    // ─── Settings tab switching ─────────────────────────────────────────────
     const settingsTabs = document.getElementById('vmu-settings-tabs');
     if (settingsTabs) {
       settingsTabs.addEventListener('click', e => {
@@ -7020,8 +7298,10 @@
     return normalizeNamePart(artist) + '|||' + normalizeNamePart(title);
   }
 
-  async function fileToCheckEntry(f) {
-    const tags = await readID3(f).catch(() => ({}));
+  // `knownTags` lets a caller that already ran readID3 on this file (the
+  // playlist-from-files panel needs the raw tags too) skip a second read.
+  async function fileToCheckEntry(f, knownTags) {
+    const tags = knownTags || await readID3(f).catch(() => ({}));
     const tagArtist = isJunkTag(tags.TPE1 || tags.TPE2) ? '' : (tags.TPE1 || tags.TPE2 || '');
     const tagTitle = isJunkTag(tags.TIT2) ? '' : (tags.TIT2 || '');
     let artist = tagArtist, title = tagTitle;
@@ -7647,11 +7927,488 @@
     group.insertBefore(scBtn, gearBtn);
   }
 
+  // ─── Playlist from local files ───────────────────────────────────────────────
+  // "Плейлист из файлов": the user picks MP3s from their PC and — without
+  // uploading anything — we look for those same tracks among what the
+  // community has ALREADY uploaded (the page's own track list), then build a
+  // playlist from the matches (a new one, or appended to an existing one).
+  // The files are only a checklist: their ID3 tags / filenames say which
+  // tracks are wanted and in what order; the playlist is filled with the
+  // community's own copies. Creating/filling reuses the proven edit-dialog
+  // automation (VK_CREATE_PLAYLIST / VK_ADD_TRACKS_TO_PLAYLIST in injected.js)
+  // — the one new thing sent along is `audioIds`, so rows are ticked by exact
+  // id rather than by (substring-)name.
+
+  // PLM-PURE-BEGIN
+  const PLMAKE_SIGNATURE = 'человек паук поможет каждому [vk.com/reuploadunder]';
+
+  // Same "Альбом (Год) Исполнитель" template runAutoPlaylist builds from the
+  // tags of freshly uploaded files.
+  function plmakeSuggestTitle(tagsList, fallbackName) {
+    const firstOf = pick => tagsList.map(pick).find(Boolean) || '';
+    const album = firstOf(t => t.TALB);
+    const year = firstOf(t => t.TYER || (t.TDRC || '').substring(0, 4));
+    const artist = firstOf(t => t.TPE2) || firstOf(t => t.TPE1);
+    let title = album;
+    if (year) title += ' (' + year + ')';
+    if (artist) title += ' ' + artist;
+    title = title.trim();
+    return title || String(fallbackName || '').replace(/\.mp3$/i, '').trim() || 'Плейлист';
+  }
+
+  function plmakeTrackNo(tags) {
+    const n = parseInt(String((tags && tags.TRCK) || '').split('/')[0], 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Playlist order: the ID3 track numbers when every file carries a distinct
+  // one, otherwise natural filename order ("2 - x" before "10 - y").
+  function plmakeSortItems(items) {
+    const nums = items.map(it => plmakeTrackNo(it.tags));
+    const numbered = items.length > 1 && nums.every(n => n != null) && new Set(nums).size === nums.length;
+    if (numbered) return items.map((it, i) => ({ it, n: nums[i] })).sort((a, b) => a.n - b.n).map(x => x.it);
+    return [...items].sort((a, b) => a.entry.name.localeCompare(b.entry.name, undefined, { numeric: true, sensitivity: 'base' }));
+  }
+
+  // For every file entry: the community track it stands for, or null.
+  // Built on matchEntriesToRows (title-first, fuzzy fallback), minus the pairs
+  // that only exist through its last-resort "as many leftovers as unmatched
+  // entries" pairing — right when reordering a playlist against itself, wrong
+  // here, where the page holds far more tracks than the files looked up.
+  // `sure` is false when several page tracks share the file's exact title and
+  // none shares a word of its artist: probably a same-named track by someone
+  // else, so the caller leaves it unticked for the user to confirm.
+  function plmakeMatch(entries, tracks) {
+    const rows = tracks.map((t, i) => ({ numId: i, artist: t.artist || '', title: t.title || '' }));
+    const rowKeys = rows.map(r => normalizeNamePart(r.title));
+    const { matchedNumIds } = matchEntriesToRows(entries, rows);
+    return entries.map((en, i) => {
+      const idx = matchedNumIds[i];
+      const titleKey = normalizeNamePart(en.title);
+      if (idx == null || !titleKey) return null;
+      const sameTitle = titleKey === rowKeys[idx];
+      if (!sameTitle && fuzzyTitleScore(wordsOf(en.title), wordsOf(rows[idx].title)) < FUZZY_TITLE_THRESHOLD) return null;
+      let sure = true;
+      if (sameTitle && rowKeys.filter(k => k === titleKey).length > 1) {
+        const enWords = wordsOf(en.artist);
+        const rowWords = wordsOf(rows[idx].artist);
+        sure = !enWords.length || enWords.some(w => rowWords.some(rw => wordsMatch(w, rw)));
+      }
+      return { track: tracks[idx], sure };
+    });
+  }
+  // PLM-PURE-END
+
+  // Playlists whose cell is mounted on the open page — exactly the ones the
+  // edit-dialog automation can reach (it clicks the cell's own edit button).
+  function plmakeMountedPlaylists() {
+    const seen = new Set();
+    const out = [];
+    for (const c of document.querySelectorAll('[data-testid="MusicPlaylistItem_Cell"][data-id]')) {
+      const id = c.getAttribute('data-id');
+      const title = c.querySelector('[data-testid="MusicPlaylistItem_Title"]')?.textContent?.trim() || '';
+      if (!id || !title || seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, title });
+    }
+    return out;
+  }
+
+  function closePlaylistMakerPanel() {
+    document.getElementById('vmu-plmake-panel')?.remove();
+  }
+
+  function injectPlaylistMakerButton() {
+    if (document.getElementById('vmu-plmake-btn')) return;
+    const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
+    const group = uploadBtn?.parentElement;
+    if (!group) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vmu-plmake-btn';
+    btn.className = uploadBtn.className;
+    matchNativeButtonBox(btn, uploadBtn);
+    btn.setAttribute('aria-label', 'Плейлист из файлов');
+    btn.setAttribute('data-vmu-tip', 'Плейлист из файлов');
+    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 9h10M3 13h6"/><path d="M15 11v5M12.5 13.5h5"/></svg>`;
+    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
+    btn.addEventListener('mouseleave', hideDlTooltip);
+    btn.addEventListener('click', () => { hideDlTooltip(); openPlaylistMakerPanel(); });
+    group.insertBefore(btn, document.getElementById('vmu-bulkops-btn') || uploadBtn);
+  }
+
+  function openPlaylistMakerPanel() {
+    syncVmuTheme();
+    closePlaylistMakerPanel();
+
+    const ownerMatch = location.href.match(/audios(-?\d+)/);
+    const pageOwnerId = ownerMatch ? ownerMatch[1] : null;
+
+    const panel = document.createElement('div');
+    panel.id = 'vmu-plmake-panel';
+    panel.className = 'vmu-bulkops-panel vmu-plmake-panel';
+    panel.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Плейлист из файлов</span>
+        <button type="button" class="vmu-check-close" id="vmu-plmake-close" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body vmu-plcollect-body">
+        <div class="vmu-plmake-hint">Выбери MP3 с компьютера — расширение найдёт эти же треки среди уже загруженных в сообщество и соберёт из них плейлист. Файлы никуда не загружаются.</div>
+        <div id="vmu-plmake-dz" class="vmu-pl-sort-dz">
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v9M6.5 6.5L10 3l3.5 3.5"/><path d="M4 13.5v1.5A1.5 1.5 0 0 0 5.5 16.5h9a1.5 1.5 0 0 0 1.5-1.5v-1.5"/></svg>
+          <span class="vmu-pl-sort-dz-hint">Перетащи MP3 сюда</span>
+          <label class="vmu-pick-btn">
+            ${ICON_UPLOAD}
+            Выбрать файлы
+            <input type="file" id="vmu-plmake-input" class="vmu-pl-sort-input" accept=".mp3,audio/mpeg" multiple>
+          </label>
+        </div>
+        <div class="vmu-bulk-source-hint" id="vmu-plmake-files-hint">Файлы не выбраны</div>
+
+        <div class="vmu-plc-section vmu-plc-section-first">
+          <div class="vmu-mode-switch" id="vmu-plmake-mode" role="tablist">
+            <button type="button" data-mode="new" class="active">Новый плейлист</button>
+            <button type="button" data-mode="existing">В существующий</button>
+          </div>
+          <div id="vmu-plmake-new" class="vmu-plmake-group">
+            <input type="text" id="vmu-plmake-title" class="vmu-plc-input vmu-plmake-field" placeholder="Название плейлиста" spellcheck="false">
+            <textarea id="vmu-plmake-desc" class="vmu-plc-input vmu-plmake-field vmu-plmake-desc" placeholder="Описание" spellcheck="false"></textarea>
+            <label class="vmu-rename-check" id="vmu-plmake-cover-row" style="display:none">
+              <input type="checkbox" id="vmu-plmake-cover"><span>Обложка (из настроек или из тегов файлов)</span>
+            </label>
+          </div>
+          <div id="vmu-plmake-existing" class="vmu-plmake-group" style="display:none">
+            <div class="vmu-plc-row">
+              <select id="vmu-plmake-pl-select" class="vmu-covered-select" title="Плейлист, в который добавить треки"></select>
+              <button type="button" id="vmu-plmake-pl-refresh" class="vmu-plc-link" title="Перечитать плейлисты, видимые на странице">Обновить</button>
+            </div>
+            <div class="vmu-plc-row">
+              <span class="vmu-bulk-source-hint" id="vmu-plmake-pl-hint"></span>
+              <button type="button" id="vmu-plmake-pl-all" class="vmu-plc-link" title="Прочитать список всех плейлистов сообщества через скрытое окно (медленнее)">Все плейлисты</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="vmu-plc-actions">
+          <button type="button" id="vmu-plmake-find" class="vmu-pick-btn" disabled>Найти в сообществе</button>
+          <button type="button" id="vmu-plmake-rescan" class="vmu-plc-link" style="display:none" title="Заново прочитать треки со страницы">Пересканировать</button>
+        </div>
+        <div class="vmu-plc-status" id="vmu-plmake-status"></div>
+        <div class="vmu-plmake-list" id="vmu-plmake-list"></div>
+        <div class="vmu-plc-actions">
+          <span class="vmu-plc-count" id="vmu-plmake-count"></span>
+          <button type="button" id="vmu-plmake-go" class="vmu-pick-btn" disabled>Создать плейлист</button>
+        </div>
+      </div>`;
+    document.body.appendChild(panel);
+    makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+    panel.querySelector('#vmu-plmake-close').addEventListener('click', closePlaylistMakerPanel);
+
+    const $ = sel => panel.querySelector(sel);
+    const dz = $('#vmu-plmake-dz');
+    const fileInput = $('#vmu-plmake-input');
+    const filesHint = $('#vmu-plmake-files-hint');
+    const modeSwitch = $('#vmu-plmake-mode');
+    const newBlock = $('#vmu-plmake-new');
+    const existingBlock = $('#vmu-plmake-existing');
+    const titleInput = $('#vmu-plmake-title');
+    const descInput = $('#vmu-plmake-desc');
+    const coverRow = $('#vmu-plmake-cover-row');
+    const coverCheck = $('#vmu-plmake-cover');
+    const plSelect = $('#vmu-plmake-pl-select');
+    vmuEnhanceSelect(plSelect, { search: true });
+    const plHint = $('#vmu-plmake-pl-hint');
+    const findBtn = $('#vmu-plmake-find');
+    const rescanBtn = $('#vmu-plmake-rescan');
+    const statusEl = $('#vmu-plmake-status');
+    const listEl = $('#vmu-plmake-list');
+    const countEl = $('#vmu-plmake-count');
+    const goBtn = $('#vmu-plmake-go');
+
+    let items = [];          // [{ file, tags, entry }] in playlist order
+    let matches = null;      // parallel to items: { track, sure } | null — null array until "Найти"
+    let checked = new Set(); // indices that go into the playlist
+    let pageTracks = null;   // the community's tracks, read once per panel
+    let mode = 'new';
+    let busy = false;
+    let titleTouched = false, descTouched = false, coverTouched = false;
+
+    const setStatus = (text, isError) => {
+      statusEl.textContent = text || '';
+      statusEl.classList.toggle('vmu-plmake-status-error', !!isError);
+    };
+
+    function updateControls() {
+      const n = matches ? [...checked].filter(i => matches[i]).length : 0;
+      findBtn.disabled = busy || !items.length;
+      rescanBtn.style.display = pageTracks ? '' : 'none';
+      rescanBtn.disabled = busy;
+      goBtn.textContent = mode === 'new' ? 'Создать плейлист' : 'Добавить в плейлист';
+      goBtn.disabled = busy || !n || (mode === 'existing' && !plSelect.value);
+      countEl.textContent = matches ? `Выбрано: ${n} из ${items.length}` : '';
+    }
+    function setBusy(b) {
+      busy = b;
+      for (const el of [titleInput, descInput, coverCheck, plSelect, fileInput]) el.disabled = b;
+      panel.classList.toggle('vmu-plmake-busy', b);
+      updateControls();
+    }
+
+    function renderList() {
+      listEl.innerHTML = items.map((it, i) => {
+        const m = matches ? matches[i] : null;
+        const found = !!m;
+        const foundText = m
+          ? `${m.track.artist ? m.track.artist + ' — ' : ''}${m.track.title}`
+          : '';
+        const second = !matches ? ''
+          : found
+            ? `<span class="vmu-plmake-found${m.sure ? '' : ' vmu-plmake-unsure'}">${escHtml(foundText)}${m.sure ? '' : ' — проверь: артист не совпал'}</span>`
+            : '<span class="vmu-plmake-missing">не найден в сообществе</span>';
+        return `
+          <label class="vmu-plmake-row" data-found="${found ? 1 : 0}">
+            <input type="checkbox" data-i="${i}"${found && checked.has(i) ? ' checked' : ''}${found ? '' : ' disabled'}>
+            <span class="vmu-bulk-preview-text">
+              <span class="vmu-plmake-file">${i + 1}. ${escHtml(it.entry.name)}</span>
+              ${second}
+            </span>
+          </label>`;
+      }).join('');
+      updateControls();
+    }
+    listEl.addEventListener('change', e => {
+      const box = e.target.closest('input[data-i]');
+      if (!box) return;
+      const i = Number(box.dataset.i);
+      if (box.checked) checked.add(i); else checked.delete(i);
+      updateControls();
+    });
+
+    // Cover: the settings cover wins, else the first file with embedded art —
+    // the same priority runAutoPlaylist uses.
+    const hasCoverSource = () => !!(settings.coverDataUrl || items.some(it => it.tags?.APIC?.data));
+    async function resolveCoverSource() {
+      if (settings.coverDataUrl) return settings.coverDataUrl;
+      const apicItem = items.find(it => it.tags?.APIC?.data);
+      if (!apicItem) return null;
+      const apic = apicItem.tags.APIC;
+      const blob = new Blob([apic.data], { type: apic.mime || 'image/jpeg' });
+      return new Promise(res => {
+        const r = new FileReader();
+        r.onload = () => res(r.result);
+        r.onerror = () => res(null);
+        r.readAsDataURL(blob);
+      });
+    }
+
+    function refreshSuggestions() {
+      if (!titleTouched) titleInput.value = items.length ? plmakeSuggestTitle(items.map(it => it.tags), items[0].file.name) : '';
+      if (!descTouched) descInput.value = titleInput.value ? `${titleInput.value}\n${PLMAKE_SIGNATURE}` : '';
+      const hasSource = hasCoverSource();
+      coverRow.style.display = hasSource ? '' : 'none';
+      if (!coverTouched) coverCheck.checked = !!(settings.coverDataUrl || (settings.autoCoverFromId3 && hasSource));
+    }
+    titleInput.addEventListener('input', () => {
+      titleTouched = true;
+      if (!descTouched) descInput.value = titleInput.value ? `${titleInput.value}\n${PLMAKE_SIGNATURE}` : '';
+    });
+    descInput.addEventListener('input', () => { descTouched = true; });
+    coverCheck.addEventListener('change', () => { coverTouched = true; });
+
+    async function handleFiles(fileList) {
+      if (busy) return;
+      const mp3s = [...fileList].filter(isMP3);
+      if (!mp3s.length) { setStatus('Нужны MP3-файлы', true); return; }
+      setBusy(true);
+      setStatus('Читаю теги…');
+      try {
+        const read = [];
+        for (const file of mp3s) {
+          const tags = await readID3(file).catch(() => ({}));
+          read.push({ file, tags, entry: await fileToCheckEntry(file, tags) });
+        }
+        if (!panel.isConnected) return;
+        items = plmakeSortItems(read);
+        matches = null;
+        checked = new Set();
+        filesHint.textContent = `Файлов: ${items.length}`;
+        refreshSuggestions();
+        setStatus('');
+      } finally {
+        if (panel.isConnected) { setBusy(false); renderList(); }
+      }
+    }
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('vmu-over'); });
+    dz.addEventListener('dragleave', e => { if (!dz.contains(e.relatedTarget)) dz.classList.remove('vmu-over'); });
+    dz.addEventListener('drop', e => {
+      e.preventDefault();
+      dz.classList.remove('vmu-over');
+      handleFiles(e.dataTransfer?.files || []);
+    });
+    fileInput.addEventListener('change', () => { handleFiles(fileInput.files); fileInput.value = ''; });
+
+    async function findInCommunity() {
+      if (busy || !items.length) return;
+      if (!pageOwnerId) {
+        setStatus('Открой страницу аудио сообщества (vk.ru/audios-…) и запусти заново', true);
+        return;
+      }
+      setBusy(true);
+      try {
+        if (!pageTracks) {
+          setStatus('Читаю треки сообщества…');
+          // Whole page, not just the first screenful — a file matching
+          // nothing because its track sits below the fold looks exactly like
+          // "not uploaded".
+          const map = await harvestPageTracks(n => {
+            if (statusEl.isConnected) setStatus(`Читаю треки сообщества… (${n})`);
+          }, null);
+          pageTracks = [...map.values()];
+        }
+        if (!panel.isConnected) return;
+        matches = plmakeMatch(items.map(it => it.entry), pageTracks);
+        checked = new Set(matches.flatMap((m, i) => (m && m.sure ? [i] : [])));
+        const found = matches.filter(Boolean).length;
+        setStatus(`Среди ${pageTracks.length} треков страницы найдено ${found} из ${items.length}`);
+      } catch (err) {
+        console.warn('[VK Multi Upload] playlist-maker find failed:', err);
+        setStatus('Ошибка: ' + translateError(err.message), true);
+      } finally {
+        if (panel.isConnected) { setBusy(false); renderList(); }
+      }
+    }
+    findBtn.addEventListener('click', findInCommunity);
+    rescanBtn.addEventListener('click', () => { pageTracks = null; matches = null; checked = new Set(); renderList(); findInCommunity(); });
+
+    // Existing-playlist picker
+    function fillPlaylists(list, hint) {
+      plSelect.innerHTML = list.map(p => `<option value="${escHtml(p.id)}">${escHtml(p.title)}</option>`).join('');
+      plHint.textContent = hint;
+      updateControls();
+    }
+    const showMountedPlaylists = () => {
+      const list = plmakeMountedPlaylists();
+      fillPlaylists(list, list.length
+        ? `На странице плейлистов: ${list.length}`
+        : 'На странице нет плейлистов — нажми «Все плейлисты»');
+    };
+    $('#vmu-plmake-pl-refresh').addEventListener('click', showMountedPlaylists);
+    $('#vmu-plmake-pl-all').addEventListener('click', async () => {
+      if (busy) return;
+      if (!pageOwnerId) { plHint.textContent = 'Нужна страница /audios… сообщества'; return; }
+      setBusy(true);
+      plHint.textContent = 'Читаю плейлисты (откроется скрытое окно)…';
+      try {
+        const res = await new Promise(resolve => {
+          try {
+            chrome.runtime.sendMessage({ type: 'VKD_SCAN_PLAYLISTS', url: `${location.origin}/audios${pageOwnerId}` }, r => resolve(r));
+          } catch { resolve({ ok: false, error: 'extension context error' }); }
+        });
+        if (!res?.ok) throw new Error(res?.error || 'scan failed');
+        if (panel.isConnected) fillPlaylists(res.playlists || [], `Плейлистов в сообществе: ${(res.playlists || []).length}. Если нужного нет на открытой странице, добавление может не сработать`);
+      } catch (err) {
+        if (panel.isConnected) plHint.textContent = 'Не удалось прочитать плейлисты: ' + (err.message || err);
+      } finally {
+        if (panel.isConnected) setBusy(false);
+      }
+    });
+    plSelect.addEventListener('change', updateControls);
+
+    modeSwitch.addEventListener('click', e => {
+      const b = e.target.closest('button[data-mode]');
+      if (!b || busy) return;
+      mode = b.dataset.mode;
+      modeSwitch.querySelectorAll('button').forEach(x => x.classList.toggle('active', x === b));
+      newBlock.style.display = mode === 'new' ? '' : 'none';
+      existingBlock.style.display = mode === 'existing' ? '' : 'none';
+      if (mode === 'existing' && !plSelect.options.length) showMountedPlaylists();
+      updateControls();
+    });
+
+    async function run() {
+      if (busy || !matches) return;
+      const chosen = items.map((_, i) => i).filter(i => matches[i] && checked.has(i));
+      if (!chosen.length) return;
+      const tracks = chosen.map(i => matches[i].track);
+      const audioIds = tracks.map(t => t.id);
+      const trackNames = tracks.map(t => ({ artist: t.artist || '', title: t.title || '' }));
+      const reqId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      const fail = msg => {
+        setStatus(msg, true);
+        showProgressToast(msg, { id: 'vmu-plmake', kind: 'error' });
+      };
+
+      setBusy(true);
+      try {
+        if (mode === 'new') {
+          const title = titleInput.value.trim();
+          if (!title) { setStatus('Введи название плейлиста', true); return; }
+          let coverBuf = null;
+          if (coverCheck.checked && hasCoverSource()) {
+            setStatus('Готовим обложку…');
+            const src = await resolveCoverSource();
+            const blob = src ? await makePerezalitoCover(src) : null;
+            coverBuf = blob ? await blob.arrayBuffer() : null;
+          }
+          setStatus('Создаём плейлист и добавляем треки… не закрывай вкладку');
+          showProgressToast('Создаём плейлист…', { id: 'vmu-plmake' });
+          // Generous timeout: ticking by id scrolls the community's whole
+          // picker list until every track has been seen.
+          const created = await pageCall('VK_CREATE_PLAYLIST', 'VK_PLAYLIST_CREATED', {
+            reqId,
+            title: title.slice(0, 255),
+            description: descInput.value.slice(0, 1000),
+            trackNames, audioIds, coverBuf,
+          }, 240000, 'reqId');
+          const added = created.selectedCount || 0;
+          if (!added) {
+            fail(`Плейлист «${title.slice(0, 30)}» создан, но треки добавить не удалось — добавь их вручную`);
+            return;
+          }
+          setStatus(`Готово: «${title}» — добавлено ${added} из ${tracks.length}`);
+          showProgressToast(`Плейлист «${title.slice(0, 30)}» создан: ${added} из ${tracks.length}`, { id: 'vmu-plmake', kind: 'done' });
+        } else {
+          const [plOwner, plId] = (plSelect.value || '').split('_');
+          const playlistId = parseInt(plId, 10);
+          if (!plOwner || !Number.isFinite(playlistId)) { setStatus('Выбери плейлист', true); return; }
+          const plTitle = plSelect.selectedOptions[0]?.textContent || '';
+          setStatus('Добавляем треки в плейлист… не закрывай вкладку');
+          showProgressToast('Добавляем треки…', { id: 'vmu-plmake' });
+          const res = await pageCall('VK_ADD_TRACKS_TO_PLAYLIST', 'VK_ADD_TRACKS_TO_PLAYLIST_DONE', {
+            reqId, ownerId: plOwner, playlistId, trackNames, audioIds,
+          }, 240000, 'reqId');
+          if (!res.selectedCount) {
+            fail('Ничего не добавлено — возможно, все эти треки уже есть в плейлисте');
+            return;
+          }
+          setStatus(`Готово: в «${plTitle}» добавлено ${res.selectedCount} из ${tracks.length}`);
+          showProgressToast(`Добавлено в «${plTitle.slice(0, 30)}»: ${res.selectedCount} из ${tracks.length}`, { id: 'vmu-plmake', kind: 'done' });
+        }
+        // Same reload the auto-playlist flow does: VK's DOM lags behind the
+        // fresh playlist / newly added tracks until a full reload.
+        setTimeout(() => location.reload(), 2000);
+      } catch (err) {
+        console.warn('[VK Multi Upload] playlist-maker failed:', err);
+        fail('Ошибка: ' + translateError(err.message));
+      } finally {
+        if (panel.isConnected) setBusy(false);
+      }
+    }
+    goBtn.addEventListener('click', run);
+
+    renderList();
+  }
+
   function injectCatalogToolbarButtons() {
+    injectPlaylistMakerButton();
     injectBulkOpsButton();
     injectToolbarSettingsButtons();
   }
-  new MutationObserver(() => injectCatalogToolbarButtons()).observe(document.body, { childList: true, subtree: true });
+  // Re-injection after VK re-renders the toolbar is driven from the throttled
+  // page-mutation watcher (onPageMutated, ≤~8 runs/sec) instead of a
+  // dedicated body-subtree observer of its own: that one ran these lookups
+  // (each a document-wide attribute scan) on EVERY mutation batch, on every
+  // vk.com page, buttons present or not.
   injectCatalogToolbarButtons();
 
   function buildBulkOpsSection(list, { pageTracks, entries }) {
@@ -8295,7 +9052,7 @@
     const body = document.createElement('div');
     body.className = 'vmu-check-body';
 
-    // ── minimap ──────────────────────────────────────────────────────────
+    // ─── minimap ──────────────────────────────────────────────────────────
     const mm = document.createElement('div');
     mm.className = 'vmu-check-mm';
     const mmInner = document.createElement('div');
@@ -8323,7 +9080,7 @@
     }
     body.appendChild(mm);
 
-    // ── list column ──────────────────────────────────────────────────────
+    // ─── list column ──────────────────────────────────────────────────────
     const list = document.createElement('div');
     list.className = 'vmu-check-list';
 
@@ -8373,7 +9130,7 @@
       makeCopyBtn(() => joinArtistTitle(present), 'Скопировать имеющиеся'),
     ]);
 
-    // ── full page-track list (mini-menu like duplicate finder) ───────────
+    // ─── full page-track list (mini-menu like duplicate finder) ───────────
     section('Все треки страницы', 'vmu-check-all', pageTracks.map((t, i) => ({ t, i })), ({ t, i }) => {
       const label = (t.artist ? escHtml(t.artist) + ' — ' : '') + escHtml(t.title || '');
       const status = foundIndices.has(i) ? '<span class="vmu-check-tick">✓</span>' : '';
@@ -8410,10 +9167,15 @@
     // set. VK may have replaced the body with a success screen AND started a
     // close animation (display:none / opacity:0), so skip the width check —
     // armBoxVisibility will restore visibility on the next 300 ms tick.
-    const zombie = document.querySelector('[class*="vkitInternalModalBox"][data-vmu-protected]');
+    // One document scan for both lookups (this runs on every throttled page
+    // mutation): the zombie is simply the first modal box carrying the
+    // protected marker, in the same document order the old two-selector
+    // version resolved it in.
+    const modalBoxes = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')];
+    const zombie = modalBoxes.find(m => m.hasAttribute('data-vmu-protected'));
     if (zombie) return zombie;
     // New VK: vkitInternalModalBox containing audio file input
-    const newDlg = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
+    const newDlg = modalBoxes
       .find(m => m.getBoundingClientRect().width > 0 &&
                  (m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
                   m.querySelector('[data-testid="UploadAudio_SelectFileButton"]')) &&
@@ -9390,7 +10152,7 @@
     return String(n).padStart(String(total).length, '0');
   }
 
-  // ── Extract tracks from popup DOM (React fiber) ──────────────────────────
+  // ─── Extract tracks from popup DOM (React fiber) ──────────────────────────
   function extractTracksFromPopupDOM() {
     const tracks = [];
     const seen = new Set();
@@ -9994,20 +10756,43 @@
     return btn;
   }
 
+  // VK's action-icon row inside a track row. It used to carry a readable
+  // class (vkuiButtonGroup__host — capital B, so the match below is
+  // case-insensitive); VK has since hashed it to vkit-XXXX utility classes
+  // with nothing semantic left, so when the class lookup misses, find it
+  // structurally instead: the child of the row's
+  // [data-testid="audiorow-actions"] slot that holds the action buttons
+  // (verified live 2026-10: slot is display:block, the group inside it is an
+  // inline-flex row of 24x24 wrappers with 8px right margins). Without this
+  // the download button fell back to the slot itself and stacked ABOVE the
+  // icon row. Returns null while only the duration label is mounted (no
+  // buttons yet) and for playlist-modal rows, which keep using the slot
+  // fallback in injectSingleDlBtn.
+  function findRowActionGroup(row) {
+    const byClass = row.querySelector('[class*="buttonGroup" i]');
+    if (byClass) return byClass;
+    const slot = row.querySelector('[data-testid="audiorow-actions"]');
+    if (!slot) return null;
+    for (const child of slot.children) {
+      if (child.classList.contains('vmu-single-dl')) continue;
+      if (child.querySelector('button, [role="button"]')) return child;
+    }
+    return null;
+  }
+
   function injectSingleDlBtn(row) {
     if (!getTrackDataFromRow(row)) return;
 
-    // Prefer the actions button group: VK's own action panel, class
-    // vkuiButtonGroup__host — capital B, so a lowercase [class*="buttonGroup"]
-    // substring match silently never hits. Note this is nested one level
-    // inside a [data-testid="audiorow-actions"] wrapper (display:block, used
-    // for hover positioning) — target the inner flex row directly, not the
-    // wrapper, or the button renders outside the icon row's flex flow.
+    // Prefer the actions button group: VK's own action panel. It is nested
+    // one level inside a [data-testid="audiorow-actions"] wrapper
+    // (display:block, used for hover positioning) — target the inner flex
+    // row directly, not the wrapper, or the button renders outside the icon
+    // row's flex flow.
     // Works for both page-level rows and playlist-modal rows (modal rows have
     // it too, but VK mounts it after first sweep — so if a previous sweep
     // placed the button into the after-slot fallback, migrate it here now
     // that the proper slot exists).
-    const btnGroup = row.querySelector('[class*="buttonGroup" i]');
+    const btnGroup = findRowActionGroup(row);
     if (btnGroup) {
       const existing = row.querySelector('.vmu-single-dl');
       if (existing && existing.parentElement === btnGroup) return;
@@ -10039,6 +10824,7 @@
   // mount/unmount window, so the button only ever showed up if a hover
   // happened to overlap a sweep — inject immediately on the mutation that
   // creates either container instead of waiting for the next sweep.
+  const NEW_ROW_ACTIONS_SEL = '[class*="buttonGroup" i], [data-testid="audiorow-actions"]';
   new MutationObserver(muts => {
     for (const mut of muts) {
       for (const node of mut.addedNodes) {
@@ -10052,8 +10838,12 @@
           act.prepend(makeSingleDlBtn(row, 'vmu-single-dl-act'));
         }
 
-        const groups = node.matches?.('[class*="buttonGroup" i]') ? [node]
-          : node.querySelectorAll ? [...node.querySelectorAll('[class*="buttonGroup" i]')] : [];
+        // New VK: the action group (old class, or — now that its class is
+        // hashed — the slot it mounts into), or the group itself appearing
+        // inside a slot that was already there (parent check, O(1)).
+        const groups = node.matches?.(NEW_ROW_ACTIONS_SEL) ? [node]
+          : node.querySelectorAll ? [...node.querySelectorAll(NEW_ROW_ACTIONS_SEL)] : [];
+        if (node.parentElement?.matches?.('[data-testid="audiorow-actions"]')) groups.push(node.parentElement);
         for (const group of groups) {
           const row = group.closest('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]');
           if (!row) continue;
@@ -10144,6 +10934,856 @@
     }
   }).observe(document.body, { childList: true, subtree: true });
 
+  // ─── Playlists catalog page: "TITLE - link" list ─────────────────────────────
+  // On a /music/catalog/<id> "Плейлисты" page (the lazy-loaded grid of playlist
+  // cards) a link under "Создать плейлист" scrolls the whole grid in and shows
+  // every playlist as one "НАЗВАНИЕ - ссылка" line in a copy-ready text box.
+  const PL_LIST_BLOCK_SEL = '[data-testid="music_playlists_list_block"]';
+  const PL_CELL_SEL = '[data-testid="MusicPlaylistItem_Cell"]';
+  const PL_TITLE_SEL = '[data-testid="MusicPlaylistItem_Title"]';
+  const PL_COLLECT_TOAST_ID = 'vmu-plcollect-progress';
+  let plCollectRunning = false;
+
+  // The scan currently in flight (if any) — a per-scan token, not a shared
+  // flag, so closing the panel cancels THAT scan only and a panel opened right
+  // afterwards can't accidentally revive it.
+  let plcActiveScan = null;
+  // playlist id -> { tracks, source }. Kept for the page's lifetime so closing
+  // and re-opening the panel (or re-collecting the list) doesn't throw away a
+  // scan that may have taken minutes.
+  const plcCache = new Map();
+
+  function closePlaylistCollectPanel() {
+    if (plcActiveScan) plcActiveScan.cancel = true;
+    document.getElementById('vmu-plcollect-modal')?.remove();
+  }
+
+  async function collectCatalogPlaylists(onCount, shouldStop) {
+    await waitForElement(PL_CELL_SEL, 10000);
+    const cells = () => (document.querySelector(PL_LIST_BLOCK_SEL) || document).querySelectorAll(PL_CELL_SEL);
+    await scrollUntilCountStable(() => cells().length, {
+      sleepMs: 800, stableLimit: 5, maxIter: 300, foreground: true, onCount, shouldStop,
+    });
+    const seen = new Set();
+    const out = [];
+    for (const cell of cells()) {
+      const id = cell.getAttribute('data-id') || '';
+      const title = (cell.querySelector(PL_TITLE_SEL)?.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!id || !title || seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, title, url: `${location.origin}/music/playlist/${id}`, count: plcCellTrackCount(cell) });
+    }
+    return out;
+  }
+
+  // The card's own track total: the first bare-number text on it (the second
+  // is the play count — verified against audio.get counts on 10 playlists).
+  // Used only to judge whether a scan came back complete, never as the data.
+  function plcCellTrackCount(cell) {
+    for (const el of cell.querySelectorAll('span')) {
+      if (el.children.length || el.closest(PL_TITLE_SEL) || el.closest('a')) continue;
+      const t = (el.textContent || '').trim();
+      if (/^\d[\d\s ]*$/.test(t)) return parseInt(t.replace(/[\s ]/g, ''), 10);
+    }
+    return null;
+  }
+
+  // ─── Playlist collector: data layer ──────────────────────────────────────────
+  // Everything from here to PLC-PURE-END is pure (no DOM, no chrome.*) so it can
+  // be exercised on its own. Duplicate/blocked detection is NOT re-invented:
+  // plcAnalyze feeds every collected track through the same
+  // findDuplicatesAndBlocked the per-playlist finder and the "Массовые
+  // операции" cleanup already use — one artist+title(+duration) rule across
+  // the extension — just over all playlists at once, so a duplicate group can
+  // span several playlists.
+  // PLC-PURE-BEGIN
+  const PLC_COLLATOR = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' });
+
+  const PLC_DEFAULT_VIEW = {
+    query: '', yearFrom: null, yearTo: null, minTracks: null, maxTracks: null,
+    trackFilter: 'all',   // all | issues | blocked | dupes | dupes-other
+    sort: 'page',         // page | name-asc | name-desc | artist-asc | year-asc | year-desc | count-desc | count-asc
+    group: 'none',        // none | year | letter
+    showTracks: true, showLinks: true, marks: true, dupeWhere: true, numbering: true,
+  };
+
+  function plcPlural(n, one, few, many) {
+    const m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+    return many;
+  }
+
+  // The community titles playlists "Название (2021) Артист1, Артист2". The year
+  // is read from a bracketed 4-digit year first (so "Патрули (5 лет вони)
+  // (2020) Овсянкин" still finds 2020), then from a bare year that isn't at
+  // the very start of the title. Everything before it is the album name,
+  // everything after it the artist list.
+  function plcParseTitle(rawTitle) {
+    const t = String(rawTitle || '').replace(/\s+/g, ' ').trim();
+    const inRange = y => y >= 1950 && y <= new Date().getFullYear() + 1;
+    let hit = null, m;
+    const bracketRe = /[(\[]\s*((?:19|20)\d{2})\s*[)\]]/g;
+    while ((m = bracketRe.exec(t))) {
+      if (inRange(+m[1])) { hit = { year: +m[1], start: m.index, end: m.index + m[0].length }; break; }
+    }
+    if (!hit) {
+      const looseRe = /(^|[^\d])((?:19|20)\d{2})(?!\d)/g;
+      while ((m = looseRe.exec(t))) {
+        const start = m.index + m[1].length;
+        if (start > 0 && inRange(+m[2])) { hit = { year: +m[2], start, end: start + 4 }; break; }
+      }
+    }
+    if (!hit) return { year: null, name: t, artist: '' };
+    return {
+      year: hit.year,
+      name: t.slice(0, hit.start).trim() || t,
+      artist: t.slice(hit.end).trim().replace(/^[-–—:,;\s]+/, ''),
+    };
+  }
+
+  function plcMakePlaylist(raw, index) {
+    const p = plcParseTitle(raw.title);
+    return {
+      id: raw.id || '', title: raw.title, url: raw.url, index,
+      year: p.year, name: p.name || raw.title, artist: p.artist,
+      declared: Number.isFinite(raw.count) ? raw.count : null,
+      tracks: null, scanSource: null, scanError: null, tried: null,
+    };
+  }
+
+  // API-route tracks only carry raw signals (hasUrl / restricted); whether a
+  // missing url means "blocked" can only be judged once we know this account's
+  // audio.get returns urls at all — if not a single track in the whole scan
+  // had one, an empty url says nothing and only the explicit restricted flag
+  // counts (otherwise every track would be reported blocked). DOM-route
+  // tracks already carry isBlocked straight from VK's own row data.
+  function plcFinalizeBlocked(playlists) {
+    let urlSeen = false;
+    for (const pl of playlists) for (const t of pl.tracks || []) if (t.viaApi && t.hasUrl) urlSeen = true;
+    for (const pl of playlists) for (const t of pl.tracks || []) {
+      if (t.viaApi) t.isBlocked = !!t.restricted || (urlSeen && !t.hasUrl);
+    }
+  }
+
+  // Annotates every scanned track in place: blocked, dupeHere (same
+  // artist+title+duration elsewhere in ITS OWN playlist) and dupeElsewhere
+  // (the other playlists it also appears in, in page order).
+  function plcAnalyze(playlists) {
+    const flat = [];
+    for (const pl of playlists) {
+      if (!pl.tracks) continue;
+      for (const t of pl.tracks) {
+        t.blocked = !!t.isBlocked;
+        t.dupeHere = false;
+        t.dupeElsewhere = [];
+        flat.push({
+          artist: String(t.artist || ''), title: String(t.title || ''),
+          duration: t.duration || 0, isBlocked: !!t.isBlocked, pl, t,
+        });
+      }
+    }
+    const { dupeGroups } = findDuplicatesAndBlocked(flat);
+    for (const g of dupeGroups) {
+      const members = g.indices.map(i => flat[i]);
+      for (const m of members) {
+        for (const o of members) {
+          if (o === m) continue;
+          if (o.pl === m.pl) m.t.dupeHere = true;
+          else if (!m.t.dupeElsewhere.includes(o.pl)) m.t.dupeElsewhere.push(o.pl);
+        }
+      }
+    }
+    for (const it of flat) it.t.dupeElsewhere.sort((a, b) => a.index - b.index);
+  }
+
+  // A scan is "incomplete" when the card said the playlist has more tracks than
+  // came back — the classic case being a list that was never expanded.
+  function plcIsIncomplete(pl) {
+    return !!pl.tracks && pl.declared != null && pl.tracks.length < pl.declared;
+  }
+
+  // Still worth (re)scanning: never scanned, or incomplete and not yet tried
+  // through BOTH routes (once both have had their go, another pass would only
+  // return the same thing).
+  function plcNeedsWork(pl) {
+    if (!pl.tracks) return true;
+    return plcIsIncomplete(pl) && !(pl.tried && pl.tried.api && pl.tried.window);
+  }
+
+  function plcStats(playlists) {
+    const s = { total: playlists.length, scanned: 0, failed: 0, incomplete: 0, tracks: 0, blocked: 0, dupeTracks: 0, dupeElsewhere: 0 };
+    for (const pl of playlists) {
+      if (!pl.tracks) { if (pl.scanError) s.failed++; continue; }
+      s.scanned++;
+      if (plcIsIncomplete(pl)) s.incomplete++;
+      for (const t of pl.tracks) {
+        s.tracks++;
+        if (t.blocked) s.blocked++;
+        if (t.dupeHere || (t.dupeElsewhere && t.dupeElsewhere.length)) s.dupeTracks++;
+        if (t.dupeElsewhere && t.dupeElsewhere.length) s.dupeElsewhere++;
+      }
+    }
+    return s;
+  }
+
+  // Sort key: ignores leading punctuation/brackets/quotes, case and ё/е.
+  function plcSortKey(s) {
+    return String(s || '').replace(/^[^\p{L}\p{N}]+/u, '').toLowerCase().replace(/ё/g, 'е');
+  }
+
+  function plcFirstArtistKey(pl) {
+    return plcSortKey(String(pl.artist || '').split(/[,;&]/)[0]);
+  }
+
+  function plcLetterKey(name) {
+    const ch = plcSortKey(name).charAt(0);
+    if (!ch) return '#';
+    if (/\d/.test(ch)) return '0–9';
+    if (/\p{L}/u.test(ch)) return ch.toUpperCase();
+    return '#';
+  }
+
+  function plcTrackVisible(t, filter) {
+    const other = !!(t.dupeElsewhere && t.dupeElsewhere.length);
+    const anyDupe = !!t.dupeHere || other;
+    switch (filter) {
+      case 'blocked': return !!t.blocked;
+      case 'dupes': return anyDupe;
+      case 'dupes-other': return other;
+      case 'issues': return !!t.blocked || anyDupe;
+      default: return true;
+    }
+  }
+
+  // Applies the view's filters + sort (+ grouping) to the playlists.
+  // Returns { items: [{pl, tracks}], groups: null | [{key, label, items}] };
+  // `tracks` is the (track-filtered) subset to show, or null if unscanned.
+  function plcSelect(playlists, view) {
+    const q = String(view.query || '').trim().toLowerCase();
+    const trackFiltering = view.trackFilter !== 'all';
+    const items = [];
+    for (const pl of playlists) {
+      if (view.yearFrom != null || view.yearTo != null) {
+        if (pl.year == null) continue;
+        if (view.yearFrom != null && pl.year < view.yearFrom) continue;
+        if (view.yearTo != null && pl.year > view.yearTo) continue;
+      }
+      const n = pl.tracks ? pl.tracks.length : null;
+      if (view.minTracks != null && (n == null || n < view.minTracks)) continue;
+      if (view.maxTracks != null && (n == null || n > view.maxTracks)) continue;
+
+      let tracks = pl.tracks ? pl.tracks.filter(t => plcTrackVisible(t, view.trackFilter)) : null;
+      if (q && !pl.title.toLowerCase().includes(q)) {
+        // The playlist's own title didn't match — it only stays if one of its
+        // tracks does, and then only those tracks are shown.
+        if (!tracks) continue;
+        tracks = tracks.filter(t => `${t.artist || ''} ${t.title || ''}`.toLowerCase().includes(q));
+        if (!tracks.length) continue;
+      }
+      if (trackFiltering && (!tracks || !tracks.length)) continue;
+      items.push({ pl, tracks });
+    }
+
+    const cmpName = (a, b) => PLC_COLLATOR.compare(plcSortKey(a.pl.name), plcSortKey(b.pl.name));
+    const cmpYear = dir => (a, b) => {
+      const ya = a.pl.year, yb = b.pl.year;
+      if (ya == null && yb == null) return 0;
+      if (ya == null) return 1;
+      if (yb == null) return -1;
+      return dir * (ya - yb);
+    };
+    const count = it => (it.pl.tracks ? it.pl.tracks.length : -1);
+    let cmp = null;
+    switch (view.sort) {
+      case 'name-asc': cmp = cmpName; break;
+      case 'name-desc': cmp = (a, b) => cmpName(b, a); break;
+      case 'artist-asc': cmp = (a, b) => {
+        const ka = plcFirstArtistKey(a.pl), kb = plcFirstArtistKey(b.pl);
+        if (!ka !== !kb) return ka ? -1 : 1;
+        return PLC_COLLATOR.compare(ka, kb) || cmpName(a, b);
+      }; break;
+      case 'year-asc': cmp = (a, b) => cmpYear(1)(a, b) || cmpName(a, b); break;
+      case 'year-desc': cmp = (a, b) => cmpYear(-1)(a, b) || cmpName(a, b); break;
+      case 'count-desc': cmp = (a, b) => (count(b) - count(a)) || cmpName(a, b); break;
+      case 'count-asc': cmp = (a, b) => (count(a) - count(b)) || cmpName(a, b); break;
+    }
+    // Ties (and the whole 'page' order) fall back to the order on the page.
+    if (cmp) items.sort((a, b) => cmp(a, b) || (a.pl.index - b.pl.index));
+    else items.sort((a, b) => a.pl.index - b.pl.index);
+
+    // Whether ANY playlist has scan data at all — plcBuildText only flags a
+    // single unscanned playlist once there's scan data to contrast it with
+    // (before a scan, every playlist is "unscanned" and the text must stay the
+    // plain title-and-link list).
+    const anyScanned = playlists.some(p => !!p.tracks);
+    if (view.group !== 'year' && view.group !== 'letter') return { items, groups: null, anyScanned };
+    const buckets = new Map();
+    for (const it of items) {
+      const key = view.group === 'year' ? (it.pl.year == null ? '' : String(it.pl.year)) : plcLetterKey(it.pl.name);
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(it);
+    }
+    const keys = [...buckets.keys()];
+    if (view.group === 'year') {
+      const desc = view.sort === 'year-desc';
+      keys.sort((a, b) => (a === '' ? 1 : b === '' ? -1 : desc ? b - a : a - b));
+    } else {
+      keys.sort((a, b) => (a === '#' ? 1 : b === '#' ? -1 : a === '0–9' ? -1 : b === '0–9' ? 1 : PLC_COLLATOR.compare(a, b)));
+    }
+    const groups = keys.map(key => ({ key, label: key === '' ? 'Без года' : key, items: buckets.get(key) }));
+    return { items, groups, anyScanned };
+  }
+
+  function plcOtherPlaylistsLabel(others) {
+    const shown = others.slice(0, 3).map(p => (p.title.length > 45 ? p.title.slice(0, 42) + '…' : p.title));
+    const rest = others.length - shown.length;
+    return shown.join('; ') + (rest > 0 ? ` и ещё ${rest}` : '');
+  }
+
+  function plcTrackLine(t, n, view) {
+    const artist = String(t.artist || '').trim(), title = String(t.title || '').trim();
+    let line = `  ${view.numbering ? n + '. ' : '- '}${artist ? artist + ' — ' : ''}${title || '(без названия)'}`;
+    if (view.marks) {
+      const bits = [];
+      if (t.blocked) bits.push('недоступен');
+      const where = [];
+      if (t.dupeHere) where.push('в этом плейлисте');
+      const others = t.dupeElsewhere || [];
+      if (others.length) {
+        where.push(view.dupeWhere
+          ? 'в: ' + plcOtherPlaylistsLabel(others)
+          : `ещё в ${others.length} ${plcPlural(others.length, 'плейлисте', 'плейлистах', 'плейлистах')}`);
+      }
+      if (where.length) bits.push('дубль ' + where.join(', '));
+      if (bits.length) line += ` [${bits.join('; ')}]`;
+    }
+    return line;
+  }
+
+  // Builds the copy-ready text. With tracks off and no grouping this is
+  // exactly the original "НАЗВАНИЕ - ссылка" one-per-line output.
+  function plcBuildText(selection, view) {
+    const lines = [];
+    let trackCount = 0;
+    const withTracks = !!view.showTracks;
+    const blockGap = () => { if (lines.length && lines[lines.length - 1] !== '') lines.push(''); };
+    const renderItem = ({ pl, tracks }) => {
+      const body = [];
+      if (withTracks) {
+        if (tracks) {
+          tracks.forEach((t, i) => body.push(plcTrackLine(t, i + 1, view)));
+          trackCount += tracks.length;
+          if (!tracks.length && pl.tracks && !pl.tracks.length) body.push('  (пусто)');
+          if (plcIsIncomplete(pl)) body.push(`  (собрано ${pl.tracks.length} из ${pl.declared} — плейлист прочитан не полностью)`);
+        } else if (selection.anyScanned) {
+          body.push(pl.scanError ? `  (треки не собраны: ${pl.scanError})` : '  (треки не собраны)');
+        }
+      }
+      if (body.length) blockGap();
+      lines.push(view.showLinks ? `${pl.title} - ${pl.url}` : pl.title);
+      if (body.length) lines.push(...body, '');
+    };
+    if (selection.groups) {
+      for (const g of selection.groups) {
+        blockGap();
+        lines.push(`=== ${g.label} ===`);
+        for (const it of g.items) renderItem(it);
+      }
+    } else {
+      for (const it of selection.items) renderItem(it);
+    }
+    while (lines.length && lines[lines.length - 1] === '') lines.pop();
+    return { text: lines.join('\n'), playlistCount: selection.items.length, trackCount };
+  }
+  // PLC-PURE-END
+
+  // One playlist's tracks. Tries VK's audio.get through the page (fast — one
+  // request per 250 tracks, no extra windows), then falls back to the same
+  // hidden-window DOM scan the auto-playlist flow already trusts
+  // (fetchPlaylistTracksViaHiddenTab → scanPlaylistTracksOnPage), for when the
+  // API route errors — VK's API has proven flaky before (see that function's
+  // comment), which is why the browser-driven route stays available as its
+  // own mode. `method`: 'auto' (API, window as fallback), 'api' (API only) or
+  // 'window' (windows only).
+  async function plcFetchPlaylistTracks(pl, method) {
+    const [ownerId, playlistId] = String(pl.id).split('_');
+    if (!ownerId || !playlistId) return { ok: false, error: 'некорректный id плейлиста' };
+    let lastError = '';
+    let apiTracks = null;
+    const tried = { api: false, window: false };
+    // A result short of what the card declares is treated like an empty API
+    // answer in 'auto' mode: not believed until the other route has weighed
+    // in (the larger of the two wins).
+    const complete = tracks => pl.declared == null || tracks.length >= pl.declared;
+    if (method !== 'window') {
+      tried.api = true;
+      for (let attempt = 0; attempt < 2 && !apiTracks; attempt++) {
+        try {
+          const res = await pageCall('VKD_COLLECT_PLAYLIST_TRACKS', 'VKD_COLLECT_PLAYLIST_TRACKS_DONE', {
+            reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+            ownerId, playlistId, accessHash: null,
+          }, 60000, 'reqId');
+          apiTracks = (res.tracks || []).map(t => ({
+            id: `${t.ownerId}_${t.numId}`, artist: t.artist || '', title: t.title || '',
+            duration: t.duration || 0, hasUrl: !!t.hasUrl, restricted: !!t.restricted, viaApi: true,
+          }));
+        } catch (err) {
+          lastError = err?.message || String(err);
+          // Missing token is permanent — retrying only wastes a second.
+          if (attempt === 0 && lastError !== 'no_access_token') await sleep(1200);
+          else break;
+        }
+      }
+      // An empty (or short) API answer is believed only in 'api' mode: in
+      // 'auto' it could just as well be a silent failure (private playlist,
+      // flood control), so the window scan double-checks it.
+      if (apiTracks && ((apiTracks.length && complete(apiTracks)) || method === 'api')) {
+        return { ok: true, source: 'api', tracks: apiTracks, tried };
+      }
+    }
+    if (method !== 'api') {
+      tried.window = true;
+      const res = await fetchPlaylistTracksViaHiddenTab(ownerId, playlistId);
+      if (res.ok) {
+        const winTracks = (res.tracks || []).map(t => ({
+          id: t.id || null, artist: t.artist || '', title: t.title || '',
+          duration: t.duration || 0, isBlocked: !!t.isBlocked,
+        }));
+        // Both routes answered but disagree — keep whichever read more.
+        if (apiTracks && apiTracks.length > winTracks.length) return { ok: true, source: 'api', tracks: apiTracks, tried };
+        return { ok: true, source: 'window', apiFailed: method !== 'window' && !apiTracks, tracks: winTracks, tried };
+      }
+      if (apiTracks) return { ok: true, source: 'api', tracks: apiTracks, tried };
+      lastError = lastError || 'не удалось открыть плейлист';
+    }
+    return { ok: false, error: lastError || 'ошибка', apiFailed: method !== 'window' && !apiTracks, tried };
+  }
+
+  // Walks every playlist that has no tracks yet (cached ones are skipped).
+  // Sequential on purpose: VK throttles bursts of audio.* calls, and the
+  // window route opens a real browser window per playlist.
+  // Bounded worker pool — up to `concurrency` playlists in flight at once,
+  // each running the same sequential steps the single-threaded version did
+  // (fetch, merge, pace). concurrency:1 is exactly the old sequential loop.
+  // apiFailStreak is shared across workers: a plain counter, not a lock — two
+  // workers can race a read/write around the same await, which only means the
+  // auto-mode circuit breaker trips a call or two early/late, never wrong
+  // results. onProgress gets a 4th argument (the other playlists currently in
+  // flight) that callers may ignore.
+  async function plcScanTracks(playlists, { method, token, concurrency, onProgress }) {
+    const todo = playlists.filter(plcNeedsWork);
+    const startHref = location.href;
+    const stopped = () => token.cancel || location.href !== startHref;
+    const n = Math.max(1, Math.min(16, Math.floor(concurrency) || 1));
+    let done = 0;
+    let cursor = 0;
+    let apiFailStreak = 0;
+    const active = new Set();
+
+    async function worker() {
+      for (;;) {
+        if (stopped()) return;
+        const idx = cursor++;
+        if (idx >= todo.length) return;
+        const pl = todo[idx];
+        active.add(pl);
+        onProgress(done, todo.length, pl, [...active]);
+        // In 'auto' mode, a few API failures in a row (no token, VK rejecting
+        // the call) mean the API route isn't going to work for this scan —
+        // go straight to the window route for the rest instead of paying a
+        // failed attempt on every remaining playlist. One success resets it.
+        const effective = method === 'auto' && apiFailStreak >= 3 ? 'window' : method;
+        const res = await plcFetchPlaylistTracks(pl, effective);
+        if (effective !== 'window') apiFailStreak = res.apiFailed ? apiFailStreak + 1 : 0;
+        pl.tried = { api: !!(pl.tried && pl.tried.api) || !!res.tried?.api, window: !!(pl.tried && pl.tried.window) || !!res.tried?.window };
+        if (res.ok) {
+          // A re-scan of an incomplete playlist must never make it worse.
+          if (!pl.tracks || res.tracks.length >= pl.tracks.length) {
+            pl.tracks = res.tracks;
+            pl.scanSource = res.source;
+          }
+          pl.scanError = null;
+          plcCache.set(pl.id, { tracks: pl.tracks, source: pl.scanSource, tried: pl.tried });
+        } else if (!pl.tracks) {
+          pl.scanError = res.error || 'ошибка';
+        }
+        active.delete(pl);
+        done++;
+        onProgress(done, todo.length, pl, [...active]);
+        if (!stopped()) await sleep(method === 'window' ? 300 : 120);
+      }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(n, todo.length) || 1 }, worker));
+    return { done, total: todo.length, stopped: stopped() };
+  }
+
+  // The collector panel: the original copy-ready "НАЗВАНИЕ - ссылка" list, now
+  // with an optional deep scan that reads every playlist's tracks (plus their
+  // blocked / duplicated-in-other-playlists state) and a filter/sort/format
+  // bar that rebuilds the text live. Until a scan is run the default view is
+  // byte-for-byte the old plain list.
+  function showPlaylistCollectPanel(playlistsRaw) {
+    syncVmuTheme();
+    closePlaylistCollectPanel();
+
+    const playlists = playlistsRaw.map((p, i) => plcMakePlaylist(p, i));
+    for (const pl of playlists) {
+      const cached = plcCache.get(pl.id);
+      if (cached) { pl.tracks = cached.tracks; pl.scanSource = cached.source; pl.tried = cached.tried || null; }
+    }
+    plcFinalizeBlocked(playlists);
+    plcAnalyze(playlists);
+    const view = { ...PLC_DEFAULT_VIEW };
+    const nf = n => n.toLocaleString('ru-RU');
+
+    const opt = (value, label) => `<option value="${value}">${escHtml(label)}</option>`;
+    const check = (id, label, checked, needsTracks) => `
+      <label class="vmu-rename-check${needsTracks ? ' vmu-plc-needs-tracks' : ''}">
+        <input type="checkbox" id="vmu-plc-${id}"${checked ? ' checked' : ''}><span>${escHtml(label)}</span>
+      </label>`;
+
+    const modal = document.createElement('div');
+    modal.id = 'vmu-plcollect-modal';
+    modal.className = 'vmu-bulkops-panel vmu-plcollect-modal';
+    modal.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title" id="vmu-plc-title">Плейлисты: ${playlists.length}</span>
+        <button type="button" class="vmu-check-close" id="vmu-plcollect-close" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body vmu-plcollect-body">
+        <div class="vmu-plc-section vmu-plc-section-first">
+          <div class="vmu-plc-row">
+            <button type="button" id="vmu-plc-scan-btn" class="vmu-pick-btn"></button>
+            <button type="button" id="vmu-plc-reset" class="vmu-plc-link" title="Забыть собранные треки">Сбросить</button>
+          </div>
+          <div class="vmu-plc-row">
+            <select id="vmu-plc-method" class="vmu-covered-select" title="Как читать треки плейлистов">
+              ${opt('auto', 'Авто: быстро через API, при сбое — через окно')}
+              ${opt('api', 'Только API страницы (быстро)')}
+              ${opt('window', 'Только скрытые окна (медленно, надёжнее)')}
+            </select>
+            <span class="vmu-plc-label" title="Сколько плейлистов читать одновременно. Для «через окна» — сколько скрытых окон открыто разом; много потоков может задевать лимиты VK.">Потоков</span>
+            <input type="number" id="vmu-plc-concurrency" class="vmu-plc-input vmu-plc-input-sm" min="1" max="16" step="1" value="3">
+          </div>
+          <div class="vmu-slim-track" id="vmu-plc-bar" style="display:none"><div class="vmu-slim-fill" id="vmu-plc-bar-fill"></div></div>
+          <div class="vmu-plc-status" id="vmu-plc-status"></div>
+        </div>
+
+        <div class="vmu-plc-section">
+          <div class="vmu-rename-block-label">Фильтры</div>
+          <div class="vmu-plc-row">
+            <span class="vmu-plc-label">Поиск</span>
+            <input type="text" id="vmu-plc-query" class="vmu-plc-input" placeholder="плейлист, артист или трек" spellcheck="false">
+          </div>
+          <div class="vmu-plc-row">
+            <span class="vmu-plc-label">Год</span>
+            <span class="vmu-plc-range">
+              <input type="number" id="vmu-plc-yfrom" class="vmu-plc-input vmu-plc-input-sm" placeholder="от" min="1950" max="2100">
+              <span>—</span>
+              <input type="number" id="vmu-plc-yto" class="vmu-plc-input vmu-plc-input-sm" placeholder="до" min="1950" max="2100">
+            </span>
+          </div>
+          <div class="vmu-plc-row vmu-plc-needs-tracks">
+            <span class="vmu-plc-label">Треков в плейлисте</span>
+            <span class="vmu-plc-range">
+              <input type="number" id="vmu-plc-minc" class="vmu-plc-input vmu-plc-input-sm" placeholder="от" min="0">
+              <span>—</span>
+              <input type="number" id="vmu-plc-maxc" class="vmu-plc-input vmu-plc-input-sm" placeholder="до" min="0">
+            </span>
+          </div>
+          <div class="vmu-plc-row vmu-plc-needs-tracks">
+            <span class="vmu-plc-label">Показывать треки</span>
+            <select id="vmu-plc-trackfilter" class="vmu-covered-select">
+              ${opt('all', 'Все')}
+              ${opt('issues', 'Только проблемные (недоступные и дубли)')}
+              ${opt('blocked', 'Только недоступные')}
+              ${opt('dupes', 'Только дубли (где угодно)')}
+              ${opt('dupes-other', 'Только дубли в других плейлистах')}
+            </select>
+          </div>
+        </div>
+
+        <div class="vmu-plc-section">
+          <div class="vmu-rename-block-label">Вид</div>
+          <div class="vmu-plc-row">
+            <span class="vmu-plc-label">Сортировка</span>
+            <select id="vmu-plc-sort" class="vmu-covered-select">
+              ${opt('page', 'Как на странице')}
+              ${opt('name-asc', 'Название А→Я')}
+              ${opt('name-desc', 'Название Я→А')}
+              ${opt('artist-asc', 'Артист А→Я')}
+              ${opt('year-asc', 'Год: старые сначала')}
+              ${opt('year-desc', 'Год: новые сначала')}
+              ${opt('count-desc', 'Треков: больше сначала')}
+              ${opt('count-asc', 'Треков: меньше сначала')}
+            </select>
+          </div>
+          <div class="vmu-plc-row">
+            <span class="vmu-plc-label">Группировать</span>
+            <select id="vmu-plc-group" class="vmu-covered-select">
+              ${opt('none', 'Без группировки')}
+              ${opt('year', 'По годам')}
+              ${opt('letter', 'По первой букве')}
+            </select>
+          </div>
+          <div class="vmu-plc-checks">
+            ${check('showlinks', 'Ссылки', true, false)}
+            ${check('showtracks', 'Треки внутри', true, true)}
+            ${check('numbering', 'Нумерация', true, true)}
+            ${check('marks', 'Пометки (недоступен / дубль)', true, true)}
+            ${check('dupewhere', 'Указывать, где ещё дубль', true, true)}
+          </div>
+        </div>
+
+        <textarea id="vmu-plcollect-text" class="vmu-plcollect-text" readonly spellcheck="false" wrap="off"></textarea>
+        <div class="vmu-plc-actions">
+          <span class="vmu-plc-count" id="vmu-plc-count"></span>
+          <button type="button" id="vmu-plcollect-copy" class="vmu-pick-btn">Копировать</button>
+          <button type="button" id="vmu-plc-download" class="vmu-pick-btn vmu-plc-secondary">Скачать .txt</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    makePanelDraggable(modal, modal.querySelector('.vmu-bulkops-head'));
+    modal.querySelector('#vmu-plcollect-close').addEventListener('click', closePlaylistCollectPanel);
+
+    const $ = sel => modal.querySelector(sel);
+    modal.querySelectorAll('select.vmu-covered-select').forEach(s => vmuEnhanceSelect(s));
+    const ta = $('#vmu-plcollect-text');
+    const scanBtn = $('#vmu-plc-scan-btn');
+    const statusEl = $('#vmu-plc-status');
+    const bar = $('#vmu-plc-bar');
+    const barFill = $('#vmu-plc-bar-fill');
+    const readInt = el => { const v = parseInt(el.value, 10); return Number.isFinite(v) ? v : null; };
+    let scanning = false;
+
+    const hasScanData = () => playlists.some(p => !!p.tracks);
+
+    function readView() {
+      view.query = $('#vmu-plc-query').value;
+      view.yearFrom = readInt($('#vmu-plc-yfrom'));
+      view.yearTo = readInt($('#vmu-plc-yto'));
+      view.minTracks = readInt($('#vmu-plc-minc'));
+      view.maxTracks = readInt($('#vmu-plc-maxc'));
+      view.trackFilter = $('#vmu-plc-trackfilter').value;
+      view.sort = $('#vmu-plc-sort').value;
+      view.group = $('#vmu-plc-group').value;
+      // Without scan data the track-based controls are greyed out and must
+      // not silently keep filtering on whatever they were last set to.
+      if (!hasScanData()) {
+        view.trackFilter = 'all';
+        view.minTracks = view.maxTracks = null;
+        if (view.sort.startsWith('count-')) view.sort = 'page';
+      }
+      view.showLinks = $('#vmu-plc-showlinks').checked;
+      view.showTracks = $('#vmu-plc-showtracks').checked;
+      view.numbering = $('#vmu-plc-numbering').checked;
+      view.marks = $('#vmu-plc-marks').checked;
+      view.dupeWhere = $('#vmu-plc-dupewhere').checked;
+    }
+
+    // Controls that only mean something once tracks exist are greyed out
+    // until then (same .vmu-row-disabled the settings panels use).
+    function syncAvailability() {
+      const has = hasScanData();
+      modal.querySelectorAll('.vmu-plc-needs-tracks').forEach(el => el.classList.toggle('vmu-row-disabled', !has));
+      for (const o of $('#vmu-plc-sort').options) if (o.value.startsWith('count-')) o.disabled = !has;
+      if (!has && $('#vmu-plc-sort').value.startsWith('count-')) $('#vmu-plc-sort').value = 'page';
+      $('#vmu-plc-reset').style.display = has && !scanning ? '' : 'none';
+    }
+
+    function refresh() {
+      readView();
+      const selection = plcSelect(playlists, view);
+      const { text, playlistCount, trackCount } = plcBuildText(selection, view);
+      ta.value = text;
+      const parts = [`Показано плейлистов: ${nf(playlistCount)} из ${nf(playlists.length)}`];
+      if (hasScanData() && view.showTracks) parts.push(`треков: ${nf(trackCount)}`);
+      $('#vmu-plc-count').textContent = parts.join(' · ');
+      syncAvailability();
+    }
+
+    function updateScanUi() {
+      const missing = playlists.filter(plcNeedsWork).length;
+      const s = plcStats(playlists);
+      if (scanning) {
+        scanBtn.textContent = 'Остановить';
+      } else if (!hasScanData()) {
+        scanBtn.textContent = 'Собрать треки плейлистов';
+      } else if (missing) {
+        scanBtn.textContent = `Дособрать треки (${nf(missing)})`;
+      } else {
+        scanBtn.textContent = 'Пересобрать треки';
+      }
+      if (scanning) return;
+      if (!hasScanData()) {
+        statusEl.textContent = 'Треки не собраны — в тексте только названия и ссылки. Сбор читает каждый плейлист и находит недоступные треки и дубли между плейлистами.';
+        return;
+      }
+      const bits = [
+        `Треки: ${nf(s.tracks)} в ${nf(s.scanned)} из ${nf(s.total)} плейлистов`,
+        `недоступных: ${nf(s.blocked)}`,
+        `дублей: ${nf(s.dupeTracks)} (в других плейлистах: ${nf(s.dupeElsewhere)})`,
+      ];
+      if (s.incomplete) bits.push(`прочитано не полностью: ${nf(s.incomplete)}`);
+      if (s.failed) bits.push(`не удалось: ${nf(s.failed)}`);
+      statusEl.textContent = bits.join(' · ');
+    }
+
+    async function runScan() {
+      if (scanning) { if (plcActiveScan) plcActiveScan.cancel = true; scanBtn.disabled = true; scanBtn.textContent = 'Останавливаем…'; return; }
+      // "Пересобрать" (everything already scanned) starts from scratch.
+      if (!playlists.some(plcNeedsWork)) resetScan();
+      const method = $('#vmu-plc-method').value;
+      const concEl = $('#vmu-plc-concurrency');
+      const concurrency = Math.max(1, Math.min(16, parseInt(concEl.value, 10) || 1));
+      concEl.value = concurrency; // reflect the clamp back (e.g. "0" or "99" typed in)
+      const token = { cancel: false };
+      plcActiveScan = token;
+      scanning = true;
+      $('#vmu-plc-method').disabled = true;
+      concEl.disabled = true;
+      bar.style.display = '';
+      barFill.style.width = '0%';
+      updateScanUi();
+      syncAvailability();
+      let note = '';
+      try {
+        const res = await plcScanTracks(playlists, {
+          method, token, concurrency,
+          onProgress: (done, total, pl, active) => {
+            if (!modal.isConnected) return;
+            barFill.style.width = (total ? Math.round(done / total * 100) : 0) + '%';
+            const short = t => (t.length > 40 ? t.slice(0, 37) + '…' : t);
+            const names = (active && active.length ? active : [pl]).map(p => short(p.title));
+            const shown = names.slice(0, 3).join(', ') + (names.length > 3 ? ` и ещё ${names.length - 3}` : '');
+            statusEl.textContent = `Читаем плейлисты: ${nf(done)} / ${nf(total)} — ${shown}`;
+          },
+        });
+        if (res.stopped) note = 'Остановлено. ';
+      } catch (err) {
+        console.error('[VK Multi Upload] playlist track scan failed:', err);
+        note = 'Ошибка: ' + (err?.message || err) + '. ';
+      } finally {
+        scanning = false;
+        if (plcActiveScan === token) plcActiveScan = null;
+        // Whatever was collected before a stop/error is still worth analysing.
+        plcFinalizeBlocked(playlists);
+        plcAnalyze(playlists);
+        if (modal.isConnected) {
+          bar.style.display = 'none';
+          scanBtn.disabled = false;
+          $('#vmu-plc-method').disabled = false;
+          concEl.disabled = false;
+          updateScanUi();
+          if (note) statusEl.textContent = note + statusEl.textContent;
+          refresh();
+        }
+      }
+    }
+
+    function resetScan() {
+      for (const pl of playlists) { pl.tracks = null; pl.scanSource = null; pl.scanError = null; pl.tried = null; }
+      plcCache.clear();
+      // The track-based controls go back to neutral along with the data.
+      $('#vmu-plc-trackfilter').value = 'all';
+      $('#vmu-plc-minc').value = '';
+      $('#vmu-plc-maxc').value = '';
+      if ($('#vmu-plc-sort').value.startsWith('count-')) $('#vmu-plc-sort').value = 'page';
+    }
+
+    scanBtn.addEventListener('click', runScan);
+    $('#vmu-plc-reset').addEventListener('click', () => {
+      resetScan();
+      updateScanUi();
+      refresh();
+    });
+
+    let refreshTimer = null;
+    const scheduleRefresh = () => { clearTimeout(refreshTimer); refreshTimer = setTimeout(refresh, 120); };
+    modal.addEventListener('input', scheduleRefresh);
+    modal.addEventListener('change', scheduleRefresh);
+
+    const copyBtn = $('#vmu-plcollect-copy');
+    copyBtn.addEventListener('click', async () => {
+      const text = ta.value;
+      let ok = false;
+      try { await navigator.clipboard.writeText(text); ok = true; } catch {}
+      if (!ok) {
+        ta.select();
+        try { ok = document.execCommand('copy'); } catch {}
+      }
+      copyBtn.textContent = ok ? '✓ Скопировано' : 'Нажмите Ctrl+C';
+      setTimeout(() => { if (copyBtn.isConnected) copyBtn.textContent = 'Копировать'; }, 1500);
+    });
+    $('#vmu-plc-download').addEventListener('click', () => {
+      const blob = new Blob([ta.value], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const owner = (playlists[0]?.id || '').split('_')[0];
+      a.href = url; a.download = `playlists${owner ? '_' + owner : ''}.txt`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+    });
+
+    updateScanUi();
+    refresh();
+    ta.focus();
+    ta.select();
+    // select() scrolls the box to the end of the selection — start at the top.
+    ta.scrollTop = 0;
+    ta.scrollLeft = 0;
+  }
+
+  async function runPlaylistCollect() {
+    if (plCollectRunning) return;
+    plCollectRunning = true;
+    const startHref = location.href;
+    const startY = window.scrollY;
+    const btn = document.getElementById('vmu-plcollect-btn');
+    if (btn) btn.disabled = true;
+    closePlaylistCollectPanel();
+    const navigatedAway = () => location.href !== startHref;
+    showProgressToast('Собираем плейлисты…', { id: PL_COLLECT_TOAST_ID });
+    try {
+      const playlists = await collectCatalogPlaylists(
+        n => showProgressToast(`Собираем плейлисты… найдено ${n}`, { id: PL_COLLECT_TOAST_ID }),
+        navigatedAway
+      );
+      if (navigatedAway()) {
+        document.getElementById(PL_COLLECT_TOAST_ID)?.remove();
+      } else if (!playlists.length) {
+        showProgressToast('Плейлисты на странице не найдены', { id: PL_COLLECT_TOAST_ID, kind: 'error' });
+      } else {
+        showProgressToast(`Готово — плейлистов: ${playlists.length}`, { id: PL_COLLECT_TOAST_ID, kind: 'done' });
+        showPlaylistCollectPanel(playlists);
+      }
+    } catch (err) {
+      showProgressToast('Ошибка: ' + (err?.message || err), { id: PL_COLLECT_TOAST_ID, kind: 'error' });
+    } finally {
+      plCollectRunning = false;
+      if (btn?.isConnected) btn.disabled = false;
+      if (!navigatedAway()) window.scrollTo(0, startY);
+    }
+  }
+
+  function injectPlaylistCollectButton() {
+    if (document.getElementById('vmu-plcollect-btn')) return;
+    const list = document.querySelector(PL_LIST_BLOCK_SEL);
+    if (!list?.parentElement) return;
+    const row = document.createElement('div');
+    row.className = 'vmu-plcollect-row';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vmu-plcollect-btn';
+    btn.className = 'vmu-plcollect-btn';
+    btn.textContent = 'Собрать список плейлистов';
+    btn.addEventListener('click', e => { e.stopPropagation(); runPlaylistCollect(); });
+    row.appendChild(btn);
+    list.parentElement.insertBefore(row, list);
+  }
+
   let _dupesDialogTimer = null;
   // ─── SPA watcher + dialog watcher ────────────────────────────────────────────
   let lastHref = location.href;
@@ -10163,7 +11803,14 @@
       dlTracks.clear();
       dlCancelFlag = true;
       dlpClose();
+      closePlaylistCollectPanel();
+      closePlaylistMakerPanel();
     }
+
+    // Own try/catch: this used to be its own observer, so a failure here
+    // (or in any step below) must not be able to skip or be skipped by the
+    // others.
+    try { injectCatalogToolbarButtons(); } catch (err) { console.warn('[VK Multi Upload] toolbar inject failed:', err); }
 
     // Inject into VK's upload dialog whenever it appears;
     // also re-inject if VK replaced the body content (success screen after upload) —
@@ -10192,6 +11839,8 @@
 
     // Keep the audio catalog header split/pin in sync with VK's re-renders
     applyAudioCatalogLayout();
+
+    injectPlaylistCollectButton();
 
     // Restore the audio FX button/panel if VK re-rendered over them
     ensureAudioFxUI();

@@ -24,7 +24,7 @@
     try { console.log(...a); } catch {}
   };
 
-  // ── VK audio_api_unavailable URL deobfuscator ────────────────────────────────
+  // ─── VK audio_api_unavailable URL deobfuscator ────────────────────────────────
   // VK serves obfuscated URLs of the form:
   //   https://vk.com/mp3/audio_api_unavailable.mp3?extra=<base64-ish>#<key>
   // The real CDN URL is encoded in `extra` and the op-chain key is in the fragment.
@@ -107,7 +107,7 @@
     return (typeof t === 'string' && t.startsWith('http')) ? t : url;
   }
 
-  // ── Always-on close escape hatch ────────────────────────────────────────────
+  // ─── Always-on close escape hatch ────────────────────────────────────────────
   // Even when our hold-open patches block VK's close path, the user must be
   // able to dismiss the panel manually. Intercept clicks on the popup's X
   // icon (popup_box_close) and on any "Закрыть" button inside .audio_add_box,
@@ -156,7 +156,7 @@
         return;
       }
       console.log('[VMU CLOSE] user-close intercepted — flag off');
-      __vmuBlockAudioBoxHide = false;
+      __vmuSetBlockFlag(false);
       clearArmedStyles();
 
       if (isNew) {
@@ -188,7 +188,7 @@
     }
   }, true);
 
-  // ── Preserve VK's Upload manager state across uploads ───────────────────────
+  // ─── Preserve VK's Upload manager state across uploads ───────────────────────
   // VK clears Upload.options/obj/vars/uploadUrls[0] right after the first
   // upload finishes (Upload.deinit / onUploadCompleteAll path). All later
   // uploads then have nothing to drive — Upload.onFileApiSend(0, ...) bails
@@ -200,7 +200,7 @@
     try {
       const U = window.Upload;
       if (!U || !U.options || !U.options[0]) return;
-      __vmuUploadSnapshot = {
+      const next = {
         options: U.options[0],
         obj: U.obj?.[0],
         vars: U.vars?.[0],
@@ -209,6 +209,15 @@
         dropbox: U.dropbox?.[0],
         files: U.files?.[0],
       };
+      // Called from the 300ms poll below for as long as the slot stays
+      // populated (i.e. the rest of the page's life once the upload dialog
+      // has been opened once) — when nothing in the slot changed the
+      // snapshot is already exactly this, so don't re-log/re-store it.
+      const prev = __vmuUploadSnapshot;
+      if (prev && prev.options === next.options && prev.obj === next.obj && prev.vars === next.vars
+          && prev.types === next.types && prev.url === next.url && prev.dropbox === next.dropbox
+          && prev.files === next.files) return;
+      __vmuUploadSnapshot = next;
       console.log('[VMU UPLOAD] snapshot saved, url=', String(__vmuUploadSnapshot.url || '').slice(0, 60));
     } catch (e) { console.log('[VMU UPLOAD] snapshot failed', e.message); }
   }
@@ -272,7 +281,7 @@
     console.log('[VMU UPLOAD] Upload manager patched');
   }
 
-  // ── Prevent VK from auto-closing the audio upload popup ──────────────────────
+  // ─── Prevent VK from auto-closing the audio upload popup ──────────────────────
   // VK's popup system is window.boxQueue; after a successful upload it calls
   // boxQueue._hide(id) (and the instance's .hide()) on the audio_add_box popup.
   // content.js toggles __vmuBlockAudioBoxHide via postMessage while the queue
@@ -348,7 +357,17 @@
       }
     }
   });
-  __vmuZombieGuard.observe(document.documentElement, { childList: true, subtree: true });
+  // The callback above is a no-op unless the block flag is on, but a
+  // documentElement-subtree observer still makes the browser build and
+  // queue a MutationRecord for every single DOM change on the page (feed,
+  // messenger, everything) for as long as it's connected — so it's only
+  // connected while the flag is actually on. Every write to the flag goes
+  // through here.
+  function __vmuSetBlockFlag(on) {
+    __vmuBlockAudioBoxHide = !!on;
+    if (__vmuBlockAudioBoxHide) __vmuZombieGuard.observe(document.documentElement, { childList: true, subtree: true });
+    else __vmuZombieGuard.disconnect();
+  }
 
   function boxHasAudioAddBox(box) {
     if (!box) return false;
@@ -467,14 +486,16 @@
 
   function scanAndPatchAudioBoxes() {
     // Old VK: box instances in _message_boxes
+    // Already-patched boxes are skipped BEFORE the DOM lookup — this runs
+    // every 300ms, and patchAudioBoxInstance would bail on them anyway.
     const mb = window._message_boxes;
     if (mb) for (const id in mb) {
-      if (boxHasAudioAddBox(mb[id])) patchAudioBoxInstance(mb[id]);
+      if (mb[id] && !mb[id].__vmuPatched && boxHasAudioAddBox(mb[id])) patchAudioBoxInstance(mb[id]);
     }
     // New VK: box instances may be in boxQueue._boxes
     const boxes = window.boxQueue?._boxes;
     if (boxes) for (const id in boxes) {
-      if (boxHasAudioAddBox(boxes[id])) patchAudioBoxInstance(boxes[id]);
+      if (boxes[id] && !boxes[id].__vmuPatched && boxHasAudioAddBox(boxes[id])) patchAudioBoxInstance(boxes[id]);
     }
   }
 
@@ -491,7 +512,7 @@
     if (e.source !== window || !e.data) return;
     if (e.data.type === 'VMU_BLOCK_AUDIO_HIDE') {
       const wasBlocking = __vmuBlockAudioBoxHide;
-      __vmuBlockAudioBoxHide = !!e.data.block;
+      __vmuSetBlockFlag(e.data.block);
       if (__vmuBlockAudioBoxHide) {
         // entering "hold open" — re-arm in case VK started fading already
         armBoxVisibility();
@@ -511,7 +532,7 @@
     if (__vmuBlockAudioBoxHide) armBoxVisibility();
   }, 300);
 
-  // ── Capture VK's own al_audio.php hashes for reuse ───────────────────────────
+  // ─── Capture VK's own al_audio.php hashes for reuse ───────────────────────────
   window.__vmuHashes = {};
   // Callback for one-shot response capture
   let __savePlaylistCapture = null;
@@ -529,7 +550,7 @@
   // instead of racing it.
   let __playlistCreationQueue = Promise.resolve();
 
-  // ── Pending upload → done_add bridge ────────────────────────────────────────
+  // ─── Pending upload → done_add bridge ────────────────────────────────────────
   // VK's upload chain is: <upload-host>/...upload (file transfer) → al_audio.php?act=done_add
   // (commit). Only done_add tells us whether the track was actually attached to
   // the user's audio (it returns payload[0]=0 on success, error code otherwise —
@@ -709,7 +730,7 @@
     } catch {}
   }
 
-  // ── XHR interceptor ──────────────────────────────────────────────────────────
+  // ─── XHR interceptor ──────────────────────────────────────────────────────────
   const origOpen = XMLHttpRequest.prototype.open;
   const origSend = XMLHttpRequest.prototype.send;
 
@@ -785,7 +806,7 @@
           emitDoneFromDoneAdd(xhr.responseText);
         }
         try {
-          const d = JSON.parse(xhr.responseText);
+          const d = parseJsonOnce(xhr.responseText);
           if (d?.payload) walkForHashes(d.payload);
         } catch {}
       });
@@ -809,8 +830,12 @@
       window.__vmuGetUploadServerBody = parseBodyStr(body);
     }
 
-    // Capture audio data for playlist download (fires on any al_audio.php response)
-    {
+    // Capture audio data for playlist download (fires on any al_audio.php response).
+    // Only hooked for URLs processForAudioData would accept anyway — it
+    // bails on everything else as its first step, so hooking every other
+    // XHR on the page (feed, messenger, ...) just to read responseText and
+    // immediately return was pure overhead.
+    if (isAudioDataUrl(url)) {
       const _xhrDl = this, _urlDl = url;
       _xhrDl.addEventListener('load', () => { try { processForAudioData(_urlDl, _xhrDl.responseText); } catch {} });
     }
@@ -818,7 +843,7 @@
     return origSend.call(this, body);
   };
 
-  // ── Fetch interceptor ────────────────────────────────────────────────────────
+  // ─── Fetch interceptor ────────────────────────────────────────────────────────
   const origFetch = window.fetch;
   window.fetch = async function (...args) {
     const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
@@ -841,6 +866,13 @@
 
     const result = await origFetch.apply(this, args);
 
+    // One clone+text() shared by every consumer below (al_audio.php responses
+    // used to be cloned and decoded twice — hash capture, then track
+    // capture). Still created synchronously, before `result` is handed back
+    // to the page, so the body can't already be consumed by then.
+    let _bodyTextP = null;
+    const bodyText = () => (_bodyTextP ||= result.clone().text());
+
     if (url.includes('al_audio.php')) {
       const bStr = parseBodyStr(args[1]?.body);
       const act = extractAct(bStr, url);
@@ -848,7 +880,7 @@
       if (hash) { window.__vmuHashes[act || '_page'] = hash; window.__vmuHashes._page = hash; }
       if (act === 'playlists_edit_data') relayEditPlaylistIds(bStr);
 
-      result.clone().text().then(text => {
+      bodyText().then(text => {
         if ((act === 'save_playlist' || act === 'playlists_edit_data') && __savePlaylistCapture) {
           const cb = __savePlaylistCapture;
           __savePlaylistCapture = null;
@@ -859,7 +891,7 @@
           emitDoneFromDoneAdd(text);
         }
         try {
-          const d = JSON.parse(text);
+          const d = parseJsonOnce(text);
           if (d?.payload) walkForHashes(d.payload);
         } catch {}
       }).catch(() => {});
@@ -886,12 +918,38 @@
     // on the domain-agnostic /method/ path like processForAudioData's own
     // guard below already does — a literal api.vk.com check alone silently
     // drops every response since VK moved the API host.
-    if (url.includes('al_audio') || url.includes('/method/') || url.includes('api.vk.com')) {
-      result.clone().text().then(t => { try { processForAudioData(url, t); } catch {} }).catch(() => {});
+    if (isAudioDataUrl(url)) {
+      bodyText().then(t => { try { processForAudioData(url, t); } catch {} }).catch(() => {});
     }
 
     return result;
   };
+
+  // The URLs whose responses processForAudioData inspects — kept in one
+  // place so the XHR/fetch hooks can skip everything else without touching
+  // the response at all.
+  function isAudioDataUrl(url) {
+    return url.includes('al_audio') || url.includes('/method/') || url.includes('api.vk.com');
+  }
+
+  // Literal shape of an array-form track as tryEmitTrack reads it: two
+  // numbers (id, owner), a url (string or null/number), then title and
+  // artist strings. Only used as a cheap "worth parsing?" pre-check.
+  const AUDIO_ARRAY_TRACK_RE = /\[\s*-?\d+\s*,\s*-?\d+\s*,\s*(?:"(?:[^"\\]|\\.)*"|null|-?\d+)\s*,\s*"(?:[^"\\]|\\.)*"\s*,\s*"/;
+
+  // One-entry parse cache. An al_audio.php response is JSON-parsed by the
+  // hash-capture step and again by processForAudioData right after it, on
+  // the very same string; neither walker mutates what it's handed, so the
+  // second call can just reuse the first parse. Dropped at the end of the
+  // current task so a multi-MB parsed payload isn't kept alive afterwards.
+  let __vmuJsonText = null, __vmuJsonVal = null, __vmuJsonClearT = null;
+  function parseJsonOnce(text) {
+    if (text === __vmuJsonText) return __vmuJsonVal;
+    const val = JSON.parse(text);
+    __vmuJsonText = text; __vmuJsonVal = val;
+    if (!__vmuJsonClearT) __vmuJsonClearT = setTimeout(() => { __vmuJsonText = __vmuJsonVal = __vmuJsonClearT = null; }, 0);
+    return val;
+  }
 
   function walkForHashes(obj, depth = 0) {
     if (!obj || typeof obj !== 'object' || depth > 4) return;
@@ -903,11 +961,11 @@
     }
   }
 
-  // ── Audio capture for playlist download ──────────────────────────────────────
+  // ─── Audio capture for playlist download ──────────────────────────────────────
 
   const _dlSeen = new Set();
 
-  // ── Capture playlist access_hash from execute responses ────────────────────
+  // ─── Capture playlist access_hash from execute responses ────────────────────
   function capturePlaylistMeta(obj, depth) {
     if (!obj || depth > 10) return;
     if (typeof obj === 'object' && !Array.isArray(obj)) {
@@ -925,15 +983,29 @@
 
   function processForAudioData(url, text) {
     if (!text || text.length < 20) return;
-    if (!url.includes('al_audio') && !url.includes('/method/') && !url.includes('api.vk.com')) return;
+    if (!isAudioDataUrl(url)) return;
+    // al_audio.php is music-only and always walked. /method/ and api.vk.com
+    // carry the whole site's API traffic (wall, groups, account, ...), and
+    // the walkers below can only ever find something in a response that
+    // literally contains one of these markers: "artist" (an audio object —
+    // tryEmitTrackObj needs that key), "access_hash"/"access_key" (a
+    // playlist's hash — capturePlaylistMeta; verified live that
+    // catalog.getSection playlist grids carry access_key with NO "artist"
+    // anywhere), or the array shape tryEmitTrack reads ([id, owner, url,
+    // "title", "artist", ...] — no key names to match on, so it's matched by
+    // its literal shape). Anything else would parse a big JSON body and walk
+    // it for nothing.
+    if (!url.includes('al_audio')
+        && !text.includes('"artist"') && !text.includes('"access_hash"')
+        && !text.includes('"access_key"') && !AUDIO_ARRAY_TRACK_RE.test(text)) return;
     try {
       const stripped = text.replace(/^<!--[\s\S]*?-->/, '').trim();
-      const parsed = JSON.parse(stripped);
+      const parsed = parseJsonOnce(stripped);
       capturePlaylistMeta(parsed, 0);
       walkForAudio(parsed, 0);
     } catch {
       try {
-        const parsed = JSON.parse(text);
+        const parsed = parseJsonOnce(text);
         capturePlaylistMeta(parsed, 0);
         walkForAudio(parsed, 0);
       } catch {}
@@ -982,7 +1054,7 @@
     return true;
   }
 
-  // ── Message dispatcher ────────────────────────────────────────────────────────
+  // ─── Message dispatcher ────────────────────────────────────────────────────────
   window.addEventListener('message', function (e) {
     if (!e.data || e.source !== window) return;
 
@@ -1158,7 +1230,7 @@
       }
 
       case 'VK_CREATE_PLAYLIST': {
-        const { title, description, trackNames, coverBuf, reqId } = e.data;
+        const { title, description, trackNames, audioIds, coverBuf, reqId } = e.data;
         // Cover as a File object, passed straight through the call chain
         // (not a shared window global) — two overlapping VK_CREATE_PLAYLIST
         // calls used to clobber each other's window.__vmuPendingCover, so
@@ -1171,7 +1243,7 @@
         // a second VK_CREATE_PLAYLIST arriving before this one finishes
         // waits its turn instead of running createPlaylistViaUI concurrently.
         __playlistCreationQueue = __playlistCreationQueue
-          .then(() => createPlaylistViaUI(title, description, trackNames || [], coverFile))
+          .then(() => createPlaylistViaUI(title, description, trackNames || [], coverFile, audioIds || null))
           .then(r => window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: true, reqId, ...r }, '*'))
           .catch(err => { window.postMessage({ type: 'VK_PLAYLIST_CREATED', ok: false, reqId, error: err.message }, '*'); });
         break;
@@ -1186,8 +1258,8 @@
       // see addTracksToExistingPlaylistViaUI below for why this drives the
       // real dialog instead of calling an API directly.
       case 'VK_ADD_TRACKS_TO_PLAYLIST': {
-        const { ownerId, playlistId, trackNames, reqId } = e.data;
-        addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames || [])
+        const { ownerId, playlistId, trackNames, audioIds, reqId } = e.data;
+        addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames || [], audioIds || null)
           .then(selectedCount => window.postMessage({ type: 'VK_ADD_TRACKS_TO_PLAYLIST_DONE', ok: true, reqId, selectedCount }, '*'))
           .catch(err => window.postMessage({ type: 'VK_ADD_TRACKS_TO_PLAYLIST_DONE', ok: false, reqId, error: err.message }, '*'));
         break;
@@ -1279,6 +1351,31 @@
         break;
       }
 
+
+      // Playlist collector ("Собрать список плейлистов" → "Собрать треки"):
+      // same audio.get read as VKD_GET_PLAYLIST_TRACKS above, but its own
+      // message pair (echoing reqId) so a long-running collector scan can
+      // never answer — or be answered by — the edit dialog's sort feature
+      // that listens for that other type without any request matching.
+      // Adds what the collector needs and that one doesn't carry: the audio's
+      // owner (full "owner_id" pair), its duration (duplicate matching), and
+      // the raw blocked signals — content.js decides what counts as blocked
+      // once it has seen the whole scan (see plcFinalizeBlocked).
+      case 'VKD_COLLECT_PLAYLIST_TRACKS': {
+        const { ownerId, playlistId, accessHash, reqId } = e.data;
+        fetchFullPlaylistItems(ownerId, playlistId, accessHash)
+          .then(items => window.postMessage({
+            type: 'VKD_COLLECT_PLAYLIST_TRACKS_DONE', ok: true, reqId,
+            tracks: items.map(it => ({
+              numId: it.id, ownerId: it.owner_id,
+              artist: it.artist || '', title: it.title || '',
+              duration: it.duration || 0,
+              hasUrl: !!it.url, restricted: !!it.content_restricted,
+            })),
+          }, '*'))
+          .catch(err => window.postMessage({ type: 'VKD_COLLECT_PLAYLIST_TRACKS_DONE', ok: false, reqId, error: String(err?.message || err) }, '*'));
+        break;
+      }
 
       case 'VKD_EXTRACT_DOM': {
         const tracks = extractTracksFromFiber();
@@ -1386,7 +1483,7 @@
     }
   });
 
-  // ── HLS download: fetch m3u8 → download .ts segments → decrypt AES-128 → concat → blob URL ──
+  // ─── HLS download: fetch m3u8 → download .ts segments → decrypt AES-128 → concat → blob URL ──
 
   function resolveUrl(uri, baseUrl) {
     if (uri.startsWith('http')) return uri;
@@ -1741,7 +1838,7 @@
       || null;
   }
 
-  // ── Playlist tail loader ─────────────────────────────────────────────────
+  // ─── Playlist tail loader ─────────────────────────────────────────────────
   // The new playlist modal is hosted inside VK's OLD popup layer
   // (#box_layer_wrap), and VK's own IntersectionObserver tail-sentinel never
   // fires there — scrolling loads nothing past the first ~25 rows (verified
@@ -1783,7 +1880,7 @@
     if (r.bottom < window.innerHeight + 800) callPlaylistTailLoader();
   }, true);
 
-  // ── Stamp data-vmu-track on audio rows so the content script (isolated world,
+  // ─── Stamp data-vmu-track on audio rows so the content script (isolated world,
   // no access to React fiber expandos) can read track data from the DOM ──
   // The selector explicitly skips rows that already have data-vmu-id. This
   // avoids the expensive findTrackEntityFromFiber walk (up to 20 fiber
@@ -1829,7 +1926,7 @@
     return marked;
   }
 
-  // ── Extract tracks from popup DOM via React fiber (runs in page context) ──
+  // ─── Extract tracks from popup DOM via React fiber (runs in page context) ──
   function extractTracksFromFiber() {
     const tracks = [];
     const seen = new Set();
@@ -1884,7 +1981,7 @@
     return tracks;
   }
 
-  // ── Resolve direct audio URLs via al_audio.php?act=reload_audio ──────────
+  // ─── Resolve direct audio URLs via al_audio.php?act=reload_audio ──────────
   async function reloadAudioUrls(ids) {
     // No page-level hash: reload_audio authorizes via per-track hashes inside ids
     // (owner_audio_actionHash_urlHash) — sending a page hash yields "bad_hash"
@@ -1950,7 +2047,7 @@
     return resolved;
   }
 
-  // ── Fast path: audio.get through VK's own web API client ──────────────────
+  // ─── Fast path: audio.get through VK's own web API client ──────────────────
   // al_audio.php act=load_section is dead (ERR_105 / 0 items on all observed
   // playlists in 2026), but VK's SPA exposes its API client on the React
   // fiber of any mounted playlist component. audio.get returns full track
@@ -1975,56 +2072,37 @@
     return null;
   }
 
-  // The anchor elements resolveApiClient looks for (and the React fiber
-  // that carries the API client) can take a beat to mount right after the
-  // page/dialog has just opened — a bare resolveApiClient() call right then
-  // finds nothing and the reorder flow throws "no_api_client", even though
-  // the exact same playlist works fine a few seconds later with no other
-  // change (verified live). Poll instead of failing on the first check.
-  async function waitForApiClient(maxWaitMs = 5000) {
-    const start = Date.now();
-    let client = resolveApiClient();
-    while (!client && Date.now() - start < maxWaitMs) {
-      await pause(200);
-      client = resolveApiClient();
-    }
-    if (!client) client = await recoverApiClientViaEditToggle();
-    return client;
+  // Reorder used to wait on resolveApiClient() here (polling, then closing
+  // the edit dialog to reveal the *view* popup underneath when polling came
+  // up empty — that's the only place the client is reachable, per the
+  // comment on resolveApiClient above). Closing only helps when the edit
+  // dialog was reached via that view popup's own pencil icon, so the view
+  // popup is still mounted (hidden) beneath it; when the dialog was opened
+  // straight from a playlist card instead (no view popup ever mounted),
+  // there is nothing to reveal and nothing to click to reopen it — verified
+  // live: the dialog closes, stays closed, and the reorder fails with
+  // "no_api_client" regardless. vkApiFetch below sidesteps needing that
+  // popup, or any React internals, at all.
+  function vkAuthParams() {
+    const tokenKey = Object.keys(localStorage).find(k => /:web_token:login:auth$/.test(k));
+    if (!tokenKey) return null;
+    let access_token;
+    try { ({ access_token } = JSON.parse(localStorage.getItem(tokenKey) || '{}')); } catch {}
+    if (!access_token) return null;
+    return { clientId: tokenKey.split(':')[0], access_token };
   }
 
-  // Waiting alone doesn't always help — verified live (2026-08-30): the
-  // "Редактирование плейлиста" box (.audio_pl_edit_box, old box_layout popup)
-  // is its own detached React tree; its rows (data-testid
-  // MusicPlaylist_EditModal_MusicTrackRow) carry no React fiber at all, and
-  // walking up from there hits a dead end with no audioApi in props anywhere.
-  // The only place the client is reachable is the *view* popup's
-  // MusicPlaylistTracks_Items/audiolistitems-list container — the one VK
-  // opens when you click a playlist's cover, which the edit box normally
-  // sits stacked on top of. Whether that view popup stays mounted (hidden)
-  // underneath is inconsistent — sometimes VK tears it down, and no amount
-  // of polling brings back an anchor that was never going to appear.
-  // refreshPlaylistEditDialog() (below) already relies on that same view
-  // popup being one click away via closeBtn+Action_Edit; reuse the same
-  // close/reopen round-trip here to force it back into the DOM, harvest the
-  // client while it's briefly visible, then restore the edit dialog.
-  async function recoverApiClientViaEditToggle() {
-    const box = getEditPlaylistBox();
-    const closeBtn = box?.querySelector('.box_x_button');
-    if (!closeBtn) return null;
-    closeBtn.click();
-    await pause(400);
-    const client = await (async () => {
-      const start = Date.now();
-      let c = resolveApiClient();
-      while (!c && Date.now() - start < 1500) {
-        await pause(200);
-        c = resolveApiClient();
-      }
-      return c;
-    })();
-    document.querySelector('[data-testid="Action_Edit"]')?.click();
-    await pause(300);
-    return client;
+  async function vkApiFetch(method, params) {
+    const auth = vkAuthParams();
+    if (!auth) throw new Error('no_access_token');
+    const res = await fetch(`https://web.api.vk.ru/method/${method}?v=5.285&client_id=${auth.clientId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ...params, access_token: auth.access_token }).toString(),
+    });
+    const json = await res.json();
+    if (json.error) throw new Error(json.error.error_msg || (method + ' failed'));
+    return json.response;
   }
 
   function getEditPlaylistBox() {
@@ -2062,27 +2140,24 @@
     return true;
   }
 
-  // Fetches a playlist's full current track list via VK's own internal API
-  // client (resolveApiClient), paginating audio.get 250 at a time. Used both
-  // to resolve access_key per track for reordering and, standalone, to read
-  // the playlist's track list/order without touching the edit popup's DOM —
-  // see fetchPlaylistTracksViaApi's comment for why the DOM path isn't
-  // reliable there.
+  // Fetches a playlist's full current track list via a direct audio.get call
+  // (vkApiFetch), paginating 250 at a time. Used both to resolve access_key
+  // per track for reordering and, standalone, to read the playlist's track
+  // list/order without touching the edit popup's DOM — see
+  // fetchPlaylistTracksViaApi's comment for why the DOM path isn't reliable
+  // there.
   async function fetchFullPlaylistItems(ownerId, playlistId, accessHash) {
-    const client = await waitForApiClient();
-    if (!client) throw new Error('no_api_client');
-
     const base = { owner_id: ownerId, playlist_id: playlistId, count: 250, offset: 0 };
     if (accessHash) base.access_key = accessHash;
     const items = [];
     let first;
-    try { first = await client.request('audio.get', base); }
+    try { first = await vkApiFetch('audio.get', base); }
     catch (e) { throw new Error('audio.get failed: ' + (e?.message || e)); }
     if (first && Array.isArray(first.items)) items.push(...first.items);
     const total = first?.count || items.length;
     for (let off = 250; off < total; off += 250) {
       try {
-        const page = await client.request('audio.get', { ...base, offset: off });
+        const page = await vkApiFetch('audio.get', { ...base, offset: off });
         if (page && Array.isArray(page.items)) items.push(...page.items);
       } catch {}
     }
@@ -2096,15 +2171,12 @@
   // drag can't work here. Real VK drag persists via a plain
   // audio.editPlaylist call carrying the FULL new track order (audio_ids,
   // comma-joined `ownerId_audioId_accessKey`), captured live from network
-  // traffic — so we just call that same method directly through VK's own
-  // internal API client (resolveApiClient), title/description/no_discover
-  // resent unchanged to avoid wiping them. audio.get supplies the access_key
-  // per track since neither DOM row variant (vkit data-sortable-id nor old
-  // .audio_row data-full-id) exposes it directly.
+  // traffic — so we just call that same method directly (vkApiFetch),
+  // title/description/no_discover resent unchanged to avoid wiping them.
+  // audio.get supplies the access_key per track since neither DOM row variant
+  // (vkit data-sortable-id nor old .audio_row data-full-id) exposes it
+  // directly.
   async function reorderPlaylistViaApi(ownerId, playlistId, accessHash, title, description, noDiscover, orderedNumericIds) {
-    const client = await waitForApiClient();
-    if (!client) throw new Error('no_api_client');
-
     const items = await fetchFullPlaylistItems(ownerId, playlistId, accessHash);
     const byId = new Map(items.map(it => [it.id, it]));
     const audioIds = [];
@@ -2115,7 +2187,7 @@
     }
     if (!audioIds.length) throw new Error('no_matching_tracks');
 
-    const res = await client.request('audio.editPlaylist', {
+    const res = await vkApiFetch('audio.editPlaylist', {
       playlist_id: playlistId,
       owner_id: ownerId,
       title: title || '',
@@ -2124,6 +2196,27 @@
       audio_ids: audioIds.join(','),
     });
     return { count: audioIds.length, response: res };
+  }
+
+  // Firing an audio.* write call back-to-back with zero pacing tripped VK's
+  // flood control after ~15 calls — verified live: a call that failed with
+  // "Access denied: no access to audio" inside a tight loop succeeded
+  // seconds later with the exact same params, run standalone. VK maps its
+  // abuse throttling onto that permission-denied-shaped message here rather
+  // than a distinct rate-limit error, so it's indistinguishable from a real
+  // denial except by retrying after a pause. 350ms pacing with 1-2.5s
+  // retries still only got ~20 through before the wall — the quota window is
+  // longer than that, so retries need to actually outlast it rather than
+  // nudge it. Shared by bulkEditTracks and bulkDeleteTracks below — both hit
+  // the same flood-control bucket.
+  async function vkApiFetchWithRetry(method, params, retryDelays = [5000, 15000, 30000]) {
+    let error = null;
+    for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+      try { return { ok: true, response: await vkApiFetch(method, params) }; }
+      catch (err) { error = String(err?.message || err); }
+      if (attempt < retryDelays.length) await pause(retryDelays[attempt]);
+    }
+    return { ok: false, error };
   }
 
   // Bulk metadata edit (title/artist) for the page-scan "Массовые операции"
@@ -2142,12 +2235,6 @@
   // an earlier version passed a single ownerId for everything and silently
   // mis-attributed most of a batch to it.
   async function bulkEditTracks(edits) {
-    const tokenKey = Object.keys(localStorage).find(k => /:web_token:login:auth$/.test(k));
-    if (!tokenKey) throw new Error('no_token');
-    const clientId = tokenKey.split(':')[0];
-    const { access_token } = JSON.parse(localStorage.getItem(tokenKey) || '{}');
-    if (!access_token) throw new Error('no_access_token');
-
     // A single bad audio.getById chunk used to throw and abort the ENTIRE
     // batch before a single audio.edit ran — that's very likely what "didn't
     // process all tracks" was: one flaky chunk killed everything after it.
@@ -2160,33 +2247,15 @@
       const chunk = edits.slice(i, i + 100);
       const audios = chunk.map(e => `${e.ownerId}_${e.audioId}`).join(',');
       try {
-        const res = await fetch(`https://web.api.vk.ru/method/audio.getById?v=5.285&client_id=${clientId}`, {
-          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ audios, access_token }).toString(),
-        });
-        const json = await res.json();
-        if (json.error) throw new Error(json.error.error_msg || 'audio.getById failed');
-        for (const it of (json.response || [])) genreByFullId.set(`${it.owner_id}_${it.id}`, it.genre_id);
+        const response = await vkApiFetch('audio.getById', { audios });
+        for (const it of (response || [])) genreByFullId.set(`${it.owner_id}_${it.id}`, it.genre_id);
       } catch (err) {
         console.warn('[vmu] bulk audio.getById chunk failed — its tracks will be skipped:', err);
       }
-      if (i + 100 < edits.length) await new Promise(r => setTimeout(r, 250));
+      if (i + 100 < edits.length) await pause(250);
     }
 
-    // Firing audio.edit back-to-back with zero pacing tripped VK's flood
-    // control after ~15 calls — verified live: a call that failed with
-    // "Access denied: no access to audio" inside the tight loop succeeded
-    // seconds later with the exact same params, run standalone. VK maps its
-    // abuse throttling onto that permission-denied-shaped message here
-    // rather than a distinct rate-limit error, so it's indistinguishable
-    // from a real denial except by retrying after a pause. 350ms pacing with
-    // 1-2.5s retries still only got ~20 through before the wall — the quota
-    // window is longer than that, so retries need to actually outlast it
-    // rather than nudge it.
-    const pause = ms => new Promise(r => setTimeout(r, ms));
     const PACING_MS = 1200;
-    const RETRY_DELAYS = [5000, 15000, 30000];
-
     let ok = 0, fail = 0;
     for (let i = 0; i < edits.length; i++) {
       const e = edits[i];
@@ -2196,27 +2265,16 @@
       if (genreId == null) {
         error = 'не удалось получить текущий жанр трека';
       } else {
-        const body = new URLSearchParams({
+        const res = await vkApiFetchWithRetry('audio.edit', {
           owner_id: String(e.ownerId),
           audio_id: String(e.audioId),
           artist: e.artist,
           title: e.title,
           genre_id: String(genreId),
           no_search: '0',
-          access_token,
-        }).toString();
-        for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
-          try {
-            const res = await fetch(`https://web.api.vk.ru/method/audio.edit?v=5.285&client_id=${clientId}`, {
-              method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
-            });
-            const json = await res.json();
-            if (json.error) error = json.error.error_msg || 'audio.edit failed';
-            else { itemOk = true; error = null; }
-          } catch (err) { error = String(err?.message || err); }
-          if (itemOk || attempt === RETRY_DELAYS.length) break;
-          await pause(RETRY_DELAYS[attempt]);
-        }
+        });
+        itemOk = res.ok;
+        error = res.error || null;
       }
       if (itemOk) ok++; else fail++;
       window.postMessage({ type: 'VKD_BULK_EDIT_PROGRESS', done: i + 1, total: edits.length, index: i, itemOk, error }, '*');
@@ -2231,39 +2289,16 @@
   // throwing), so reusing untested pacing here would just rediscover it the
   // hard way. items: [{ownerId, audioId}].
   async function bulkDeleteTracks(items) {
-    const tokenKey = Object.keys(localStorage).find(k => /:web_token:login:auth$/.test(k));
-    if (!tokenKey) throw new Error('no_token');
-    const clientId = tokenKey.split(':')[0];
-    const { access_token } = JSON.parse(localStorage.getItem(tokenKey) || '{}');
-    if (!access_token) throw new Error('no_access_token');
-
-    const pause = ms => new Promise(r => setTimeout(r, ms));
     const PACING_MS = 1200;
-    const RETRY_DELAYS = [5000, 15000, 30000];
-
     let ok = 0, fail = 0;
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
-      const body = new URLSearchParams({
+      const res = await vkApiFetchWithRetry('audio.delete', {
         owner_id: String(it.ownerId),
         audio_id: String(it.audioId),
-        access_token,
-      }).toString();
-      let itemOk = false, error = null;
-      for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
-        try {
-          const res = await fetch(`https://web.api.vk.ru/method/audio.delete?v=5.285&client_id=${clientId}`, {
-            method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
-          });
-          const json = await res.json();
-          if (json.error) error = json.error.error_msg || 'audio.delete failed';
-          else { itemOk = true; error = null; }
-        } catch (err) { error = String(err?.message || err); }
-        if (itemOk || attempt === RETRY_DELAYS.length) break;
-        await pause(RETRY_DELAYS[attempt]);
-      }
-      if (itemOk) ok++; else fail++;
-      window.postMessage({ type: 'VKD_BULK_DELETE_PROGRESS', done: i + 1, total: items.length, index: i, itemOk, error }, '*');
+      });
+      if (res.ok) ok++; else fail++;
+      window.postMessage({ type: 'VKD_BULK_DELETE_PROGRESS', done: i + 1, total: items.length, index: i, itemOk: res.ok, error: res.error || null }, '*');
       if (i < items.length - 1) await pause(PACING_MS);
     }
     return { ok, fail };
@@ -2330,7 +2365,7 @@
     window.postMessage({ type: 'VKD_SECTIONS_DONE' }, '*');
   }
 
-  // ── Create playlist via VK UI automation ─────────────────────────────────────
+  // ─── Create playlist via VK UI automation ─────────────────────────────────────
   // Pure ASCII/unicode-escape strings — no Cyrillic source bytes
   const LBL_CREATE  = '\u0421\u043e\u0437\u0434\u0430\u0442\u044c \u043f\u043b\u0435\u0439\u043b\u0438\u0441\u0442'; // \u0421\u043e\u0437\u0434\u0430\u0442\u044c \u043f\u043b\u0435\u0439\u043b\u0438\u0441\u0442
   const LBL_SAVE    = '\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c'; // \u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c
@@ -2402,7 +2437,10 @@
 
   // PHASE 1: Create empty playlist (title + description + cover, no tracks)
   // PHASE 2: Open edit dialog on new playlist — ._ape_audio_item items are directly visible there
-  async function createPlaylistViaUI(title, description, trackNames, coverFile) {
+  // audioIds (optional, "ownerId_audioId" strings in the desired order): when
+  // given, tracks are picked by exact id instead of by name — see
+  // selectTracksByAudioIds. Omitted = the original name-matching behavior.
+  async function createPlaylistViaUI(title, description, trackNames, coverFile, audioIds) {
     // Snapshot playlist cells that exist BEFORE creation — title-prefix
     // matching below must never resolve to one of these, or an upload whose
     // generated title happens to share a prefix with an older playlist
@@ -2524,13 +2562,16 @@
     console.log('[vmu] Playlist created:', result.ownerId, result.playlistId);
 
     // PHASE 2: Add tracks via UI.
-    if (trackNames.length > 0) {
+    if (trackNames.length > 0 || audioIds?.length) {
       if (typeof window.nav?.reload === 'function') {
         console.log('[vmu] SPA reload to reset APE state...');
         window.nav.reload();
         await pause(3000);
       }
-      await addTracksViaEditDialog(title, description, result.ownerId, result.playlistId, trackNames);
+      const selectedCount = await addTracksViaEditDialog(title, description, result.ownerId, result.playlistId, trackNames, audioIds);
+      // Extra field for callers that care how many tracks actually landed
+      // (the auto-playlist caller ignores it).
+      return { ...result, selectedCount: selectedCount || 0 };
     }
 
     return result;
@@ -2555,7 +2596,7 @@
   }
 
   // Open edit dialog for the newly created playlist and select tracks by name
-  async function addTracksViaEditDialog(playlistTitle, playlistDescription, ownerId, playlistId, trackNames) {
+  async function addTracksViaEditDialog(playlistTitle, playlistDescription, ownerId, playlistId, trackNames, audioIds) {
     // Wait for new playlist to appear in DOM (VK SPA updates after save)
     let editBtn = null;
     for (let i = 0; i < 20; i++) {
@@ -2603,7 +2644,9 @@
 
     if (!await waitForEl('._ape_audio_item', 3000)) { console.warn('[vmu] add-audios item list not found'); return; }
 
-    const selectedCount = await selectTracksFromCommunityList(dialog, trackNames);
+    const selectedCount = audioIds?.length
+      ? await selectTracksByAudioIds(dialog, audioIds)
+      : await selectTracksFromCommunityList(dialog, trackNames);
     if (!selectedCount) console.warn('[vmu] No tracks matched in the community list for playlist', playlistId);
 
     await pause(300);
@@ -2626,10 +2669,11 @@
     await pause(1500);
 
     // Reorder tracks to match album order
-    if (editPlaylistBody && trackNames.length > 1) {
-      await reorderPlaylistTracks(ownerId, playlistId, editPlaylistBody, playlistTitle, playlistDescription, trackNames);
+    if (editPlaylistBody && (audioIds?.length || trackNames.length) > 1) {
+      await reorderPlaylistTracks(ownerId, playlistId, editPlaylistBody, playlistTitle, playlistDescription, trackNames, audioIds);
       await pause(1000);
     }
+    return selectedCount;
   }
 
   // Adds tracks to an ALREADY-EXISTING playlist ("дозаливка" — the album's
@@ -2730,9 +2774,11 @@
     return dialog;
   }
 
-  async function addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames) {
+  async function addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames, audioIds) {
     const dialog = await openAddTracksPicker(playlistId);
-    const selectedCount = await selectTracksFromCommunityList(dialog, trackNames);
+    const selectedCount = audioIds?.length
+      ? await selectTracksByAudioIds(dialog, audioIds)
+      : await selectTracksFromCommunityList(dialog, trackNames);
     await pause(300);
 
     const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
@@ -2847,8 +2893,10 @@
   // tracks, is read from the real captured save request so resending it
   // doesn't flip a field we never touched. Falls back to the captured
   // title/description if for some reason our own value is missing.
-  async function reorderPlaylistTracks(ownerId, playlistId, capturedBody, fallbackTitle, fallbackDescription, trackNames) {
-    if (!capturedBody || !trackNames.length) return;
+  // audioIds (optional "ownerId_audioId" list): the order is taken from it
+  // directly, by exact id, instead of name-matching trackNames.
+  async function reorderPlaylistTracks(ownerId, playlistId, capturedBody, fallbackTitle, fallbackDescription, trackNames, audioIds) {
+    if (!capturedBody || !(trackNames.length || audioIds?.length)) return;
 
     const params = {};
     capturedBody.split('&').forEach(pair => {
@@ -2874,12 +2922,20 @@
       fullText: normalizeStr(`${it.artist || ''} ${it.title || ''}`),
     }));
 
-    // Build the desired order based on trackNames
+    // Build the desired order based on trackNames (or, when exact ids were
+    // given, on those — audio.get items carry owner_id + numeric id)
     const used = new Set();
     const orderedIds = [];
-    for (const trackName of trackNames) {
-      const m = itemMeta.find(x => !used.has(x.id) && trackMatchesItem(trackName, x));
-      if (m) { used.add(m.id); orderedIds.push(m.id); }
+    if (audioIds?.length) {
+      for (const full of audioIds) {
+        const it = items.find(x => !used.has(x.id) && `${x.owner_id}_${x.id}` === full);
+        if (it) { used.add(it.id); orderedIds.push(it.id); }
+      }
+    } else {
+      for (const trackName of trackNames) {
+        const m = itemMeta.find(x => !used.has(x.id) && trackMatchesItem(trackName, x));
+        if (m) { used.add(m.id); orderedIds.push(m.id); }
+      }
     }
     // Add any remaining tracks not matched (shouldn't happen, but just in case)
     for (const it of items) {
@@ -2985,6 +3041,41 @@
     }
     console.log('[vmu] Selected', matched.size, 'of', trackNames.length, 'tracks from community list');
     return matched.size;
+  }
+
+  // Id-based sibling of selectTracksFromCommunityList: ticks the picker rows
+  // whose own ownerId_audioId (getItemAudioId, below) is in `audioIds`,
+  // scrolling the community's catalog until every wanted id has been seen or
+  // the list is exhausted. Names are never consulted — the "playlist from
+  // files" flow already knows exactly which uploaded tracks it wants, and
+  // trackMatchesItem's substring test would let a short title like "Intro"
+  // tick the first look-alike instead. A row VK already marks ape_selected is
+  // a track the playlist already contains: counted as found, not re-clicked
+  // (a second click would UNtick it). Returns how many rows were newly ticked.
+  async function selectTracksByAudioIds(dialog, audioIds) {
+    const remaining = new Set(audioIds);
+    let selected = 0;
+    let scannedFrom = 0;
+    for (;;) {
+      const items = ownAudioItems(dialog);
+      for (let i = scannedFrom; i < items.length && remaining.size; i++) {
+        const item = items[i];
+        const id = getItemAudioId(item);
+        if (!id || !remaining.has(id)) continue;
+        remaining.delete(id);
+        if (item.classList.contains('ape_selected')) continue;
+        const chk = item.querySelector('.ape_check') || item;
+        chk.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        selected++;
+        await pause(150);
+      }
+      scannedFrom = items.length;
+      if (!remaining.size) break;
+      if (!await loadMoreOwnItems(dialog)) break;
+    }
+    for (const id of remaining) console.warn('[vmu] Track id not found in community list:', id);
+    console.log('[vmu] Selected', selected, 'of', audioIds.length, 'tracks by id');
+    return selected;
   }
 
   // Extracts the stable ownerId_audioId pair VK stamps into every add-audios
@@ -3114,7 +3205,7 @@
     return null;
   }
 
-  // ── Get recent audio IDs from page DOM ────────────────────────────────────────
+  // ─── Get recent audio IDs from page DOM ────────────────────────────────────────
   function getRecentAudioIdsFromDOM(count) {
     const ids = [];
     const seen = new Set();
@@ -3145,7 +3236,7 @@
     return ids;
   }
 
-  // ── al_audio.php direct call (uses captured hashes) ──────────────────────────
+  // ─── al_audio.php direct call (uses captured hashes) ──────────────────────────
   async function callAlAudio(act, params) {
     const hash = window.__vmuHashes[act] || window.__vmuHashes._page || getPageHashFromDOM();
     if (!hash) throw new Error('Хэш не найден');
@@ -3163,7 +3254,7 @@
     return null;
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────────
+  // ─── Helpers ───────────────────────────────────────────────────────────────────
   function setVal(el, value) {
     // Works for both React and old VK inputs
     const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -3186,7 +3277,7 @@
     });
   }
 
-  // ── Cover upload via direct file-input assignment ──────────────────────────────
+  // ─── Cover upload via direct file-input assignment ──────────────────────────────
   // .ape_cover's "redesigned" markup (ape_cover_redesigned) only mounts an
   // actual <input type=file> (inside a <label>, native label-activation —
   // clicking it never goes through the input's own JS-visible .click(),
@@ -3253,7 +3344,7 @@
     }, 400);
   }
 
-  // ── Monitor <audio> element src for resolved CDN URLs ────────────────────────
+  // ─── Monitor <audio> element src for resolved CDN URLs ────────────────────────
   (function () {
     function watchAudio(el) {
       new MutationObserver(() => {
@@ -3266,7 +3357,14 @@
     const dObs = new MutationObserver(muts => {
       for (const m of muts) for (const n of m.addedNodes) {
         if (n.nodeName === 'AUDIO') watchAudio(n);
-        else if (n.querySelectorAll) n.querySelectorAll('audio').forEach(watchAudio);
+        // Leaf nodes (text, empty elements) have nothing to search; for the
+        // rest getElementsByTagName is a tag-indexed lookup that doesn't
+        // build a static NodeList per added node like querySelectorAll —
+        // this runs for every node VK adds anywhere on the page.
+        else if (n.firstElementChild) {
+          const found = n.getElementsByTagName('audio');
+          for (let i = 0; i < found.length; i++) watchAudio(found[i]);
+        }
       }
     });
     const start = () => {
@@ -3276,7 +3374,7 @@
     document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', start) : start();
   })();
 
-  // ── Audio FX: 10-band graphic EQ + compressor + AudioWorklet lookahead
+  // ─── Audio FX: 10-band graphic EQ + compressor + AudioWorklet lookahead
   // limiter on VK's <audio> playback ─────────────────────────────────────────
   // createMediaElementSource() can only ever be called once per <audio> element
   // (throws InvalidStateError on a second call) and permanently reroutes that

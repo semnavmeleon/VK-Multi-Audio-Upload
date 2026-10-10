@@ -1131,6 +1131,12 @@ html.vmu-theme-light {
 .vmu-single-dl {
   position: relative;
   z-index: 2;
+  /* New VK makes the whole row's foreground layers click-through
+     (pointer-events:none from MusicTrackRow down to the actions group — verified
+     live) and re-enables clicks only on each native button's own wrapper.
+     Our button sits directly in that group and inherits `none`, so every click
+     fell through to the row's play surface underneath. Opt back in. */
+  pointer-events: auto;
 }
 /* Mirrors VK's own .tt_w.tt_black tooltip (audio rows, top-bar icons, etc.):
    60 % black, 3 px radius, ~12.5 px white text with 4/7/5/7 padding, no
@@ -2127,6 +2133,7 @@ html.vmu-theme-light {
    name since that hash isn't stable across VK's rebuilds. --vmu-text-hint
    already tracks that same muted shade in both themes, so use it directly
    instead. */
+#vmu-plmake-btn svg,
 #vmu-bulkops-btn svg,
 #vmu-toolbar-settings-btn svg,
 #vmu-toolbar-sc-btn svg { display: block; color: var(--vmu-text-hint); }
@@ -3131,3 +3138,221 @@ html.vmu-theme-light .vmu-notice { border: 1px solid rgba(0,0,0,0.1); }
   color: var(--vmu-text-hint-2);
   text-align: right;
 }
+
+/* ── Playlists catalog page: "TITLE - link" collector ─────────────────────── */
+.vmu-plcollect-row { padding: 2px 12px 12px; }
+.vmu-plcollect-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--vkui--color_text_accent, #528bcc);
+  cursor: pointer;
+}
+.vmu-plcollect-btn:hover { text-decoration: underline; }
+.vmu-plcollect-btn:disabled { opacity: 0.5; cursor: default; text-decoration: none; }
+.vmu-plcollect-modal { width: 640px; max-width: calc(100vw - 48px); }
+.vmu-plcollect-body { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px; }
+.vmu-plcollect-text {
+  width: 100%;
+  box-sizing: border-box;
+  height: 300px;
+  min-height: 120px;
+  resize: vertical;
+  background: rgba(var(--vmu-ov),0.06);
+  border: 1px solid rgba(var(--vmu-ov),0.13);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--vmu-text);
+  font-family: ui-monospace, Consolas, monospace;
+  white-space: pre;
+  overflow: auto;
+}
+.vmu-plcollect-text:focus { outline: none; border-color: #2688eb; }
+.vmu-plcollect-body .vmu-pick-btn { align-self: flex-start; padding: 6px 14px; font-size: 12px; }
+.vmu-plcollect-body .vmu-pick-btn:disabled { opacity: 0.45; cursor: default; }
+.vmu-plcollect-body .vmu-covered-select { max-width: 100%; }
+
+/* Collector panel: scan / filter / view sections above the text box */
+.vmu-plc-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(var(--vmu-ov),0.06);
+}
+.vmu-plc-section-first { padding-top: 0; border-top: none; }
+.vmu-plc-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+.vmu-plc-row .vmu-covered-select { min-width: 0; }
+.vmu-plc-label { font-size: 12px; color: var(--vmu-text-2); flex-shrink: 0; }
+.vmu-plc-range { display: inline-flex; align-items: center; gap: 6px; color: var(--vmu-text-hint-2); }
+.vmu-plc-input {
+  box-sizing: border-box;
+  min-width: 0;
+  flex: 1 1 auto;
+  max-width: 320px;
+  border-radius: 7px;
+  border: 1px solid rgba(var(--vmu-ov),0.12);
+  background: rgba(var(--vmu-ov),0.04);
+  color: var(--vmu-text-2);
+  font-size: 12px;
+  font-family: inherit;
+  padding: 5px 8px;
+}
+.vmu-plc-input:focus { outline: none; border-color: #2688eb; }
+.vmu-plc-input-sm { flex: 0 0 auto; width: 74px; }
+.vmu-plc-checks { display: flex; flex-wrap: wrap; gap: 6px 16px; padding-top: 2px; }
+.vmu-plc-status { font-size: 12px; line-height: 1.4; color: var(--vmu-text-dim); }
+.vmu-plc-actions { display: flex; align-items: center; gap: 8px; }
+.vmu-plc-count { margin-right: auto; font-size: 11px; color: var(--vmu-text-hint-2); }
+.vmu-plc-actions .vmu-plc-secondary {
+  background: rgba(var(--vmu-ov),0.08);
+  color: var(--vmu-text-2);
+}
+.vmu-plc-actions .vmu-plc-secondary:hover { background: rgba(var(--vmu-ov),0.14); }
+.vmu-plc-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin-left: auto;
+  font: inherit;
+  font-size: 12px;
+  color: var(--vkui--color_text_accent, #528bcc);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.vmu-plc-link:hover { text-decoration: underline; }
+
+/* ── "Плейлист из файлов" panel ──────────────────────────────────────────────
+   Shell, sections, inputs, buttons and the status line all reuse the
+   collector panel's classes (.vmu-bulkops-panel / .vmu-plcollect-body /
+   .vmu-plc-*); only the file→track review list and a few fields are new. */
+.vmu-plmake-panel { width: 420px; }
+.vmu-plmake-hint { font-size: 12px; line-height: 1.4; color: var(--vmu-text-dim); }
+.vmu-plmake-group { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.vmu-plmake-field { max-width: none; width: 100%; flex: 0 0 auto; }
+.vmu-plmake-desc { min-height: 52px; resize: vertical; line-height: 1.4; }
+.vmu-plmake-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
+.vmu-plmake-list:empty { display: none; }
+.vmu-plmake-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: rgba(var(--vmu-ov),0.05);
+  font-size: 12px;
+  cursor: pointer;
+}
+.vmu-plmake-row[data-found="0"] { cursor: default; }
+.vmu-plmake-row input[type="checkbox"] { flex-shrink: 0; margin: 2px 0 0; accent-color: #2688eb; }
+.vmu-plmake-file,
+.vmu-plmake-found,
+.vmu-plmake-missing { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vmu-plmake-file { color: var(--vmu-text-faint-2); }
+.vmu-plmake-found { color: var(--vmu-text); }
+.vmu-plmake-unsure { color: #d9a400; }
+.vmu-plmake-missing { color: #e64646; }
+.vmu-plc-status.vmu-plmake-status-error { color: #e64646; }
+.vmu-plmake-busy .vmu-plmake-list { opacity: 0.6; pointer-events: none; }
+
+/* ── Themed <select> replacement (content.js vmuEnhanceSelect) ───────────────
+   The native popup is OS chrome: in the dark theme its options take the
+   select's light text colour onto a white popup and read as blank. The real
+   <select> stays hidden in the DOM; this is the button + a body-level fixed
+   list (so no panel's overflow:hidden can clip it), same popover recipe as
+   .vmu-fx-dd-list / .vmu-audiofx-panel. */
+.vmu-sel { position: relative; display: inline-block; min-width: 0; max-width: 100%; vertical-align: middle; }
+.vmu-plc-row .vmu-sel,
+.vmu-plmake-group .vmu-plc-row .vmu-sel { flex: 1 1 auto; min-width: 0; }
+.vmu-sel-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--vmu-text-2);
+  background: rgba(var(--vmu-ov),0.04);
+  border: 1px solid rgba(var(--vmu-ov),0.12);
+  border-radius: 7px;
+  padding: 5px 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: background .12s, border-color .12s;
+}
+.vmu-sel-btn:hover:not(:disabled) { background: rgba(var(--vmu-ov),0.08); }
+.vmu-sel-btn:focus-visible,
+.vmu-sel-open .vmu-sel-btn { border-color: #2688eb; outline: none; }
+.vmu-sel-btn:disabled { opacity: 0.5; cursor: default; }
+.vmu-sel-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vmu-sel-open .vmu-fx-dd-chevron { transform: rotate(180deg); }
+.vmu-sel-list {
+  position: fixed;
+  z-index: 9900;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  background: var(--vmu-panel-bg);
+  border-radius: 10px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.35);
+  padding: 4px;
+  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
+}
+.vmu-sel-search {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 0 4px;
+  padding: 6px 10px;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--vmu-text);
+  background: rgba(var(--vmu-ov),0.06);
+  border: 1px solid rgba(var(--vmu-ov),0.12);
+  border-radius: 6px;
+}
+.vmu-sel-search:focus { outline: none; border-color: #2688eb; }
+.vmu-sel-search::placeholder { color: var(--vmu-text-faint-2); }
+.vmu-sel-items { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.vmu-sel-items::-webkit-scrollbar { width: 4px; }
+.vmu-sel-items::-webkit-scrollbar-thumb { background: rgba(var(--vmu-ov),0.14); border-radius: 2px; }
+.vmu-sel-item {
+  display: block;
+  width: 100%;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.3;
+  text-align: left;
+  color: var(--vmu-text-2);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 10px;
+  cursor: pointer;
+  transition: background .1s, color .1s;
+}
+.vmu-sel-item:hover,
+.vmu-sel-item.vmu-sel-hi { background: rgba(var(--vmu-ov),0.07); color: var(--vmu-text); }
+.vmu-sel-item.active { background: rgba(38,136,235,0.85); color: #fff; }
+.vmu-sel-item.active:hover,
+.vmu-sel-item.active.vmu-sel-hi { background: rgba(38,136,235,1); }
+.vmu-sel-empty { padding: 8px 10px; font-size: 12px; color: var(--vmu-text-dim); }
+html.vmu-theme-light .vmu-sel-btn { background: #f0f1f3; border-color: rgba(0,0,0,0.1); }
+html.vmu-theme-light .vmu-sel-btn:hover:not(:disabled) { background: #e7e9ec; }
+html.vmu-theme-light .vmu-sel-list { border: 1px solid rgba(0,0,0,0.1); }
+html.vmu-theme-light .vmu-sel-search { background: #f0f1f3; border-color: rgba(0,0,0,0.1); }
