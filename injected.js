@@ -1305,6 +1305,27 @@
         break;
       }
 
+      // Playlist order: the owner's playlists in their CURRENT order (the
+      // order audio.getPlaylists returns is the manual order the catalog
+      // shows — verified live), and one audio.reorderPlaylists move. Always
+      // answers ok:true with a `success` flag + VK's error code, because
+      // pageCall() rejects on ok:false and drops the code the caller needs to
+      // tell flood control from a real refusal.
+      case 'VKD_PLAYLIST_ORDER_LIST': {
+        const { ownerId, reqId } = e.data;
+        listOwnerPlaylists(ownerId)
+          .then(items => window.postMessage({ type: 'VKD_PLAYLIST_ORDER_LIST_DONE', ok: true, success: true, reqId, items }, '*'))
+          .catch(err => window.postMessage({ type: 'VKD_PLAYLIST_ORDER_LIST_DONE', ok: true, success: false, reqId, error: err.message }, '*'));
+        break;
+      }
+
+      case 'VKD_PLAYLIST_ORDER_MOVE': {
+        const { ownerId, playlistId, after, before, reqId } = e.data;
+        movePlaylist(ownerId, playlistId, after, before)
+          .then(r => window.postMessage({ type: 'VKD_PLAYLIST_ORDER_MOVE_DONE', ok: true, reqId, success: r.ok, code: r.code, error: r.error, response: r.ok ? r.response : undefined }, '*'));
+        break;
+      }
+
       case 'VKD_RESET_DL': {
         _dlSeen.clear();
         break;
@@ -2105,6 +2126,79 @@
     return json.response;
   }
 
+  // ─── Playlist order (audio.reorderPlaylists) ──────────────────────────────
+  // VK removed the drag-to-reorder UI for playlists from the desktop site but
+  // the server method and VK's own web API client are still there. Found in
+  // VK's bundle (2026-10): reorderRequest({itemId, ownerId, after, before})
+  // -> api.reorderPlaylists({after, before, playlist_id: itemId, owner_id}),
+  // where `after` / `before` are the ids of the playlists that will sit
+  // directly before / after the moved one (either may be undefined). Same
+  // web token + endpoint as vkApiFetch; this variant keeps VK's error code.
+  async function vkApiRaw(method, params) {
+    // Code 5 = the cached web token has expired (a tab left idle does this;
+    // seen live). VK's own client refreshes the stored token in the
+    // background, so one re-read after a short wait usually fixes it.
+    for (let attempt = 0; ; attempt++) {
+      const auth = vkAuthParams();
+      if (!auth) return { ok: false, code: 0, error: 'no_access_token' };
+      try {
+        const res = await fetch(`https://web.api.vk.ru/method/${method}?v=5.285&client_id=${auth.clientId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ ...params, access_token: auth.access_token }).toString(),
+        });
+        const json = await res.json();
+        if (json.error) {
+          if (json.error.error_code === 5 && attempt === 0) { await pause(1500); continue; }
+          return { ok: false, code: json.error.error_code, error: json.error.error_msg || (method + ' failed') };
+        }
+        return { ok: true, response: json.response };
+      } catch (err) {
+        return { ok: false, code: -1, error: String(err?.message || err) };
+      }
+    }
+  }
+
+  // All of an owner's playlists in their current manual order, 200 per call.
+  async function listOwnerPlaylists(ownerId) {
+    const items = [];
+    let total = Infinity;
+    for (let offset = 0; offset < total; offset += 200) {
+      const r = await vkApiRaw('audio.getPlaylists', { owner_id: ownerId, count: 200, offset });
+      if (!r.ok) throw new Error(r.error);
+      const page = r.response?.items || [];
+      total = r.response?.count ?? page.length;
+      for (const p of page) {
+        const ph = p.photo || {};
+        items.push({
+          id: p.id,
+          ownerId: p.owner_id,
+          title: p.title || '',
+          count: p.count || 0,
+          cover: ph.photo_135 || ph.photo_68 || ph.photo_270 || ph.photo_300 || ph.photo_34 || null,
+          isFollowing: !!p.is_following,
+        });
+      }
+      if (!page.length) break;
+    }
+    return items;
+  }
+
+  // One move. Both neighbours are sent whenever they exist — exactly the
+  // payload shape VK's own client builds ({after: afterItem?.id, before:
+  // beforeItem?.id}); an earlier version sent only one of them and the server
+  // left the order untouched. The raw answer is logged: this is an
+  // undocumented method, and "accepted but nothing changed" has to be
+  // diagnosable.
+  async function movePlaylist(ownerId, playlistId, after, before) {
+    const params = { owner_id: ownerId, playlist_id: playlistId };
+    if (after != null) params.after = after;
+    if (before != null) params.before = before;
+    const r = await vkApiRaw('audio.reorderPlaylists', params);
+    console.info('[vmu] audio.reorderPlaylists', JSON.stringify(params), '->', JSON.stringify(r.ok ? { response: r.response } : { code: r.code, error: r.error }));
+    return r;
+  }
+
   function getEditPlaylistBox() {
     const boxes = [...document.querySelectorAll('.popup_box_container')]
       .filter(c => getComputedStyle(c).display !== 'none' && c.querySelector('.audio_pl_edit_box'));
@@ -2703,7 +2797,61 @@
   // mounted) — the shared prefix behind both addTracksToExistingPlaylistViaUI
   // (which then ticks+saves matches) and the manual find-in-community-catalog
   // flow (which only wants to read the list, not touch it yet).
-  async function openAddTracksPicker(playlistId) {
+  // The edit button of ONE specific playlist's cell on the page that is open
+  // right now, or null. Exact id match only. The lookup this replaces was
+  // `[data-id$="_<id>"], [href*="_<id>"]` — the href half is a substring
+  // test, so any track link whose audio id merely STARTS with the playlist id
+  // matched too (playlist 45 -> 98 hits on the community page, every track
+  // link "…_45xxxxxxx"); "the edit button" then became whatever
+  // [class*="edit"] element sat near the first hit, the click did nothing and
+  // the flow died with dialog_not_opened. Playlist cells are matched by their
+  // own data-id; plain links only when they are playlist links with exactly
+  // this id.
+  function findPlaylistEditButton(playlistId, ownerId) {
+    const wanted = String(playlistId);
+    const owner = ownerId == null || ownerId === '' ? null : String(ownerId);
+    const sameOwner = o => owner === null || o === owner;
+    for (const cell of document.querySelectorAll('[data-testid="MusicPlaylistItem_Cell"][data-id], .audio_pl_item[data-id], .audio_pl[data-id]')) {
+      const m = (cell.getAttribute('data-id') || '').match(/^(-?\d+)_(\d+)$/);
+      if (!m || m[2] !== wanted || !sameOwner(m[1])) continue;
+      const btn = findEditBtnInCell(cell);
+      if (btn) return btn;
+    }
+    for (const a of document.querySelectorAll('a[href*="_' + wanted + '"]')) {
+      const m = (a.getAttribute('href') || '').match(/(?:playlist\/|audio_playlist)(-?\d+)_(\d+)(?:_[A-Za-z0-9]+)?(?:[?#]|$)/);
+      if (!m || m[2] !== wanted || !sameOwner(m[1])) continue;
+      const cell = a.closest('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl');
+      const btn = cell ? findEditBtnInCell(cell) : null;
+      if (btn) return btn;
+    }
+    return null;
+  }
+
+  // Fallback for a playlist that isn't among the cells mounted on the open
+  // page (the community page only mounts the newest ~20 of 200+): open the
+  // playlist's OWN page through VK's SPA router and use that page's edit
+  // action (verified live: button[data-testid="Action_Edit"], opens the same
+  // .audio_pl_edit_box dialog). SPA navigation only — a full location change
+  // would tear down this very script mid-flow. Returns the button, or null.
+  async function openPlaylistPageEditButton(ownerId, playlistId) {
+    if (typeof window.nav?.go !== 'function' || ownerId == null || ownerId === '') return null;
+    const key = `${ownerId}_${playlistId}`;
+    window.nav.go(`/music/playlist/${key}`);
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      await pause(300);
+      if (!location.pathname.includes(key)) continue;
+      const btn = document.querySelector('[data-testid="Action_Edit"]');
+      if (btn) return btn;
+    }
+    return null;
+  }
+
+  async function openAddTracksPicker(playlistId, ownerId) {
+    // The caller usually knows the owner; the manual find flow doesn't, and
+    // there it is the community whose /audios… page this runs on.
+    const owner = ownerId ?? location.href.match(/audios(-?\d+)/)?.[1] ?? null;
+
     // Same "APE state" staleness createPlaylistViaUI already works around
     // before its own addTracksViaEditDialog call: VK's "Добавить
     // аудиозаписи" picker reads an in-memory audio list that doesn't yet
@@ -2716,15 +2864,15 @@
       await pause(3000);
     }
 
+    // Short retry (the page has only just re-rendered), then the playlist's
+    // own page — not the old 12 s of waiting for a cell that was never going
+    // to be mounted.
     let editBtn = null;
-    for (let i = 0; i < 20 && !editBtn; i++) {
+    for (let i = 0; i < 5 && !editBtn; i++) {
       if (i > 0) await pause(600);
-      for (const link of document.querySelectorAll('[data-id$="_' + playlistId + '"], [href*="_' + playlistId + '"]')) {
-        const cell = link.closest('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl') || link.parentElement?.parentElement;
-        const btn = findEditBtnInCell(cell);
-        if (btn) { editBtn = btn; break; }
-      }
+      editBtn = findPlaylistEditButton(playlistId, owner);
     }
+    if (!editBtn) editBtn = await openPlaylistPageEditButton(owner, playlistId);
     if (!editBtn) throw new Error('edit_button_not_found');
 
     editBtn.click();
@@ -2760,7 +2908,9 @@
     // baselineCount — either alone can be misleading (the marker can mount
     // a beat before the list finishes populating).
     const opened = await (async () => {
-      const deadline = Date.now() + 6000;
+      // Measured live 2026-10: ~4 s from the click on a 16-track playlist;
+      // the old 6 s left almost no margin on a slower connection.
+      const deadline = Date.now() + 15000;
       while (Date.now() < deadline) {
         const hasMarker = !!dialog.querySelector('[data-testid="MusicPlaylist_EditModal_SearchTracks"]');
         const grew = dialog.querySelectorAll('._ape_audio_item').length > baselineCount;
@@ -2775,7 +2925,7 @@
   }
 
   async function addTracksToExistingPlaylistViaUI(ownerId, playlistId, trackNames, audioIds) {
-    const dialog = await openAddTracksPicker(playlistId);
+    const dialog = await openAddTracksPicker(playlistId, ownerId);
     const selectedCount = audioIds?.length
       ? await selectTracksByAudioIds(dialog, audioIds)
       : await selectTracksFromCommunityList(dialog, trackNames);

@@ -203,7 +203,7 @@
   // (freq) / wheel (q, bandwidth).
   const AUDIOFX_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   const EQ_DEFAULT_Q = 1.41; // RBJ-cookbook default — matches BiquadFilterNode's own peaking-EQ default
-  let settings = { autoPlaylist: false, dupPlaylistCheck: true, autoAddToExistingPlaylist: true, geniusValidateAutoAdd: true, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A',
+  let settings = { autoPlaylist: false, dupPlaylistCheck: true, autoAddToExistingPlaylist: true, geniusValidateAutoAdd: true, coverDataUrl: null, autoMeta: false, autoCoverFromId3: false, workMode: 'upload', checkFullPage: false, plmakeScanLimit: 100, pinSidebar: false, contentOffsetX: 0, optimizeBigPlaylists: false, hideScrollToTop: false, hideFriendsMusic: false, pinTabsBar: false, downloadThreads: 3, audioFxLimiterEnabled: false, audioFxCompEnabled: false, audioFxEqEnabled: false, audioFxThreshold: -3, audioFxRatio: 4, audioFxInputGain: 0, audioFxOutputGain: 0, audioFxAttack: 3, audioFxRelease: 250, audioFxKnee: 0, audioFxCeiling: -0.3, audioFxCeilingR: -0.3, audioFxLimRelease: 50, audioFxLimGain: 0, audioFxStyle: 3, audioFxAutoRelease: false, audioFxTruePeak: false, audioFxOversampling: 1, audioFxAutoGain: false, audioFxProcessingMode: 0, audioFxChainOrder: 0, audioFxActiveTab: 'compressor', audioFxBands: AUDIOFX_FREQS.map(f => ({ freq: f, gain: 0, q: EQ_DEFAULT_Q })), audioFxCurrentPreset: null, audioFxAB: { A: null, B: null }, audioFxABActive: 'A',
     slimEnabled: false,
     slimSj: true, slimSjCount: 5, slimSjAtt: 15.0, slimSjNoise: true,
     slimSjMode: 0, slimSjAdaptive: false, slimSjTemporal: false, slimSjBoost: false, slimSjManualFilters: [],
@@ -298,6 +298,7 @@
         autoCoverFromId3: settings.autoCoverFromId3,
         workMode: settings.workMode,
         checkFullPage: settings.checkFullPage,
+        plmakeScanLimit: settings.plmakeScanLimit,
         pinSidebar: settings.pinSidebar,
         contentOffsetX: settings.contentOffsetX,
         optimizeBigPlaylists: settings.optimizeBigPlaylists,
@@ -3013,7 +3014,7 @@
   function translateError(msg) {
     const map = {
       btn_create_playlist_not_found: 'Кнопка "Создать плейлист" не найдена. Перейдите на страницу своей музыки (/audios) и попробуйте снова.',
-      dialog_not_opened: 'Диалог создания плейлиста не открылся.',
+      dialog_not_opened: 'Диалог плейлиста не открылся.',
       save_btn_not_found: 'Кнопка "Сохранить" не найдена в диалоге.',
       save_playlist_timeout: 'Плейлист не был сохранён за 20 секунд.',
       playlist_id_not_found: 'Не удалось получить ID созданного плейлиста.',
@@ -7452,7 +7453,10 @@
     return null;
   }
 
-  async function harvestPageTracks(onProgress, limit) {
+  // shouldStop(collectedMap) (optional): asked after every pull — return true
+  // to stop scrolling right there, e.g. once the caller has found everything
+  // it was looking for. Without it the scan runs to `limit` / the end.
+  async function harvestPageTracks(onProgress, limit, shouldStop) {
     const collected = new Map();
     const scanRoot = getPageScanRoot();
 
@@ -7492,10 +7496,12 @@
     await refreshStamps();
     pull();
     if (onProgress) onProgress(collected.size);
+    let stopRequested = !!shouldStop && shouldStop(collected);
 
     // Scroll-and-harvest loop. Stops on either:
     //   - limit reached
     //   - lazy-load is exhausted (stable count for 15 iterations)
+    //   - the caller's shouldStop says it has what it needs
     //
     // Plain `scrollTop = scrollHeight` triggers VK's lazy-load only for the
     // first few batches — measured live on a 684-row library, it plateaued
@@ -7506,7 +7512,7 @@
     let stable = 0, last = collected.size;
     const MAX_ITER = 200;
     const STABLE_LIMIT = 15;
-    for (let i = 0; i < MAX_ITER && stable < STABLE_LIMIT; i++) {
+    for (let i = 0; i < MAX_ITER && stable < STABLE_LIMIT && !stopRequested; i++) {
       if (limit && collected.size >= limit) break;
       if (sc) {
         // Every 3rd iter, jump up first so the next scroll-to-bottom registers
@@ -7530,6 +7536,7 @@
       pull();
       if (onProgress) onProgress(collected.size);
       if (collected.size === last) stable++; else { stable = 0; last = collected.size; }
+      if (shouldStop && !stopRequested) stopRequested = shouldStop(collected);
     }
 
     // Restore scroll position so the user lands where they were
@@ -7994,7 +8001,10 @@
         const rowWords = wordsOf(rows[idx].artist);
         sure = !enWords.length || enWords.some(w => rowWords.some(rw => wordsMatch(w, rw)));
       }
-      return { track: tracks[idx], sure };
+      // `exact`: the title matched as-is, not via the fuzzy tier. A fuzzy
+      // stand-in found early may be beaten by a real match further down the
+      // page, so the scan only stops early on exact matches.
+      return { track: tracks[idx], sure, exact: sameTitle };
     });
   }
   // PLM-PURE-END
@@ -8089,6 +8099,15 @@
           </div>
         </div>
 
+        <div class="vmu-plc-row" title="Сколько первых треков страницы читать при поиске. Поиск остановится раньше, как только найдёт все файлы.">
+          <span class="vmu-plc-label">Просматривать треков</span>
+          <span class="vmu-plc-range">
+            <input type="number" id="vmu-plmake-limit" class="vmu-plc-input vmu-plc-input-sm" min="1" step="50" value="100">
+            <label class="vmu-rename-check">
+              <input type="checkbox" id="vmu-plmake-whole"><span>вся страница</span>
+            </label>
+          </span>
+        </div>
         <div class="vmu-plc-actions">
           <button type="button" id="vmu-plmake-find" class="vmu-pick-btn" disabled>Найти в сообществе</button>
           <button type="button" id="vmu-plmake-rescan" class="vmu-plc-link" style="display:none" title="Заново прочитать треки со страницы">Пересканировать</button>
@@ -8124,11 +8143,16 @@
     const listEl = $('#vmu-plmake-list');
     const countEl = $('#vmu-plmake-count');
     const goBtn = $('#vmu-plmake-go');
+    const limitInput = $('#vmu-plmake-limit');
+    const wholeCheck = $('#vmu-plmake-whole');
 
     let items = [];          // [{ file, tags, entry }] in playlist order
     let matches = null;      // parallel to items: { track, sure } | null — null array until "Найти"
     let checked = new Set(); // indices that go into the playlist
-    let pageTracks = null;   // the community's tracks, read once per panel
+    // The last page read: { tracks, limit (null = whole page), early (stopped
+    // because every file was already found), forItems (the file list an
+    // `early` read was only good for) }.
+    let scan = null;
     let mode = 'new';
     let busy = false;
     let titleTouched = false, descTouched = false, coverTouched = false;
@@ -8141,7 +8165,7 @@
     function updateControls() {
       const n = matches ? [...checked].filter(i => matches[i]).length : 0;
       findBtn.disabled = busy || !items.length;
-      rescanBtn.style.display = pageTracks ? '' : 'none';
+      rescanBtn.style.display = scan ? '' : 'none';
       rescanBtn.disabled = busy;
       goBtn.textContent = mode === 'new' ? 'Создать плейлист' : 'Добавить в плейлист';
       goBtn.disabled = busy || !n || (mode === 'existing' && !plSelect.value);
@@ -8149,10 +8173,40 @@
     }
     function setBusy(b) {
       busy = b;
-      for (const el of [titleInput, descInput, coverCheck, plSelect, fileInput]) el.disabled = b;
+      for (const el of [titleInput, descInput, coverCheck, plSelect, fileInput, limitInput, wholeCheck]) el.disabled = b;
+      // "вся страница" owns the number box's enabled state when not busy
+      if (!b) limitInput.disabled = wholeCheck.checked;
       panel.classList.toggle('vmu-plmake-busy', b);
+      // Lets the SPA-navigation watcher keep this panel (and its progress
+      // line) alive: adding to a playlist that isn't on the open page opens
+      // that playlist's own page mid-operation.
+      if (b) panel.dataset.vmuBusy = '1'; else delete panel.dataset.vmuBusy;
       updateControls();
     }
+
+    // How much of the page "Найти" may read — persisted, same spirit as the
+    // check mode's "сканировать всю страницу" (default: just the first
+    // screenfuls; the whole library only on request).
+    limitInput.value = String(settings.plmakeScanLimit > 0 ? settings.plmakeScanLimit : 100);
+    wholeCheck.checked = !(settings.plmakeScanLimit > 0);
+    limitInput.disabled = wholeCheck.checked;
+    const readLimit = () => {
+      if (wholeCheck.checked) return null;
+      const n = parseInt(limitInput.value, 10);
+      return Number.isFinite(n) && n > 0 ? n : 100;
+    };
+    const saveLimit = () => {
+      settings.plmakeScanLimit = wholeCheck.checked ? 0 : (readLimit() || 100);
+      saveSettings();
+    };
+    limitInput.addEventListener('change', () => {
+      limitInput.value = String(readLimit() || 100);
+      saveLimit();
+    });
+    wholeCheck.addEventListener('change', () => {
+      limitInput.disabled = wholeCheck.checked;
+      saveLimit();
+    });
 
     function renderList() {
       listEl.innerHTML = items.map((it, i) => {
@@ -8253,23 +8307,47 @@
         setStatus('Открой страницу аудио сообщества (vk.ru/audios-…) и запусти заново', true);
         return;
       }
+      const limit = readLimit();           // null = whole page
+      const entries = items.map(it => it.entry);
       setBusy(true);
       try {
-        if (!pageTracks) {
-          setStatus('Читаю треки сообщества…');
-          // Whole page, not just the first screenful — a file matching
-          // nothing because its track sits below the fold looks exactly like
-          // "not uploaded".
+        // A previous read is reused when it already covers what's asked for:
+        // an equal-or-larger cap, the whole page, or an early stop that was
+        // for this very file list.
+        const reusable = scan && (scan.early
+          ? scan.forItems === items
+          : (scan.limit == null || (limit != null && scan.limit >= limit)));
+        if (!reusable) {
+          setStatus(`Читаю треки страницы… (0${limit ? ' из ' + limit : ''})`);
+          let early = false;
+          // Stop scrolling the moment every file has a confident, exact-title
+          // match — the rest of a 2 700-track page can't change the result.
+          // (Fuzzy or ambiguous matches keep reading, up to the cap, since a
+          // better one may still be further down.)
+          const allFound = collected => {
+            if (collected.size < entries.length) return false;
+            early = plmakeMatch(entries, [...collected.values()]).every(m => m && m.sure && m.exact);
+            return early;
+          };
           const map = await harvestPageTracks(n => {
-            if (statusEl.isConnected) setStatus(`Читаю треки сообщества… (${n})`);
-          }, null);
-          pageTracks = [...map.values()];
+            if (statusEl.isConnected) setStatus(`Читаю треки страницы… (${n}${limit ? ' из ' + limit : ''})`);
+          }, limit, allFound);
+          scan = { tracks: [...map.values()], limit, early, forItems: items };
         }
         if (!panel.isConnected) return;
-        matches = plmakeMatch(items.map(it => it.entry), pageTracks);
+        const tracks = limit != null && scan.tracks.length > limit ? scan.tracks.slice(0, limit) : scan.tracks;
+        matches = plmakeMatch(entries, tracks);
         checked = new Set(matches.flatMap((m, i) => (m && m.sure ? [i] : [])));
         const found = matches.filter(Boolean).length;
-        setStatus(`Среди ${pageTracks.length} треков страницы найдено ${found} из ${items.length}`);
+        let msg = scan.early && found === items.length
+          ? `Найдено ${found} из ${items.length} среди первых ${tracks.length} треков страницы`
+          : `Просмотрено треков: ${tracks.length}. Найдено ${found} из ${items.length}`;
+        // Capped read with files still missing: they may simply be further down.
+        const total = getPageTrackCount();
+        if (found < items.length && limit != null && tracks.length >= limit && (total == null || total > tracks.length)) {
+          msg += ` — остальные могут быть глубже: увеличь число или отметь «вся страница»`;
+        }
+        setStatus(msg);
       } catch (err) {
         console.warn('[VK Multi Upload] playlist-maker find failed:', err);
         setStatus('Ошибка: ' + translateError(err.message), true);
@@ -8278,7 +8356,7 @@
       }
     }
     findBtn.addEventListener('click', findInCommunity);
-    rescanBtn.addEventListener('click', () => { pageTracks = null; matches = null; checked = new Set(); renderList(); findInCommunity(); });
+    rescanBtn.addEventListener('click', () => { scan = null; matches = null; checked = new Set(); renderList(); findInCommunity(); });
 
     // Existing-playlist picker
     function fillPlaylists(list, hint) {
@@ -8399,7 +8477,796 @@
     renderList();
   }
 
+  // ─── Playlist order ──────────────────────────────────────────────────────────
+  // VK removed drag-to-reorder for playlists from the desktop site (community
+  // and personal music); the server method is still there and VK's own web
+  // client still contains the call (see movePlaylist in injected.js). This is
+  // the missing UI: list every playlist, let the user drag them into the order
+  // they want, then send the smallest set of audio.reorderPlaylists moves that
+  // gets there — one call per move, like the app does on every drop.
+
+  // PLO-PURE-BEGIN
+  // Indices (into `arr`) of one longest strictly increasing subsequence.
+  function ploLisIndices(arr) {
+    const tails = [];                       // tails[k]: index of the smallest tail of an increasing run of length k+1
+    const prev = new Array(arr.length).fill(-1);
+    for (let i = 0; i < arr.length; i++) {
+      let lo = 0, hi = tails.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[tails[mid]] < arr[i]) lo = mid + 1; else hi = mid;
+      }
+      if (lo > 0) prev[i] = tails[lo - 1];
+      tails[lo] = i;
+    }
+    const keep = new Set();
+    for (let k = tails.length ? tails[tails.length - 1] : -1; k !== -1; k = prev[k]) keep.add(k);
+    return keep;
+  }
+
+  // Server-side semantics of one move: take `id` out, then put it right after
+  // `after`, or — with no `after` — right before `before`.
+  function ploApplyMove(order, m) {
+    const out = order.filter(x => x !== m.id);
+    if (m.toTop) { out.unshift(m.id); return out; }
+    if (m.after != null) out.splice(out.indexOf(m.after) + 1, 0, m.id);
+    else if (m.before != null) out.splice(out.indexOf(m.before), 0, m.id);
+    else out.push(m.id);
+    return out;
+  }
+
+  // The fewest single-playlist moves that turn `current` into `target` (same
+  // ids, any order): the longest run of playlists already in the right
+  // relative order stays put, every other one is moved once — straight after
+  // its predecessor in the target (or before the current first item, for the
+  // very top). Moves are listed in the order they have to be sent.
+  function ploPlanMoves(current, target) {
+    const pos = new Map(current.map((id, i) => [id, i]));
+    const keep = ploLisIndices(target.map(id => pos.get(id)));
+    let cur = current.slice();
+    const moves = [];
+    for (let i = 0; i < target.length; i++) {
+      if (keep.has(i)) continue;
+      const id = target[i];
+      const m = i === 0
+        ? { id, after: null, before: cur.find(x => x !== id) ?? null }
+        : { id, after: target[i - 1], before: null };
+      cur = ploApplyMove(cur, m);
+      // Report BOTH neighbours the item has after the move — the payload
+      // shape VK's own client sends ({after, before}, either may be absent).
+      const at = cur.indexOf(id);
+      moves.push({ id, after: at > 0 ? cur[at - 1] : null, before: at < cur.length - 1 ? cur[at + 1] : null });
+    }
+    return moves;
+  }
+
+  // For lists where VK only honours "move to the top" — a community's
+  // playlists: verified live, there a relative move (after/before a valid
+  // neighbour) is accepted with `1` and silently ignored, while a move with
+  // no neighbour puts the playlist first. The playlists that stay put must be
+  // a suffix of the target that already appears in the same relative order in
+  // the current list; every other playlist goes to the top, the one wanted
+  // lowest first, so each lands above those moved before it. That is also the
+  // fewest possible top-moves: whatever is never moved has to be such a
+  // suffix, and this takes the longest one.
+  function ploPlanTopMoves(current, target) {
+    const pos = new Map(current.map((id, i) => [id, i]));
+    let k = target.length;
+    while (k > 0 && (k === target.length || pos.get(target[k - 1]) < pos.get(target[k]))) k--;
+    const moves = [];
+    for (let i = k - 1; i >= 0; i--) moves.push({ id: target[i], after: null, before: null, toTop: true });
+    return moves;
+  }
+  // PLO-PURE-END
+
+  function closePlaylistOrderPanel() {
+    document.getElementById('vmu-plorder-panel')?.remove();
+  }
+
+  function injectPlaylistOrderButton() {
+    if (document.getElementById('vmu-plorder-btn')) return;
+    const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
+    const group = uploadBtn?.parentElement;
+    if (!group) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vmu-plorder-btn';
+    btn.className = uploadBtn.className;
+    matchNativeButtonBox(btn, uploadBtn);
+    btn.setAttribute('aria-label', 'Порядок плейлистов');
+    btn.setAttribute('data-vmu-tip', 'Порядок плейлистов');
+    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v14M3.5 5.5L6 3l2.5 2.5M3.5 14.5L6 17l2.5-2.5"/><path d="M12 6h5M12 10h5M12 14h5"/></svg>`;
+    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
+    btn.addEventListener('mouseleave', hideDlTooltip);
+    btn.addEventListener('click', () => { hideDlTooltip(); openPlaylistOrderPanel(); });
+    group.insertBefore(btn, document.getElementById('vmu-plmake-btn') || document.getElementById('vmu-bulkops-btn') || uploadBtn);
+  }
+
+  function openPlaylistOrderPanel() {
+    syncVmuTheme();
+    closePlaylistOrderPanel();
+
+    const ownerMatch = location.href.match(/audios(-?\d+)/);
+    const ownerId = ownerMatch ? ownerMatch[1] : null;
+
+    // Resume support: if VK blocks/rejects a request mid-apply (flood
+    // control that outlasts the retries, or a hard refusal), the target
+    // order the user picked is saved here — reopening the panel (even after
+    // a forced page reload, e.g. an expired token) restores it so the user
+    // just reviews and hits «Применить» again instead of re-building the
+    // order from scratch. Cleared once a run finishes with no mismatch.
+    const ploKey = 'vmu-plorder-target-' + ownerId;
+    function ploSaveTarget(idsList) {
+      try { sessionStorage.setItem(ploKey, JSON.stringify({ ids: idsList, ts: Date.now() })); } catch {}
+    }
+    function ploLoadTarget() {
+      try {
+        const data = JSON.parse(sessionStorage.getItem(ploKey) || 'null');
+        return Array.isArray(data?.ids) ? data.ids : null;
+      } catch { return null; }
+    }
+    function ploClearTarget() {
+      try { sessionStorage.removeItem(ploKey); } catch {}
+    }
+
+    const panel = document.createElement('div');
+    panel.id = 'vmu-plorder-panel';
+    panel.className = 'vmu-bulkops-panel vmu-plorder-panel';
+    panel.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Порядок плейлистов</span>
+        <button type="button" class="vmu-check-close" id="vmu-plorder-close" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body vmu-plcollect-body">
+        <div class="vmu-plmake-hint">Перетащи плейлисты в нужный порядок и нажми «Применить». Кнопки в углу плитки переносят плейлист в начало или в конец. Изменения уходят в VK по одному перемещению, как из приложения.</div>
+        <div class="vmu-plo-paste-row">
+          <textarea id="vmu-plorder-paste" class="vmu-plc-input vmu-plo-paste-text" rows="3" spellcheck="false" placeholder="Вставь ссылки или ID плейлистов в нужном порядке (можно прямо весь список построчно) — остальные останутся как есть"></textarea>
+          <div class="vmu-plo-paste-btns">
+            <button type="button" id="vmu-plorder-autosort" class="vmu-pick-btn vmu-plc-secondary" title="Разбирает «Название (Год) Автор» у каждого плейлиста и группирует по автору; что не разобралось — в конец">Сортировать по авторам (А→Я)</button>
+            <button type="button" id="vmu-plorder-paste-apply" class="vmu-pick-btn vmu-plc-secondary">Расставить по списку</button>
+          </div>
+        </div>
+        <div class="vmu-plo-bury-row">
+          <div class="vmu-plmake-hint vmu-plo-bury-hint" id="vmu-plorder-bury-hint">Нажми «Сортировать по авторам» — появится список авторов, из которого можно кликом отправить кого-то в самый низ, после всех.</div>
+          <div class="vmu-plo-bury-chips" id="vmu-plorder-bury-chips" style="display:none"></div>
+        </div>
+        <div class="vmu-plc-status" id="vmu-plorder-status">Загружаю плейлисты…</div>
+        <div class="vmu-plmake-hint vmu-plo-info" id="vmu-plorder-info" style="display:none"></div>
+        <div class="vmu-slim-track" id="vmu-plorder-bar" style="display:none"><div class="vmu-slim-fill" id="vmu-plorder-bar-fill"></div></div>
+        <div class="vmu-plo-list" id="vmu-plorder-list"></div>
+        <div class="vmu-plc-actions">
+          <span class="vmu-plc-count" id="vmu-plorder-count"></span>
+          <button type="button" id="vmu-plorder-reload" class="vmu-plc-link" style="display:none" title="Перезагрузить страницу, чтобы каталог показал новый порядок">Обновить страницу</button>
+          <button type="button" id="vmu-plorder-stop" class="vmu-pick-btn vmu-plc-secondary" style="display:none">Остановить</button>
+          <button type="button" id="vmu-plorder-reset" class="vmu-pick-btn vmu-plc-secondary" disabled>Сбросить</button>
+          <button type="button" id="vmu-plorder-apply" class="vmu-pick-btn" disabled>Применить</button>
+        </div>
+      </div>`;
+    document.body.appendChild(panel);
+    makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+    panel.querySelector('#vmu-plorder-close').addEventListener('click', closePlaylistOrderPanel);
+
+    const $ = sel => panel.querySelector(sel);
+    const statusEl = $('#vmu-plorder-status');
+    const infoEl = $('#vmu-plorder-info');
+    const barEl = $('#vmu-plorder-bar');
+    const barFill = $('#vmu-plorder-bar-fill');
+    const listEl = $('#vmu-plorder-list');
+    const countEl = $('#vmu-plorder-count');
+    const applyBtn = $('#vmu-plorder-apply');
+    const resetBtn = $('#vmu-plorder-reset');
+    const reloadBtn = $('#vmu-plorder-reload');
+    const stopBtn = $('#vmu-plorder-stop');
+    const pasteBox = $('#vmu-plorder-paste');
+    const pasteApplyBtn = $('#vmu-plorder-paste-apply');
+    const autoSortBtn = $('#vmu-plorder-autosort');
+    const buryHintEl = $('#vmu-plorder-bury-hint');
+    const buryChipsEl = $('#vmu-plorder-bury-chips');
+    reloadBtn.addEventListener('click', () => location.reload());
+
+    let orig = [];            // playlist ids in the order the server has them
+    let items = [];           // playlist objects in the order being edited
+    let byId = new Map();
+    let busy = false;
+    let cancelled = false;
+    let dropMark = null;      // { id, after } while dragging
+    let dragged = new Set();  // ids the user moved by hand since the last load / reset
+
+    const setStatus = (text, isError) => {
+      statusEl.textContent = text || '';
+      statusEl.classList.toggle('vmu-plmake-status-error', !!isError);
+    };
+    const setProgress = frac => {
+      barEl.style.display = frac == null ? 'none' : '';
+      if (frac != null) barFill.style.width = Math.round(frac * 100) + '%';
+    };
+    const ids = () => items.map(p => p.id);
+    // Communities only honour "move to the top" (see ploPlanTopMoves); a
+    // personal list takes relative moves (verified live on both).
+    const isCommunity = () => Number(ownerId) < 0;
+    const pending = () => (isCommunity() ? ploPlanTopMoves : ploPlanMoves)(orig, ids());
+
+    function updateControls() {
+      const plan = pending();
+      const moves = plan.length;
+      const changed = ids().filter((id, i) => id !== orig[i]).length;
+      applyBtn.disabled = busy || !moves;
+      resetBtn.disabled = busy || !moves;
+      applyBtn.textContent = busy ? 'Применяю…' : (moves ? `Применить (${moves})` : 'Применить');
+      countEl.textContent = items.length ? `Плейлистов: ${items.length}${changed ? ` · сдвинуто: ${changed}` : ''}` : '';
+      // Why N requests when only a few playlists were dragged: say it.
+      const lifted = isCommunity() ? plan.filter(m => !dragged.has(m.id)).length : 0;
+      if (!busy && moves && isCommunity()) {
+        infoEl.style.display = '';
+        const mins = Math.max(0.1, Math.round(moves * 0.8 / 60 * 10) / 10);
+        infoEl.textContent = lifted
+          ? `Вы переставили: ${dragged.size}. В сообществе VK принимает только «в начало», поэтому понадобится ${moves} запросов (≈ ${mins} мин): плейлисты, которые должны оказаться выше (помечены «↑»), поднимутся заново в прежнем порядке — друг относительно друга они не сдвинутся.`
+          : `Запросов: ${moves}. В сообществе VK принимает только «в начало».`;
+      } else {
+        infoEl.style.display = 'none';
+      }
+    }
+    function setBusy(b) {
+      busy = b;
+      panel.classList.toggle('vmu-plmake-busy', b);
+      if (b) panel.dataset.vmuBusy = '1'; else delete panel.dataset.vmuBusy;
+      listEl.querySelectorAll('.vmu-plo-tile').forEach(r => { r.draggable = !b; });
+      updateControls();
+    }
+
+    const iconTop = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2.5h8M7 12V5.5M4 8l3-3 3 3"/></svg>';
+    const iconBottom = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5h8M7 2v6.5M4 6l3 3 3-3"/></svg>';
+
+    // Blocks (cover tiles in a grid, like the catalog's playlist cards), not
+    // rows: a cover is what people recognise a playlist by.
+    function render() {
+      const scroll = listEl.scrollTop;
+      const lift = isCommunity() ? new Set(pending().map(m => m.id)) : new Set();
+      listEl.innerHTML = items.map((p, i) => `
+        <div class="vmu-plo-tile${dragged.has(p.id) && p.id !== orig[i] ? ' vmu-plo-changed' : (lift.has(p.id) && !dragged.has(p.id) ? ' vmu-plo-lift' : '')}" draggable="${busy ? 'false' : 'true'}" data-id="${p.id}">
+          <div class="vmu-plo-art">
+            ${p.cover ? `<img class="vmu-plo-cover" src="${escHtml(p.cover)}" alt="" decoding="async" draggable="false">` : '<span class="vmu-plo-cover vmu-plo-cover-empty"></span>'}
+            <span class="vmu-plo-pos">${i + 1}</span>
+            <span class="vmu-plo-meta" title="Треков в плейлисте">${p.count}</span>
+            <span class="vmu-plo-actions">
+              <button type="button" class="vmu-plo-btn" data-act="top" title="В начало">${iconTop}</button>
+              <button type="button" class="vmu-plo-btn" data-act="bottom" title="В конец">${iconBottom}</button>
+            </span>
+          </div>
+          <div class="vmu-plo-title" title="${escHtml(p.title)}">${escHtml(p.title)}</div>
+        </div>`).join('');
+      listEl.scrollTop = scroll;
+      updateControls();
+    }
+
+    function move(id, refId, after) {
+      if (id === refId) return;
+      const from = items.findIndex(p => p.id === id);
+      if (from < 0) return;
+      const [it] = items.splice(from, 1);
+      const to = items.findIndex(p => p.id === refId);
+      items.splice(after ? to + 1 : to, 0, it);
+    }
+
+    // Paste-a-list shortcut: one playlist link/ID per line, in the wanted
+    // order — same idea as applyPlaylistOrderFromEntries, but for playlists
+    // instead of tracks, and matched by ID instead of title (unambiguous).
+    // A line with no "http" and that isn't pure digits is ignored, so pasting
+    // a whole formatted list (headers, blank lines, "### Artist (N)" counts)
+    // works as-is: only lines ending in a playlist URL or a bare ID count.
+    function parsePastedPlaylistIds(text) {
+      const order = [];
+      const seen = new Set();
+      for (const raw of String(text || '').split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        let id = null;
+        if (/^\d+$/.test(line)) {
+          id = Number(line);
+        } else if (/https?:\/\//i.test(line)) {
+          const m = line.match(/(\d+)(?!.*\d)/);
+          if (m) id = Number(m[1]);
+        }
+        if (id == null || !Number.isFinite(id) || seen.has(id)) continue;
+        seen.add(id);
+        order.push(id);
+      }
+      return order;
+    }
+
+    // Auto-sort shortcut: parses "Название (Год) Автор" (or "Название Год
+    // Автор" with no parens) out of each playlist's own title and groups by
+    // the author — same rule as the paste-order helper's source data used,
+    // only inline instead of from a pasted list. A multi-credit title keeps
+    // only the first-listed name as the sort key ("Баста, Гуф" -> "баста").
+    // Titles that don't fit the pattern can't be attributed and go last, in
+    // their current order. This is a generic text pattern, not a per-artist
+    // alias table: literal spelling/script variants (e.g. a Cyrillic vs
+    // Latin spelling of the same name) sort as different authors.
+    const YEAR_PAREN_RE = /\((\d{4}(?:-\d{4})?)\s*\)/;
+    const YEAR_BARE_RE = /(?<!\d)((?:19|20)\d{2})(?!\d)/;
+    // Only the main/album artist is wanted, never a featured one — so this
+    // splits on every common "and another artist joins in" separator,
+    // including both "feat." and "ft." (with or without the trailing dot;
+    // `\b...\b` keeps "feat" from matching inside "feature").
+    const AUTHOR_SEP_RE = /\s*(?:,|&|\/|;|\bfeat\.?\b|\bft\.?\b)\s*/i;
+    // "Artist - Album (Year)" / "Artist - Song - Song (Year)": the year sits
+    // at the very end with nothing after it, so there's no "Автор" tail to
+    // read — real community data has playlists titled exactly this way
+    // (metal/black-metal releases mostly). Only trusted when an explicit
+    // " - " splits the text before the year; a bare leading phrase with no
+    // separator (e.g. "Артист все синглы и фиты (2018-2026)") is too
+    // ambiguous to guess at and is left unattributed, same as before.
+    const DASH_SEP_RE = /\s+[-–—]\s+/;
+    function extractAuthorKey(title) {
+      const t = String(title || '');
+      const m = YEAR_PAREN_RE.exec(t) || YEAR_BARE_RE.exec(t);
+      if (!m) return null;
+      const after = t.slice(m.index + m[0].length).trim();
+      if (after) {
+        const primary = after.split(AUTHOR_SEP_RE)[0].trim();
+        return primary ? primary.toLowerCase() : null;
+      }
+      const dashParts = t.slice(0, m.index).split(DASH_SEP_RE);
+      if (dashParts.length < 2) return null;
+      // Same main-artist-only rule applies here too — "Artist1 & Artist2 -
+      // Album (Year)" should key on "Artist1", not the whole credit list.
+      const primary = dashParts[0].split(AUTHOR_SEP_RE)[0].trim();
+      return primary ? primary.toLowerCase() : null;
+    }
+    // Same year match extractAuthorKey found, as a number — a "(2018-2026)"
+    // range sorts on its start year. Grouping by author only fixes WHICH
+    // playlists sit together; within one author's group they were still
+    // left in whatever order the page happened to have them (reported:
+    // "года поломаны, не в хронологическом порядке"), so this re-sorts
+    // each author's own playlists oldest -> newest once they're grouped.
+    function extractYear(title) {
+      const t = String(title || '');
+      const m = YEAR_PAREN_RE.exec(t) || YEAR_BARE_RE.exec(t);
+      return m ? parseInt(m[1], 10) : null;
+    }
+    // Cyrillic code points (U+0400+) all sort after Latin ones (U+0061-007A)
+    // in a plain string compare, so a straight `<`/`>` on the raw keys puts
+    // every Latin-named author in one block before every Cyrillic-named one
+    // instead of interleaving them alphabetically ("конфликт алфавитов",
+    // reported live on this community's own mixed-script catalog). Sorting
+    // by a transliterated key instead makes both alphabets compare on the
+    // same scale — "баста" -> "basta" lands next to "big baby tape", not
+    // after "эфир в норме". Transliteration is comparison-only: the actual
+    // grouping key (and everything shown/applied) stays the original text.
+    const CYR_TRANSLIT = {
+      а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z',
+      и: 'i', й: 'i', к: 'k', л: 'l', м: 'm', н: 'n', о: 'o', п: 'p', р: 'r',
+      с: 's', т: 't', у: 'u', ф: 'f', х: 'h', ц: 'c', ч: 'ch', ш: 'sh',
+      щ: 'shch', ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
+    };
+    const translitKey = s => String(s || '').replace(/[а-яё]/g, ch => CYR_TRANSLIT[ch] ?? ch);
+
+    // Same real artist, two different typed-out keys: not just script
+    // (handled above) but plain typos across the community's own playlist
+    // titles ("Frendly Thug 52 NGG" vs "FRIENDLY THUG 52 NGG" — someone
+    // dropped an "i"). Levenshtein distance on the transliterated keys
+    // catches this, but only when it's safe to: a 1-char difference on a
+    // 3-letter key is 33% of the string and could just as easily be two
+    // unrelated artists, so short keys require an exact match and the
+    // threshold is relative to length, not a flat character count. Checked
+    // against this community's real 46 parsed authors live: only the one
+    // genuine typo pair crosses it, nothing else comes close (verified via
+    // Claude in Chrome before this shipped — see [[playlist-order-feature]]).
+    function levenshtein(a, b) {
+      const al = a.length, bl = b.length;
+      if (!al) return bl;
+      if (!bl) return al;
+      let prev = new Array(bl + 1);
+      for (let j = 0; j <= bl; j++) prev[j] = j;
+      for (let i = 1; i <= al; i++) {
+        const cur = [i];
+        for (let j = 1; j <= bl; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+        }
+        prev = cur;
+      }
+      return prev[bl];
+    }
+    function isFuzzyAuthorMatch(ta, tb) {
+      if (ta === tb) return true;
+      const minLen = Math.min(ta.length, tb.length);
+      if (minLen < 6) return false; // too short to risk it
+      if (Math.abs(ta.length - tb.length) > 3) return false; // cheap pre-filter
+      const maxLen = Math.max(ta.length, tb.length);
+      const dist = levenshtein(ta, tb);
+      return dist <= 3 && dist / maxLen <= 0.15;
+    }
+    // Groups raw extractAuthorKey() outputs into clusters of "same real
+    // author" (script variants + close typos merged), each with one
+    // representative key (whichever raw key has the most playlists — ties
+    // keep whichever was seen first). `groups` stays keyed by the ORIGINAL
+    // raw key for lookups; this only decides which raw keys count as one.
+    function clusterAuthorKeys(rawKeys, groups) {
+      const tl = rawKeys.map(translitKey);
+      const parent = rawKeys.map((_, i) => i);
+      const find = x => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+      const union = (x, y) => { const rx = find(x), ry = find(y); if (rx !== ry) parent[rx] = ry; };
+      for (let i = 0; i < rawKeys.length; i++) {
+        for (let j = i + 1; j < rawKeys.length; j++) {
+          if (tl[i] === tl[j] || isFuzzyAuthorMatch(tl[i], tl[j])) union(i, j);
+        }
+      }
+      const clusters = new Map(); // root index -> raw key indices
+      for (let i = 0; i < rawKeys.length; i++) {
+        const r = find(i);
+        if (!clusters.has(r)) clusters.set(r, []);
+        clusters.get(r).push(i);
+      }
+      return [...clusters.values()].map(idxs => {
+        const keys = idxs.map(i => rawKeys[i]);
+        let rep = keys[0], repCount = groups.get(rep).length;
+        for (const k of keys) { const c = groups.get(k).length; if (c > repCount) { rep = k; repCount = c; } }
+        const playlists = [];
+        for (const k of keys) playlists.push(...groups.get(k));
+        return { key: rep, count: playlists.length, playlists };
+      });
+    }
+
+    // Bury-list: instead of making the user type author names from memory
+    // (a typo wouldn't match the parsed key at all), autosort builds the
+    // list of every author it actually found and offers it as clickable
+    // chips — the user just points at who goes to the very end, after even
+    // the unattributed tail. Selection is remembered per community across
+    // reopenings.
+    const buryStoreKey = 'vmu-plorder-bury-' + ownerId;
+    let buryKeySet = new Set();
+    try { buryKeySet = new Set(JSON.parse(localStorage.getItem(buryStoreKey) || '[]')); } catch {}
+    const saveBury = () => { try { localStorage.setItem(buryStoreKey, JSON.stringify([...buryKeySet])); } catch {} };
+    let authorGroupInfo = []; // [{key, count}] — every distinct author from the last parse, any script
+    function renderBuryChips() {
+      if (!authorGroupInfo.length) {
+        buryHintEl.style.display = '';
+        buryChipsEl.style.display = 'none';
+        return;
+      }
+      buryHintEl.style.display = 'none';
+      buryChipsEl.style.display = '';
+      const sorted = [...authorGroupInfo].sort((a, b) => {
+        const ta = translitKey(a.key), tb = translitKey(b.key);
+        return ta < tb ? -1 : ta > tb ? 1 : 0;
+      });
+      buryChipsEl.innerHTML = sorted.map(a => {
+        const label = a.key.charAt(0).toUpperCase() + a.key.slice(1);
+        const on = buryKeySet.has(a.key);
+        return `<button type="button" class="vmu-plo-bury-chip${on ? ' vmu-plo-bury-chip-on' : ''}" data-key="${escHtml(a.key)}" title="${on ? 'В самом низу — клик, чтобы вернуть в обычную сортировку' : 'Отправить в самый низ, после всех'}">${escHtml(label)} <span class="vmu-plo-bury-chip-n">${a.count}</span></button>`;
+      }).join('');
+    }
+    buryChipsEl.addEventListener('click', e => {
+      const b = e.target.closest('.vmu-plo-bury-chip');
+      if (!b || busy) return;
+      const key = b.dataset.key;
+      if (buryKeySet.has(key)) buryKeySet.delete(key); else buryKeySet.add(key);
+      saveBury();
+      sortItemsByAuthor();
+    });
+
+    function sortItemsByAuthor() {
+      if (busy) return;
+      const keyed = items.map(p => ({ p, key: extractAuthorKey(p.title) }));
+      const groups = new Map();
+      const unknown = [];
+      for (const x of keyed) {
+        if (x.key == null) { unknown.push(x.p); continue; }
+        if (!groups.has(x.key)) groups.set(x.key, []);
+        groups.get(x.key).push(x.p);
+      }
+      const clusters = clusterAuthorKeys([...groups.keys()], groups);
+      for (const c of clusters) {
+        // Newest first within an author's own group.
+        c.playlists.sort((a, b) => (extractYear(b.title) ?? 0) - (extractYear(a.title) ?? 0));
+      }
+      authorGroupInfo = clusters.map(c => ({ key: c.key, count: c.count }));
+      // Bury-list authors are pulled out of the normal grouping before the
+      // sort and tacked on at the very end (alphabetised the same way among
+      // themselves), after even the unattributed tail — "у параши", below
+      // absolutely everyone else.
+      const cmpTranslit = (a, b) => {
+        const ta = translitKey(a), tb = translitKey(b);
+        return ta < tb ? -1 : ta > tb ? 1 : 0;
+      };
+      const buriedClusters = clusters.filter(c => buryKeySet.has(c.key)).sort((a, b) => cmpTranslit(a.key, b.key));
+      const restClusters = clusters.filter(c => !buryKeySet.has(c.key)).sort((a, b) => cmpTranslit(a.key, b.key));
+      const ordered = [];
+      for (const c of restClusters) ordered.push(...c.playlists);
+      ordered.push(...unknown);
+      const buried = [];
+      for (const c of buriedClusters) buried.push(...c.playlists);
+      ordered.push(...buried);
+      items = ordered;
+      dragged = new Set(items.map(p => p.id));
+      render();
+      renderBuryChips();
+      setStatus(`Отсортировано по авторам: групп — ${restClusters.length}`
+        + (unknown.length ? `, без определённого автора — ${unknown.length}` : '')
+        + (buried.length ? `, в самый низ — ${buried.length}` : '')
+        + '. Проверь список и нажми «Применить».');
+    }
+
+    // ── drag & drop (HTML5) ──
+    let dragId = null;
+    const clearMark = () => {
+      listEl.querySelectorAll('.vmu-plo-drop-before, .vmu-plo-drop-after').forEach(r => r.classList.remove('vmu-plo-drop-before', 'vmu-plo-drop-after'));
+      dropMark = null;
+    };
+    listEl.addEventListener('dragstart', e => {
+      const tile = e.target.closest?.('.vmu-plo-tile');
+      if (!tile || busy) { e.preventDefault(); return; }
+      dragId = Number(tile.dataset.id);
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', String(dragId)); } catch {}
+      tile.classList.add('vmu-plo-dragging');
+    });
+    listEl.addEventListener('dragover', e => {
+      if (dragId == null) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      // edge auto-scroll: the list is 200+ rows tall
+      const lr = listEl.getBoundingClientRect();
+      if (e.clientY < lr.top + 44) listEl.scrollTop -= 14;
+      else if (e.clientY > lr.bottom - 44) listEl.scrollTop += 14;
+      const tile = e.target.closest?.('.vmu-plo-tile');
+      clearMark();
+      if (!tile) return;
+      const id = Number(tile.dataset.id);
+      if (id === dragId) return;
+      // Grid reading order: the left half of a tile means "before it", the
+      // right half "after it".
+      const r = tile.getBoundingClientRect();
+      const after = e.clientX > r.left + r.width / 2;
+      tile.classList.add(after ? 'vmu-plo-drop-after' : 'vmu-plo-drop-before');
+      dropMark = { id, after };
+    });
+    listEl.addEventListener('drop', e => {
+      if (dragId == null) return;
+      e.preventDefault();
+      const mark = dropMark;
+      clearMark();
+      const id = dragId;
+      dragId = null;
+      if (mark) { move(id, mark.id, mark.after); dragged.add(id); render(); }
+    });
+    listEl.addEventListener('dragend', () => {
+      dragId = null;
+      clearMark();
+      listEl.querySelectorAll('.vmu-plo-dragging').forEach(r => r.classList.remove('vmu-plo-dragging'));
+    });
+    listEl.addEventListener('click', e => {
+      const b = e.target.closest('.vmu-plo-btn');
+      if (!b || busy) return;
+      const id = Number(b.closest('.vmu-plo-tile').dataset.id);
+      const from = items.findIndex(p => p.id === id);
+      const [it] = items.splice(from, 1);
+      if (b.dataset.act === 'top') items.unshift(it); else items.push(it);
+      dragged.add(id);
+      render();
+    });
+
+    // ── talking to injected.js ──
+    const reqId = () => `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    async function fetchList() {
+      const r = await pageCall('VKD_PLAYLIST_ORDER_LIST', 'VKD_PLAYLIST_ORDER_LIST_DONE', { reqId: reqId(), ownerId }, 60000, 'reqId');
+      if (!r.success) throw new Error(r.error || 'не удалось получить список');
+      return r.items || [];
+    }
+    // One move. VK maps its flood control onto "access denied" among other
+    // things, so a refusal is only retried once something in this run has
+    // already gone through — a real refusal on the very first move fails fast.
+    async function sendMove(m, anySucceeded) {
+      const owner = byId.get(m.id)?.ownerId ?? ownerId;
+      const delays = [3000, 8000, 20000, 45000];
+      for (let attempt = 0; ; attempt++) {
+        const r = await pageCall('VKD_PLAYLIST_ORDER_MOVE', 'VKD_PLAYLIST_ORDER_MOVE_DONE',
+          { reqId: reqId(), ownerId: owner, playlistId: m.id, after: m.after, before: m.before }, 30000, 'reqId');
+        if (r.success) return { ok: true };
+        const floodish = r.code === 6 || r.code === 9 || r.code === 29 || r.code === -1
+          || (anySucceeded && (r.code === 15 || /access denied|too many/i.test(r.error || '')));
+        if (!floodish || attempt >= delays.length) return { ok: false, code: r.code, error: r.error };
+        setStatus(`VK просит подождать… повтор через ${Math.round(delays[attempt] / 1000)} с`);
+        await sleep(delays[attempt]);
+      }
+    }
+
+    async function load() {
+      setBusy(true);
+      setProgress(null);
+      reloadBtn.style.display = 'none';
+      try {
+        if (!ownerId) throw new Error('Открой страницу музыки (vk.ru/audios…) и запусти заново');
+        setStatus('Загружаю плейлисты…');
+        const list = await fetchList();
+        if (!panel.isConnected) return;
+        items = list;
+        orig = ids();
+        dragged = new Set();
+        byId = new Map(items.map(p => [p.id, p]));
+        const foreign = items.filter(p => String(p.ownerId) !== String(ownerId)).length;
+        setStatus(items.length
+          ? `Плейлистов: ${items.length}${foreign ? ` (из них чужих, на которые вы подписаны: ${foreign})` : ''}${isCommunity() ? '. В сообществе VK умеет только поднимать плейлист в начало — порядок будет собран такими переносами' : ''}`
+          : 'Плейлистов нет');
+
+        // Resume support: an earlier apply() in this tab (or before a forced
+        // reload) left a target order that never finished — restore it so
+        // the user reviews and hits «Применить» again instead of starting
+        // over. pending() below naturally shows 0 and the button stays
+        // disabled if it turns out to already be fully applied.
+        const savedTarget = ploLoadTarget();
+        if (savedTarget && savedTarget.length) {
+          const restored = savedTarget.map(id => byId.get(id)).filter(Boolean);
+          if (restored.length) {
+            const extra = items.filter(p => !savedTarget.includes(p.id));
+            items = [...restored, ...extra];
+            dragged = new Set(restored.map(p => p.id));
+            const left = (isCommunity() ? ploPlanTopMoves : ploPlanMoves)(orig, ids()).length;
+            setStatus(left
+              ? `Восстановлен незавершённый порядок (прошлая попытка прервалась). Осталось запросов: ${left} — проверь и нажми «Применить», либо «Сбросить», чтобы начать заново.`
+              : 'Восстановлен незавершённый порядок — он уже применён, можно закрыть.');
+          } else {
+            ploClearTarget();
+          }
+        }
+      } catch (err) {
+        console.warn('[VK Multi Upload] playlist-order load failed:', err);
+        setStatus('Ошибка: ' + (err.message || err), true);
+        items = []; orig = [];
+      } finally {
+        if (panel.isConnected) { setBusy(false); render(); }
+      }
+    }
+
+    // Sends the moves; never throws, always reports how far it got.
+    async function sendAll(target) {
+      const res = { sent: 0, total: 0, problem: null };
+      try {
+        // Plan from what the server has RIGHT NOW, not from what was loaded
+        // earlier — the order may have changed since (app, other tab).
+        setStatus('Сверяю с порядком на сервере…');
+        const freshIds = (await fetchList()).map(p => p.id);
+        const sameSet = freshIds.length === target.length && freshIds.every(id => byId.has(id));
+        if (!sameSet) { res.problem = 'Список плейлистов изменился — перезагружаю, выбери порядок заново'; return res; }
+        let relative = !isCommunity();
+        let moves = (relative ? ploPlanMoves : ploPlanTopMoves)(freshIds, target);
+        let expected = freshIds;          // the order the server should have after the moves sent so far
+        res.total = moves.length;
+        for (let next = 0; next < moves.length;) {
+          if (!panel.isConnected) { res.problem = 'Окно закрыто'; return res; }
+          if (cancelled) { res.problem = `Остановлено: выполнено ${res.sent} из ${res.total}`; return res; }
+          const m = moves[next];
+          setStatus(`Перемещаю: ${res.sent + 1} из ${res.total} — «${byId.get(m.id)?.title || m.id}»`);
+          setProgress(res.sent / res.total);
+          const r = await sendMove(m, res.sent > 0);
+          if (!r.ok) {
+            res.problem = r.code === 5
+              ? 'Токен VK устарел — обновите страницу (F5) и повторите; уже выполнено перемещений: ' + res.sent
+              : `VK отклонил перемещение ${res.sent + 1} из ${res.total}: ${r.error || 'ошибка'}${r.code ? ` (код ${r.code})` : ''}`;
+            return res;
+          }
+          res.sent++;
+          next++;
+          expected = ploApplyMove(expected, m);
+          // A relative move can be accepted (`1`) and still ignored — that is
+          // exactly what a community does — so the first one is checked
+          // against the server; if it did nothing, plan again from what the
+          // server really has, using top-moves only.
+          if (relative && res.sent === 1) {
+            const now = (await fetchList()).map(p => p.id);
+            if (JSON.stringify(now) !== JSON.stringify(expected)) {
+              console.info('[VK Multi Upload] relative move ignored by VK, falling back to top-moves');
+              relative = false;
+              moves = ploPlanTopMoves(now, target);
+              expected = now;
+              next = 0;
+              res.total = res.sent + moves.length;
+              setStatus('VK игнорирует перемещение рядом с соседом — собираю порядок переносами в начало…');
+              await sleep(600);
+            }
+          }
+          await sleep(450);
+        }
+      } catch (err) {
+        console.warn('[VK Multi Upload] playlist-order apply failed:', err);
+        res.problem = 'Ошибка: ' + (err.message || err);
+      }
+      return res;
+    }
+
+    async function apply() {
+      if (busy) return;
+      const planned = pending().length;
+      if (isCommunity() && planned > 25) {
+        const mins = Math.max(1, Math.round(planned * 0.8 / 60));
+        const ok = await vmuConfirmBulkAction(applyBtn.parentElement, applyBtn,
+          `Понадобится ${planned} запросов (≈ ${mins} мин). В сообществе VK принимает только «в начало», поэтому плейлисты выше перенесённого поднимутся заново. Продолжить?`, 'Применить');
+        if (!ok) return;
+      }
+      const target = ids();
+      ploSaveTarget(target);
+      cancelled = false;
+      stopBtn.disabled = false;
+      setBusy(true);
+      stopBtn.style.display = '';
+      const { sent, total, problem } = await sendAll(target);
+      stopBtn.style.display = 'none';
+      setProgress(null);
+      if (!panel.isConnected) return;
+
+      // Show the truth either way: re-read what the server ended up with.
+      let mismatch = null;
+      try {
+        const list = await fetchList();
+        byId = new Map(list.map(p => [p.id, p]));
+        orig = list.map(p => p.id);
+        const freshIds = orig;
+        mismatch = target.length === freshIds.length
+          ? freshIds.filter((id, i) => id !== target[i]).length
+          : Math.max(target.length, freshIds.length);
+        if (problem || mismatch !== 0) {
+          // Unfinished: keep editing the ORIGINAL target (refreshed with
+          // current item data), not the partial server order, so pending()
+          // immediately reflects just what's left — a plain «Применить»
+          // continues from here instead of silently losing the plan.
+          items = target.map(id => byId.get(id)).filter(Boolean);
+          const extra = list.filter(p => !target.includes(p.id));
+          items.push(...extra);
+          dragged = new Set(target);
+        } else {
+          items = list;
+          dragged = new Set();
+        }
+      } catch { /* keep what is on screen */ }
+
+      if (problem) {
+        setStatus(problem + ' — список не потерян: проверь и нажми «Применить» ещё раз, чтобы продолжить с этого места.', true);
+      } else if (total === 0) {
+        setStatus('Порядок уже такой, как нужно');
+        ploClearTarget();
+      } else if (mismatch === 0) {
+        setStatus(`Готово: порядок применён (перемещений: ${sent})`);
+        ploClearTarget();
+      } else {
+        setStatus(`Применено ${sent} из ${total}, но на сервере порядок отличается от выбранного (позиций: ${mismatch}) — нажми «Применить» ещё раз, чтобы закончить перестановку`, true);
+      }
+      if (sent) reloadBtn.style.display = '';
+      setBusy(false);
+      render();
+    }
+
+    stopBtn.addEventListener('click', () => { cancelled = true; stopBtn.disabled = true; });
+    applyBtn.addEventListener('click', apply);
+    resetBtn.addEventListener('click', () => {
+      if (busy) return;
+      items = orig.map(id => byId.get(id));
+      dragged = new Set();
+      ploClearTarget();
+      render();
+    });
+    autoSortBtn.addEventListener('click', sortItemsByAuthor);
+    pasteApplyBtn.addEventListener('click', () => {
+      if (busy) return;
+      const order = parsePastedPlaylistIds(pasteBox.value);
+      if (!order.length) { showToast('Не нашёл в тексте ни одной ссылки/ID плейлиста', true); return; }
+      const pos = new Map(order.map((id, i) => [id, i]));
+      const known = items.filter(p => pos.has(p.id)).sort((a, b) => pos.get(a.id) - pos.get(b.id));
+      const rest = items.filter(p => !pos.has(p.id));
+      const missing = order.filter(id => !byId.has(id)).length;
+      items = [...known, ...rest];
+      dragged = new Set(known.map(p => p.id));
+      render();
+      setStatus(`Порядок из списка применён: расставлено ${known.length} из ${items.length}`
+        + (missing ? `, не найдено на странице: ${missing}` : '')
+        + '. Остальное — в прежнем порядке. Проверь список и нажми «Применить».');
+    });
+    load();
+  }
+
   function injectCatalogToolbarButtons() {
+    injectPlaylistOrderButton();
     injectPlaylistMakerButton();
     injectBulkOpsButton();
     injectToolbarSettingsButtons();
@@ -11804,7 +12671,8 @@
       dlCancelFlag = true;
       dlpClose();
       closePlaylistCollectPanel();
-      closePlaylistMakerPanel();
+      if (!document.getElementById('vmu-plmake-panel')?.dataset.vmuBusy) closePlaylistMakerPanel();
+      if (!document.getElementById('vmu-plorder-panel')?.dataset.vmuBusy) closePlaylistOrderPanel();
     }
 
     // Own try/catch: this used to be its own observer, so a failure here

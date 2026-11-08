@@ -3356,3 +3356,165 @@ html.vmu-theme-light .vmu-sel-btn { background: #f0f1f3; border-color: rgba(0,0,
 html.vmu-theme-light .vmu-sel-btn:hover:not(:disabled) { background: #e7e9ec; }
 html.vmu-theme-light .vmu-sel-list { border: 1px solid rgba(0,0,0,0.1); }
 html.vmu-theme-light .vmu-sel-search { background: #f0f1f3; border-color: rgba(0,0,0,0.1); }
+
+/* ── Playlist order panel (content.js openPlaylistOrderPanel) ───────────────
+   Cover tiles in a grid (like the catalog's own playlist cards), not rows. */
+#vmu-plorder-btn svg { display: block; color: var(--vmu-text-hint); }
+.vmu-plorder-panel { width: 780px; max-width: calc(100vw - 48px); }
+.vmu-plo-list {
+  max-height: min(560px, calc(100vh - 290px));
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
+  gap: 14px 12px;
+  padding: 4px 6px 4px 2px;
+  align-content: start;
+}
+.vmu-plo-list:empty { display: none; }
+.vmu-plo-list::-webkit-scrollbar { width: 4px; }
+.vmu-plo-list::-webkit-scrollbar-thumb { background: rgba(var(--vmu-ov),0.14); border-radius: 2px; }
+.vmu-plo-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  cursor: grab;
+  user-select: none;
+}
+.vmu-plo-tile:active { cursor: grabbing; }
+.vmu-plo-art {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(var(--vmu-ov),0.08);
+  box-shadow: 0 0 0 1px rgba(var(--vmu-ov),0.06);
+  transition: box-shadow .12s, transform .12s;
+}
+.vmu-plo-tile:hover .vmu-plo-art { box-shadow: 0 0 0 2px rgba(var(--vmu-ov),0.22); }
+.vmu-plo-changed .vmu-plo-art,
+.vmu-plo-changed:hover .vmu-plo-art { box-shadow: 0 0 0 2px #2688eb; }
+.vmu-plo-dragging { opacity: 0.35; }
+.vmu-plo-cover { display: block; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+.vmu-plo-cover-empty { background: rgba(var(--vmu-ov),0.1); }
+.vmu-plo-pos,
+.vmu-plo-meta {
+  position: absolute;
+  bottom: 6px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  background: rgba(0,0,0,0.6);
+  pointer-events: none;
+}
+.vmu-plo-pos { left: 6px; }
+.vmu-plo-meta { right: 6px; font-weight: 500; opacity: 0.9; }
+.vmu-plo-actions {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity .1s;
+}
+.vmu-plo-tile:hover .vmu-plo-actions { opacity: 1; }
+.vmu-plo-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.62);
+  color: #fff;
+  cursor: pointer;
+  transition: background .1s;
+}
+.vmu-plo-btn:hover { background: rgba(38,136,235,0.95); }
+.vmu-plo-title {
+  font-size: 12px;
+  line-height: 1.25;
+  color: var(--vmu-text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+/* Drop position: a vertical bar on the side of the tile the item will land */
+.vmu-plo-drop-before::before,
+.vmu-plo-drop-after::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  height: calc(100% - 38px);
+  min-height: 60px;
+  width: 3px;
+  border-radius: 2px;
+  background: #2688eb;
+  pointer-events: none;
+  z-index: 3;
+}
+.vmu-plo-drop-before::before { left: -8px; }
+.vmu-plo-drop-after::after { right: -8px; }
+.vmu-plmake-busy .vmu-plo-tile { cursor: default; }
+
+/* Playlist order: tiles that are only re-lifted to the top to keep their order (communities) */
+.vmu-plo-info { margin: -2px 0 2px; line-height: 1.4; }
+.vmu-plo-lift .vmu-plo-art { box-shadow: 0 0 0 2px rgba(var(--vmu-ov),0.22); }
+.vmu-plo-lift .vmu-plo-art::after {
+  content: "↑";
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: rgba(0,0,0,0.6);
+  color: #fff;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: center;
+  pointer-events: none;
+}
+.vmu-plo-lift .vmu-plo-art .vmu-plo-cover { opacity: 0.72; }
+
+/* Playlist order: paste-a-list shortcut (IDs or full links, one per line) and
+   the auto-sort-by-author shortcut that sits next to it */
+.vmu-plo-paste-row { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 4px; }
+.vmu-plo-paste-text { max-width: none; min-height: 56px; resize: vertical; line-height: 1.4; }
+.vmu-plo-paste-btns { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+
+/* Playlist order: bury-list — autosort's own parsed authors, offered as
+   toggle chips; clicking one sends that author to the very end on the next
+   auto-sort, after even the unattributed tail */
+.vmu-plo-bury-row { margin: 0 0 6px; }
+.vmu-plo-bury-hint { margin: 0; }
+.vmu-plo-bury-chips { display: flex; flex-wrap: wrap; gap: 5px; max-height: 92px; overflow-y: auto; padding: 1px; }
+.vmu-plo-bury-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(var(--vmu-ov),0.08);
+  color: var(--vmu-text-2);
+  border: 1px solid rgba(var(--vmu-ov),0.12);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.vmu-plo-bury-chip:hover { background: rgba(var(--vmu-ov),0.14); }
+.vmu-plo-bury-chip-n { color: var(--vmu-text-hint-2); font-size: 10px; }
+.vmu-plo-bury-chip-on { background: #2688eb; border-color: #2688eb; color: #fff; }
+.vmu-plo-bury-chip-on:hover { background: #1a7ad4; }
+.vmu-plo-bury-chip-on .vmu-plo-bury-chip-n { color: rgba(255,255,255,0.75); }
