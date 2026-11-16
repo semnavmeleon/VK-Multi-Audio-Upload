@@ -11909,17 +11909,10 @@
     // Default flavour matches VK's old tt_w.tt_black tooltip (used across the
     // legacy audio rows and top-bar icons). Buttons inside the new vkui
     // playlist modal get the vkui-style tooltip via .vmu-tooltip-new.
-    const isNewVk = !!forceNew
-      || btn.classList.contains('vmu-single-dl-vkit')
-      || btn.classList.contains('vmu-single-dl-after')
-      || btn.classList.contains('vmu-audiofx-btn')
-      || btn.id === 'vmu-bulkops-btn'
-      || btn.id === 'vmu-toolbar-settings-btn'
-      || btn.id === 'vmu-toolbar-sc-btn'
-      || btn.classList.contains('vmu-help-icon') // long hints: wrapped vkui bubble, not one endless legacy line
-      || btn.classList.contains('vmu-swap-btn')  // original ↔ community toggle (panel + VK's native block)
-      || !!btn.closest('#vmu-overlay-panel')
-      || !!btn.closest('.vmu-settings-modal'); // the settings window is new-VK styled throughout
+    // One look for every bubble of the extension: the current VK one (dark, rounded,
+    // wrapped). The legacy translucent black one (tt_black) is gone — it showed on the
+    // toolbar buttons that were not on the old «new-style» list and looked foreign.
+    const isNewVk = true;
     el.classList.toggle('vmu-tooltip-new', isNewVk);
     // Reset placement modifier before measuring so layout reflects the
     // default-above tail height.
@@ -11953,14 +11946,29 @@
   // of them — present now or added later — without touching those call
   // sites: on hover, swap title for data-vmu-tip (so the browser's own
   // tooltip doesn't also render) and show our bubble; on leave, swap back.
-  // Scoped to elements inside something carrying a vmu- id/class so this
-  // never touches VK's own native title="" tooltips elsewhere on the page.
+  // Covers the whole page, VK's own title="" included: the browser's grey native
+  // tooltip next to our bubbles looked like two different apps. (Only the title is
+  // taken off while the pointer is over the element and put back on leave.)
   let _vmuTitleHoverEl = null;
+  const _tipRelease = () => {
+    const el = _vmuTitleHoverEl;
+    if (!el) return;
+    const text = el.getAttribute('data-vmu-tip');
+    if (text && !el.hasAttribute('title') && el.isConnected) el.setAttribute('title', text);
+    el.removeAttribute('data-vmu-tip');
+    _vmuTitleHoverEl = null;
+    hideDlTooltip();
+  };
   document.addEventListener('mouseover', e => {
+    if (!(e.target instanceof Element)) return;
+    // still inside the element whose title is currently shown (its title is already
+    // taken off, so closest('[title]') would find an ancestor instead)
+    if (_vmuTitleHoverEl && _vmuTitleHoverEl.contains(e.target)) return;
     const el = e.target.closest('[title]');
-    if (!el || el === _vmuTitleHoverEl) return;
-    const text = el.getAttribute('title');
-    if (!text || !el.closest('[id^="vmu-"], [class*="vmu-"]')) return;
+    if (!el || el.closest('#vmu-tooltip')) return;
+    const text = (el.getAttribute('title') || '').trim();
+    if (!text) return;
+    if (_vmuTitleHoverEl) _tipRelease();
     _vmuTitleHoverEl = el;
     el.setAttribute('data-vmu-tip', text);
     el.removeAttribute('title');
@@ -11975,13 +11983,13 @@
     // entirely) should hide the tooltip, not moving from the element onto
     // its own child icon/text.
     if (e.relatedTarget && _vmuTitleHoverEl.contains(e.relatedTarget)) return;
-    const el = _vmuTitleHoverEl;
-    const text = el.getAttribute('data-vmu-tip');
-    if (text) el.setAttribute('title', text);
-    el.removeAttribute('data-vmu-tip');
-    _vmuTitleHoverEl = null;
-    hideDlTooltip();
+    _tipRelease();
   }, true);
+  // an element that is clicked, scrolled away or re-rendered under the pointer does not
+  // always get a mouseout — the bubble must not stay behind
+  document.addEventListener('mousedown', () => { if (_vmuTitleHoverEl) _tipRelease(); }, true);
+  window.addEventListener('scroll', () => { if (_vmuTitleHoverEl) _tipRelease(); }, { passive: true, capture: true });
+  setInterval(() => { if (_vmuTitleHoverEl && !_vmuTitleHoverEl.isConnected) _tipRelease(); }, 700);
 
   function makeSingleDlBtn(row, extraClass) {
     const btn = document.createElement('button');
