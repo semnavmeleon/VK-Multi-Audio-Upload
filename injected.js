@@ -4702,11 +4702,44 @@
       else panelEl.appendChild(sw);
     }
 
+    // A text line that never wraps: a long title / credit is cut with an ellipsis
+    // and cannot make the block taller or push the controls beside it.
+    function oneLine(el) {
+      el.style.whiteSpace = 'nowrap';
+      el.style.overflow = 'hidden';
+      el.style.textOverflow = 'ellipsis';
+      el.style.minWidth = '0';
+    }
+
     // Texts / bars of the copy are ours, everything else stays native.
     function applyOverrides(match) {
       if (!panelCtl) return;
-      if (panelCtl.titleEl) panelCtl.titleEl.textContent = decodeEntities(match.title || '');
-      if (panelCtl.extraEl) panelCtl.extraEl.textContent = decodeEntities(match.artist || '');
+      if (panelCtl.titleEl) {
+        panelCtl.titleEl.textContent = decodeEntities(match.title || '');
+        oneLine(panelCtl.titleEl);
+      }
+      if (panelCtl.extraEl) {
+        // The artist line is VK's «extra» box wrapping a one-line-clamped div that
+        // holds the author links. Replacing the whole box with plain text dropped
+        // that clamp, so a long credit ("FRIENDLY THUG 52 NGG & kizaru") wrapped to
+        // a second line, made the block taller and pushed the controls around.
+        // The text goes inside the clamped div instead, in a span that keeps the
+        // links' look, and the line is forced to a single ellipsised line anyway.
+        const extra = panelCtl.extraEl;
+        const artist = decodeEntities(match.artist || '');
+        const inner = extra.firstElementChild;
+        if (inner) {
+          const link = inner.querySelector('a');
+          const span = document.createElement('span');
+          if (link) span.className = link.className;
+          span.textContent = artist;
+          inner.replaceChildren(span);
+          oneLine(inner);
+        } else {
+          extra.textContent = artist;
+        }
+        oneLine(extra);
+      }
       if (panelCtl.noticeIcon) panelCtl.noticeIcon.style.display = 'none';
       if (panelCtl.progressBar) {
         ensureReadyBar();

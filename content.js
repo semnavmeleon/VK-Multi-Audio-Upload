@@ -2563,6 +2563,19 @@
     _pinQ[key] = { t: now, v };
     return v;
   }
+  // The section's padding-top changes by a known amount when the bar is pinned /
+  // released, and everything below the header (and so the page-background notch
+  // faking the second card) moves with it. Moving the notch by the same amount
+  // right here keeps it in step in the same frame; waiting for the next full
+  // applyAudioHeaderSplit (a throttled mutation pass) left it a few hundred ms
+  // behind — one of the visible stages of the transition.
+  function shiftSplitMasks(section, d) {
+    if (!d) return;
+    for (const m of section.querySelectorAll(':scope > .vmu-split-mask')) {
+      const t = parseFloat(m.style.top);
+      if (!isNaN(t)) m.style.top = (t + d) + 'px';
+    }
+  }
   function applyTabsBarPin() {
     const sections = pinQuery('hdr', '[data-testid="AudioCatalog_Header"]', true);
     // This runs on every throttled page mutation (see onPageMutated), on
@@ -2576,6 +2589,8 @@
     const needLayout = !!settings.pinTabsBar && sections.length > 0;
     let anchor = 0;
     let mmCard = null;
+    let playerBlocks = [];
+    let mergeNow = null; // null: no player block on the page, fall back to the tabs' own position
     if (needLayout) {
       const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
       const topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
@@ -2589,11 +2604,27 @@
       // all matches always lands on whichever is actually visible.
       let playerBottom = 0;
       let visiblePlayerBlock = null;
-      for (const pb of pinQuery('pb', '[data-testid="AudioPage_PlayerBlock"]', true)) {
-        const b = pb.getBoundingClientRect().bottom;
-        if (b > playerBottom) { playerBottom = b; visiblePlayerBlock = pb; }
+      let minTop = Infinity, playerH = 0;
+      // fresh on every call (not cached): the appearance of VK's second, pinned copy is
+      // exactly the event the merge has to catch
+      playerBlocks = [...document.querySelectorAll('[data-testid="AudioPage_PlayerBlock"]')];
+      for (const pb of playerBlocks) {
+        const r = pb.getBoundingClientRect();
+        if (r.bottom > playerBottom) { playerBottom = r.bottom; visiblePlayerBlock = pb; }
+        if (r.top < minTop) minTop = r.top;
+        if (r.height > playerH) playerH = r.height;
       }
-      anchor = Math.round(Math.max(48, topBarBottom, playerBottom));
+      // The anchor is where VK's PINNED player copy sits — the top bar's bottom
+      // plus the block's own height — a constant. It used to follow whichever
+      // copy was lower at the moment, so it moved by a few pixels as VK swapped
+      // its copies mid-scroll: one more of the separate steps of the transition.
+      anchor = Math.round(Math.max(48, playerH ? topBarBottom + playerH : topBarBottom, playerH ? 0 : playerBottom));
+      // The merge starts at the very moment VK switches from the in-flow player
+      // to its pinned copy (a second copy appears / the in-flow one reaches the
+      // top bar), not later when the tabs happen to scroll up to the anchor — that
+      // delay was what made the player's corners flatten first and the tabs and
+      // the search box follow one after another a bit further down the scroll.
+      mergeNow = playerBlocks.length >= 2 || (playerBlocks.length > 0 && minTop <= topBarBottom + 0.5);
 
       // The multimedia card (AudioPage_PlayerBlock's own vkitInternalGroupCard
       // wrapper) draws its "border" via a uniform inset box-shadow on ::before,
@@ -2629,6 +2660,10 @@
           el.classList.remove('vmu-tabs-pinned', 'vmu-pin-top', 'vmu-pin-bottom');
           el.style.top = el.style.left = el.style.width = el.style.background = '';
         }
+        const curPad = parseFloat(section.style.paddingTop);
+        if (!isNaN(curPad) && section.dataset.vmuBasePadTop !== undefined) {
+          shiftSplitMasks(section, (Number(section.dataset.vmuBasePadTop) || 0) - curPad);
+        }
         section.style.paddingTop = '';
       };
 
@@ -2646,7 +2681,9 @@
       const tabsOffset = Number(section.dataset.vmuTabsOffset) || 0;
       const naturalTabsViewportTop = section.getBoundingClientRect().top + tabsOffset;
 
-      if (naturalTabsViewportTop > anchor) { unpin(); continue; }
+      // With a player block the merge follows VK's own switch; without one the
+      // old rule (the tabs reached the anchor while scrolling) applies.
+      if (mergeNow === null ? naturalTabsViewportTop > anchor : !mergeNow) { unpin(); continue; }
 
       const basePad = Number(section.dataset.vmuBasePadTop) || 0;
       const nowBg = performance.now();
@@ -2657,32 +2694,76 @@
       const bg = section.__vmuBg;
       const sRect = section.getBoundingClientRect(); // already reflects any active content-offset shift
 
+      // The heights of the tabs row and the search box are measured while they
+      // are still in the flow (re-measured at most once a second), so that the
+      // moment they get pinned there is nothing left to READ: all the style
+      // writes below land together and the browser lays the page out once, in
+      // that frame. Reading a height after writing the position (as before) forced
+      // a full layout of the whole page between the writes — twice.
+      if (!tabs.classList.contains('vmu-tabs-pinned')) {
+        const nowH = performance.now();
+        if (section.__vmuTabsH === undefined || nowH - (section.__vmuHAt || 0) > 1000) {
+          section.__vmuHAt = nowH;
+          section.__vmuTabsH = tabs.getBoundingClientRect().height;
+          section.__vmuSearchH = isSearchWrap ? search.getBoundingClientRect().height : 0;
+        }
+      }
+      let tabsH = section.__vmuTabsH;
+      let searchH = section.__vmuSearchH || 0;
+      const measured = tabsH !== undefined;
+
       anyEngaged = true;
       tabs.classList.add('vmu-tabs-pinned', 'vmu-pin-top');
       tabs.style.left = sRect.left + 'px';
       tabs.style.width = sRect.width + 'px';
       tabs.style.top = anchor + 'px';
       tabs.style.background = bg;
-      const tabsH = tabs.getBoundingClientRect().height;
+      if (!measured) tabsH = tabs.getBoundingClientRect().height; // first time ever: no cached height yet
 
-      let searchH = 0;
       if (isSearchWrap) {
         search.classList.add('vmu-tabs-pinned', 'vmu-pin-bottom');
         search.style.left = sRect.left + 'px';
         search.style.width = sRect.width + 'px';
         search.style.top = (anchor + tabsH) + 'px';
         search.style.background = bg;
-        searchH = search.getBoundingClientRect().height;
+        if (!measured) searchH = search.getBoundingClientRect().height;
       } else {
         // No separate search wrapper on this tab — tabs is the last piece,
         // so it needs the bottom rounding+border itself.
         tabs.classList.add('vmu-pin-bottom');
       }
+      // (heights read while already pinned include the border — not cached; the next unpinned pass measures the natural ones)
 
-      section.style.paddingTop = (basePad + tabsH + searchH) + 'px';
+      // Exactly what the bar occupied in the flow (the unpinned heights), so the content
+      // below does not move by even a pixel at the moment of the merge. (The pinned bar is
+      // 1 px taller — its bottom border — which just overlaps the notch gap below it; heights
+      // read while already pinned include that pixel, hence the -1 in that rare path.)
+      const newPad = basePad + tabsH + searchH - (measured ? 0 : 1);
+      const oldPad = parseFloat(section.style.paddingTop);
+      shiftSplitMasks(section, newPad - (isNaN(oldPad) ? basePad : oldPad));
+      section.style.paddingTop = newPad + 'px';
     }
 
-    if (mmCard) mmCard.classList.toggle('vmu-multimedia-flat', anyEngaged);
+    const wasEngaged = _pinEngagedState;
+    _pinEngagedState = anyEngaged;
+    if (mmCard) {
+      for (const pb of playerBlocks) {
+        const card = pb.closest('section');
+        if (!card) continue;
+        card.classList.toggle('vmu-multimedia-flat', anyEngaged);
+        // The player card's corners are switched by VK itself (flat on its pinned
+        // copy, rounded on the in-flow one), from its own scroll handling — which
+        // runs later than ours and left the corners changing a good while after
+        // everything else. The merge therefore sets the corners itself, in the same
+        // pass: flat while merged, and for a moment after the release rounded again,
+        // until VK has caught up.
+        if (anyEngaged) card.classList.remove('vmu-multimedia-round');
+        else if (wasEngaged) {
+          card.classList.add('vmu-multimedia-round');
+          setTimeout(() => card.classList.remove('vmu-multimedia-round'), 700);
+        }
+      }
+    }
     // Layout reads were skipped: nothing can be engaged, so just make sure a
     // flat-card class left over from an earlier pinned state is cleared.
     else if (!needLayout) document.querySelector('.vmu-multimedia-flat')?.classList.remove('vmu-multimedia-flat');
@@ -2694,7 +2775,16 @@
     applyTabsBarPin();
   }
   window.addEventListener('resize', applyAudioCatalogLayout);
-  window.addEventListener('scroll', () => { if (settings.pinTabsBar) applyTabsBarPin(); }, { passive: true });
+  var _pinEngagedState = false;
+  window.addEventListener('scroll', () => {
+    if (!settings.pinTabsBar) return;
+    const before = _pinEngagedState;
+    applyTabsBarPin();
+    // VK swaps its player copies in its own handler, possibly a frame after ours:
+    // when the merge state just flipped, apply once more next frame so the
+    // anchor and the flat card follow the new copy at once
+    if (_pinEngagedState !== before) requestAnimationFrame(applyTabsBarPin);
+  }, { passive: true });
 
   // Splits off trailing reuploader/site watermarks (e.g. "(hitmos.fm)",
   // "[vk.com/reuploadunder]") from a filename fragment or raw ID3 tag value.
