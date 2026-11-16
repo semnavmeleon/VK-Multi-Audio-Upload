@@ -1189,6 +1189,8 @@ html.vmu-theme-light {
   line-height: 1.2;
   box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
 }
+/* long hints: wrap at explicit line breaks / a narrow width instead of one endless line */
+#vmu-tooltip.vmu-tooltip-new { white-space: pre-line; max-width: 250px; line-height: 1.35; }
 #vmu-tooltip.vmu-tooltip-new::after {
   border-top-color: rgb(50,50,50);
 }
@@ -3518,3 +3520,267 @@ html.vmu-theme-light .vmu-sel-search { background: #f0f1f3; border-color: rgba(0
 .vmu-plo-bury-chip-on { background: #2688eb; border-color: #2688eb; color: #fff; }
 .vmu-plo-bury-chip-on:hover { background: #1a7ad4; }
 .vmu-plo-bury-chip-on .vmu-plo-bury-chip-n { color: rgba(255,255,255,0.75); }
+
+/* ══ Settings window — rail + panes ══════════════════════════════════════════
+   Left rail of sections, right side = heading + search + one pane at a time
+   (all panes while searching). Every colour goes through the theme tokens, so
+   the light theme needs nothing special. Old .vmu-settings-section / -tabs
+   rules above are no longer used by this window. */
+.vmu-settings-modal {
+  width: 820px;
+  max-width: calc(100vw - 32px);
+  height: 640px;
+  max-height: calc(100vh - 100px);
+}
+.vmu-settings-modal .vmu-bulkops-body { padding: 0; flex: 1 1 auto; min-height: 0; overflow: hidden; }
+.vmu-settings-modal #vmu-settings-panel { height: 100%; }
+.vmu-sx-shell { display: flex; height: 100%; min-height: 0; }
+
+/* rail */
+.vmu-sx-nav {
+  flex: 0 0 188px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 10px;
+  border-right: 1px solid rgba(var(--vmu-ov),0.07);
+  background: rgba(var(--vmu-ov),0.02);
+  overflow-y: auto;
+}
+.vmu-sx-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  color: var(--vmu-text-muted);
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  padding: 9px 10px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.vmu-sx-nav-item:hover { background: rgba(var(--vmu-ov),0.06); color: var(--vmu-text-2); }
+.vmu-sx-nav-item.active { background: rgba(38,136,235,0.16); color: #4a9df0; }
+html.vmu-theme-light .vmu-sx-nav-item.active { color: #1f6fc6; }
+.vmu-sx-nav-ico { display: inline-flex; flex-shrink: 0; }
+.vmu-sx-nav-foot { margin-top: auto; padding: 10px 10px 2px; font-size: 11px; color: var(--vmu-text-dim); line-height: 1.35; }
+
+/* main column */
+.vmu-sx-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.vmu-sx-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px 12px;
+  border-bottom: 1px solid rgba(var(--vmu-ov),0.07);
+  flex-shrink: 0;
+}
+.vmu-sx-heading { min-width: 0; }
+.vmu-sx-h1 { font-size: 16px; font-weight: 600; color: var(--vmu-text); line-height: 1.25; }
+.vmu-sx-h2 { font-size: 12px; color: var(--vmu-text-dim); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vmu-sx-search { position: relative; flex: 0 0 220px; display: block; }
+.vmu-sx-search-ico {
+  position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+  display: inline-flex; color: var(--vmu-text-dim); pointer-events: none;
+}
+.vmu-sx-search input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--vmu-text);
+  background: rgba(var(--vmu-ov),0.06);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 7px 10px 7px 30px;
+  outline: none;
+  transition: border-color .12s, background .12s;
+}
+.vmu-sx-search input::placeholder { color: var(--vmu-text-dim); }
+.vmu-sx-search input:focus { border-color: #2688eb; background: rgba(var(--vmu-ov),0.04); }
+
+.vmu-sx-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 14px 20px 22px; }
+.vmu-sx-scroll::-webkit-scrollbar { width: 6px; }
+.vmu-sx-scroll::-webkit-scrollbar-thumb { background: rgba(var(--vmu-ov),0.14); border-radius: 3px; }
+.vmu-sx-pane { display: flex; flex-direction: column; gap: 12px; }
+/* the heading above already names the pane — the title only shows in search
+   results, where several panes are stacked */
+.vmu-sx-pane-title { display: none; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--vmu-text-dim); margin-top: 6px; }
+.vmu-sx-searching .vmu-sx-pane-title { display: block; }
+.vmu-sx-searching .vmu-sx-pane { margin-bottom: 8px; }
+.vmu-sx-stack { display: flex; flex-direction: column; gap: 12px; }
+.vmu-sx-hidden { display: none !important; }
+.vmu-sx-nomatch { display: none !important; }
+.vmu-sx-empty { padding: 40px 0; text-align: center; font-size: 13px; color: var(--vmu-text-dim); }
+
+/* cards + rows */
+.vmu-sx-card, .vmu-sx-group {
+  background: rgba(var(--vmu-ov),0.035);
+  border: 1px solid rgba(var(--vmu-ov),0.07);
+  border-radius: 12px;
+}
+.vmu-sx-card-title {
+  padding: 11px 16px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--vmu-text-dim);
+}
+.vmu-sx-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 11px 16px;
+  border-top: 1px solid rgba(var(--vmu-ov),0.06);
+  min-height: 24px;
+}
+.vmu-sx-card > .vmu-sx-row:first-child { border-top: none; }
+.vmu-sx-card-title + .vmu-sx-row { border-top: none; }
+.vmu-sx-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 auto; }
+.vmu-sx-label { font-size: 13px; font-weight: 500; color: var(--vmu-text-2); line-height: 1.3; }
+.vmu-sx-hint { font-size: 11.5px; color: var(--vmu-text-dim); line-height: 1.4; }
+.vmu-sx-ctl { display: flex; align-items: center; justify-content: flex-end; flex: 0 0 auto; gap: 8px; }
+.vmu-sx-row-stack { flex-direction: column; align-items: stretch; gap: 9px; }
+.vmu-sx-row-stack .vmu-sx-ctl { justify-content: flex-start; flex: 1 1 auto; }
+.vmu-sx-row-stack .vmu-sx-ctl > * { max-width: 100%; }
+.vmu-sx-row-stack .vmu-sx-input { width: 100%; }
+.vmu-sx-row-stack .vmu-sx-slider { width: 100%; }
+.vmu-sx-row-stack .vmu-sx-slider .vmu-slider { flex: 1 1 auto; width: auto; }
+/* dependent options sit indented under the one they depend on */
+.vmu-sx-sub { padding-left: 34px; position: relative; }
+.vmu-sx-sub::before { content: ''; position: absolute; left: 20px; top: 0; bottom: 0; width: 2px; background: rgba(38,136,235,0.28); border-radius: 1px; }
+.vmu-sx-sub2 { padding-left: 52px; }
+.vmu-sx-sub2::before { left: 38px; }
+.vmu-sx-sub3 { padding-left: 70px; }
+.vmu-sx-sub3::before { left: 56px; }
+
+.vmu-sx-note {
+  font-size: 12px;
+  line-height: 1.45;
+  color: #d9a441;
+  background: rgba(217,164,65,0.1);
+  border: 1px solid rgba(217,164,65,0.25);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+html.vmu-theme-light .vmu-sx-note { color: #8a5d0a; }
+.vmu-sx-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: #4a9df0;
+  background: rgba(38,136,235,0.16);
+  border-radius: 5px;
+  vertical-align: 1px;
+}
+.vmu-sx-mini { font-size: 11px; color: var(--vmu-text-dim); }
+
+/* controls */
+.vmu-sx-input {
+  font-family: inherit;
+  font-size: 13px;
+  box-sizing: border-box;
+  color: var(--vmu-text);
+  background: rgba(var(--vmu-ov),0.06);
+  border: 1px solid rgba(var(--vmu-ov),0.12);
+  border-radius: 8px;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color .12s, background .12s;
+}
+.vmu-sx-input:focus { border-color: #2688eb; background: rgba(var(--vmu-ov),0.04); }
+.vmu-sx-input::placeholder { color: var(--vmu-text-dim); }
+.vmu-sx-btn {
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--vmu-text-2);
+  background: rgba(var(--vmu-ov),0.08);
+  border: none;
+  border-radius: 8px;
+  padding: 7px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .12s, color .12s;
+}
+.vmu-sx-btn:hover { background: rgba(var(--vmu-ov),0.14); color: var(--vmu-text); }
+.vmu-sx-btn:active { background: rgba(var(--vmu-ov),0.2); }
+.vmu-sx-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.vmu-sx-coverctl { display: flex; align-items: center; gap: 8px; }
+.vmu-sx-slider { gap: 12px; }
+.vmu-sx-slider .vmu-slider { width: 200px; }
+.vmu-sx-slider .vmu-slider-value { min-width: 54px; font-size: 12px; color: var(--vmu-text-2); }
+
+/* status chip of the swap index */
+.vmu-sx-statusline { padding: 0 16px 12px; }
+.vmu-sx-status {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--vmu-text-muted);
+  background: rgba(var(--vmu-ov),0.05);
+  border-radius: 999px;
+  padding: 5px 12px 5px 10px;
+}
+.vmu-sx-dot { width: 8px; height: 8px; border-radius: 50%; background: #4bb34b; flex-shrink: 0; }
+.vmu-sx-status[data-state="warn"] .vmu-sx-dot { background: #e0a030; }
+.vmu-sx-status[data-state="busy"] .vmu-sx-dot { background: #2688eb; animation: vmu-sx-pulse 1.1s ease-in-out infinite; }
+@keyframes vmu-sx-pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+
+/* obfuscation groups */
+.vmu-sx-group { transition: opacity .15s; }
+.vmu-sx-group-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 11px 16px;
+  border-bottom: 1px solid rgba(var(--vmu-ov),0.06);
+}
+.vmu-sx-group-title { font-size: 13px; font-weight: 600; color: var(--vmu-text-2); flex: 1; }
+.vmu-sx-group-body { transition: opacity .15s; }
+.vmu-sx-group-body.vmu-row-disabled { opacity: 0.38; pointer-events: none; }
+.vmu-sx-group-body > .vmu-sx-row:first-child { border-top: none; }
+.vmu-sx-group-body .vmu-slim-sj-presets, .vmu-sx-group-body .vmu-slim-sj-table-hdr, .vmu-sx-group-body .vmu-slim-sj-row { margin-left: 16px; margin-right: 16px; }
+.vmu-sx-group-body #vmu-slim-sj-add-row { margin: 6px 16px 12px; width: calc(100% - 32px); box-sizing: border-box; }
+.vmu-sx-group-body .vmu-fx-dd { min-width: 150px; }
+.vmu-sx-ctl .vmu-fx-dd-btn { padding: 7px 10px; font-size: 12.5px; border-radius: 8px; }
+
+/* narrow window: the rail keeps only its icons */
+@media (max-width: 880px) {
+  .vmu-sx-nav { flex-basis: 54px; padding: 12px 6px; }
+  .vmu-sx-nav-txt, .vmu-sx-nav-foot { display: none; }
+  .vmu-sx-nav-item { justify-content: center; padding: 10px 0; }
+  .vmu-sx-search { flex-basis: 150px; }
+}
+
+/* ── Notices: SVG check / cross + the short «Подменено» pill ───────────────── */
+.vmu-notice-svg { display: block; }
+.vmu-notice-tick {
+  stroke-dasharray: 14;
+  stroke-dashoffset: 14;
+  animation: vmu-notice-tick .32s .1s ease-out forwards;
+}
+@keyframes vmu-notice-tick { to { stroke-dashoffset: 0; } }
+.vmu-notice-compact {
+  gap: 9px;
+  padding: 7px 16px 7px 8px;
+  border-radius: 999px;
+}
+.vmu-notice-compact .vmu-notice-icon { width: 24px; height: 24px; }
+.vmu-notice-compact .vmu-notice-text { font-size: 13px; font-weight: 500; line-height: 1.2; white-space: nowrap; }
+/* a repeated notice (several swapped tracks in a row) gives a small pulse
+   instead of sliding out and in again */
+.vmu-notice-compact.vmu-notice-pulse { animation: vmu-notice-pulse .34s ease-out; }
+@keyframes vmu-notice-pulse {
+  0%   { transform: translate(-50%, 0) scale(1); }
+  40%  { transform: translate(-50%, 0) scale(1.06); }
+  100% { transform: translate(-50%, 0) scale(1); }
+}

@@ -125,6 +125,13 @@
     if (e.data?.type === 'VK_HANDOFF_DISPATCHED' && e.data.ok) {
       revealNativeUploadUI();
     }
+    // Preview-swap actually replaced what's streaming — the mini-player's own
+    // title/artist still read the original track (only window.ap's internal
+    // identity changed), so without this the user has no visible sign the
+    // swap happened at all.
+    if (e.data?.type === 'VKD_PREVIEW_SWAP_DONE') {
+      showSwapToast();
+    }
   });
 
   // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -151,6 +158,112 @@
       window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
     });
   }
+
+  // ─── preview-track swap ─────────────────────────────────────────────────────
+  // Pushes the feature's on/off state and source-community owner id to
+  // injected.js, which owns the actual player watch + the cached track index
+  // (both live in page context — window.ap and the audio.get fetch can't be
+  // reached from this isolated world). Called once on load and again on every
+  // settings change so injected.js is never out of sync with what's on screen.
+  const PREVIEW_INDEX_META_KEY = 'vmu_preview_swap_index_meta_v1';
+  function sendPreviewSwapConfig() {
+    window.postMessage({
+      type: 'VKD_PREVIEW_SWAP_CONFIG',
+      enabled: !!settings.previewSwapEnabled,
+      ownerId: settings.previewSwapOwnerId || null,
+    }, '*');
+  }
+  function readPreviewIndexMeta() {
+    try { return JSON.parse(localStorage.getItem(PREVIEW_INDEX_META_KEY) || 'null'); } catch { return null; }
+  }
+  function previewIndexStatusText() {
+    const meta = readPreviewIndexMeta();
+    if (previewIndexBuilding) return 'Обновляется в фоне…';
+    if (!meta || !meta.ownerId) return settings.previewSwapEnabled ? 'Индекс ещё не построен — построится автоматически' : 'Индекс ещё не построен';
+    if (String(meta.ownerId) !== String(settings.previewSwapOwnerId || '')) return 'Индекс построен для другого ID — обновится автоматически';
+    const d = new Date(meta.builtAt);
+    const when = isNaN(d.getTime()) ? '' : ` · обновлён ${d.toLocaleString()}`;
+    return `Треков в индексе: ${meta.count}${when}`;
+  }
+  let previewIndexBuilding = false;
+  // Manual call (the button) shows toasts; a silent call is the background
+  // refresh below — progress only goes to the status line in the settings.
+  const PREVIEW_INDEX_LOCK_KEY = 'vmu_preview_swap_index_lock_v1';
+  function setPreviewIndexStatus(text) {
+    const statusEl = document.getElementById('vmu-previewswap-status');
+    if (!statusEl) return;
+    statusEl.textContent = text;
+    const chip = statusEl.closest('.vmu-sx-status');
+    if (chip) chip.setAttribute('data-state', /Обновляется/.test(text) ? 'busy' : /не построен|другого ID/.test(text) ? 'warn' : 'ok');
+  }
+  function rebuildPreviewSwapIndex(opts) {
+    const silent = !!(opts && opts.silent === true);
+    if (previewIndexBuilding) return;
+    const ownerId = (settings.previewSwapOwnerId || '').trim();
+    if (!ownerId || !/^-?\d+$/.test(ownerId)) {
+      if (!silent) showProgressToast('Укажи числовой ID сообщества (например -206614096)', { kind: 'error', id: 'vmu-previewswap-toast' });
+      return;
+    }
+    // Several VK tabs open at once would all start the same long fetch — the
+    // lock (shared through localStorage) lets only one of them do it.
+    try {
+      const lock = Number(localStorage.getItem(PREVIEW_INDEX_LOCK_KEY) || 0);
+      if (silent && Date.now() - lock < 3 * 60 * 1000) return;
+      localStorage.setItem(PREVIEW_INDEX_LOCK_KEY, String(Date.now()));
+    } catch {}
+    const excludePlaylistIds = (settings.previewSwapExcludePlaylists || '')
+      .split(/[\s,]+/).map(s => s.trim()).filter(s => /^\d+$/.test(s)).map(Number);
+    previewIndexBuilding = true;
+    if (silent) setPreviewIndexStatus('Обновляется в фоне…');
+    else showProgressToast('Строим индекс треков сообщества…', { kind: 'progress', id: 'vmu-previewswap-toast' });
+    const onMsg = e => {
+      if (e.source !== window || !e.data) return;
+      if (e.data.type === 'VKD_PREVIEW_INDEX_PROGRESS') {
+        const { loaded, total } = e.data;
+        const txt = `${loaded}${total ? ' из ' + total : ''}`;
+        if (silent) setPreviewIndexStatus('Обновляется в фоне… ' + txt);
+        else showProgressToast(`Строим индекс треков сообщества… (${txt})`, { kind: 'progress', id: 'vmu-previewswap-toast' });
+      } else if (e.data.type === 'VKD_PREVIEW_INDEX_DONE') {
+        window.removeEventListener('message', onMsg);
+        previewIndexBuilding = false;
+        try { localStorage.removeItem(PREVIEW_INDEX_LOCK_KEY); } catch {}
+        if (e.data.ok) {
+          if (!silent) showProgressToast(`Индекс построен: ${e.data.count} треков`, { kind: 'done', id: 'vmu-previewswap-toast' });
+        } else if (silent) {
+          console.warn('[vmu] фоновое обновление индекса не удалось:', e.data.error);
+        } else {
+          showProgressToast('Не удалось построить индекс: ' + translateError(e.data.error || ''), { kind: 'error', id: 'vmu-previewswap-toast' });
+        }
+        setPreviewIndexStatus(previewIndexStatusText());
+      }
+    };
+    window.addEventListener('message', onMsg);
+    window.postMessage({ type: 'VKD_BUILD_PREVIEW_INDEX', ownerId: Number(ownerId), excludePlaylistIds }, '*');
+  }
+
+  // Background upkeep of the index: built on first use, then refreshed when
+  // it is old, when the source / exclusions change, and — throttled — when a
+  // restricted track found no counterpart (a fresh upload is the usual
+  // reason). Nothing here needs a click or interrupts anything.
+  const PREVIEW_INDEX_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+  const PREVIEW_INDEX_MISS_AGE_MS = 30 * 60 * 1000;
+  function autoRefreshPreviewIndex(reason) {
+    if (!settings.previewSwapEnabled) return;
+    const ownerId = (settings.previewSwapOwnerId || '').trim();
+    if (!ownerId || !/^-?\d+$/.test(ownerId)) return;
+    const meta = readPreviewIndexMeta();
+    const same = !!(meta && String(meta.ownerId) === ownerId && meta.builtAt);
+    const age = same ? Date.now() - meta.builtAt : Infinity;
+    const minAge = reason === 'settings' ? 0 : reason === 'miss' ? PREVIEW_INDEX_MISS_AGE_MS : PREVIEW_INDEX_MAX_AGE_MS;
+    if (age < minAge) return;
+    rebuildPreviewSwapIndex({ silent: true });
+  }
+  setTimeout(() => autoRefreshPreviewIndex('load'), 4000);
+  setInterval(() => autoRefreshPreviewIndex('timer'), 20 * 60 * 1000);
+  window.addEventListener('message', e => {
+    if (e.source === window && e.data && e.data.type === 'VKD_PREVIEW_INDEX_MISS') autoRefreshPreviewIndex('miss');
+  });
+
   const isMP3 = (f) => f.type === 'audio/mpeg' || f.name.toLowerCase().endsWith('.mp3');
   const fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
   const escHtml = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -213,7 +326,8 @@
     slimBd: true, slimBdType: 0,
     slimBitrate: 320, slimVolume: 100,
     slimPreserveMeta: true, slimPreserveCover: true,
-    slimCommunityTag: false, slimCommunityTagText: '' };
+    slimCommunityTag: false, slimCommunityTagText: '',
+    previewSwapEnabled: false, previewSwapOwnerId: '', previewSwapExcludePlaylists: '' };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -323,6 +437,8 @@
         slimBitrate: settings.slimBitrate, slimVolume: settings.slimVolume,
         slimPreserveMeta: settings.slimPreserveMeta, slimPreserveCover: settings.slimPreserveCover,
         slimCommunityTag: settings.slimCommunityTag, slimCommunityTagText: settings.slimCommunityTagText,
+        previewSwapEnabled: settings.previewSwapEnabled, previewSwapOwnerId: settings.previewSwapOwnerId,
+        previewSwapExcludePlaylists: settings.previewSwapExcludePlaylists,
       };
       for (const key of AUDIOFX_FIELD_KEYS) out[key] = settings[key];
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(out));
@@ -381,6 +497,7 @@
   const AUDIOFX_DEFAULTS = snapshotAudioFxSettings();
 
   loadSettings();
+  sendPreviewSwapConfig();
 
   // Seeds a "Базовый" preset with the factory defaults the first time the
   // preset store doesn't have one (fresh install, or a store that predates
@@ -5552,13 +5669,38 @@
     if (toolbarBtn) toolbarBtn.style.color = '#2688eb';
   }
 
-  let settingsActiveTab = 'general';
+  let settingsActiveTab = 'upload';
   let vmuDdOutsideClickBound = false;
+
+  // Sections of the settings window (left rail). `id` is also the pane id.
+  const SX_ICON = {
+    upload:   '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M5 20h14"/></svg>',
+    swap:     '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8h13"/><path d="M15 5l3 3-3 3"/><path d="M19 16H6"/><path d="M9 13l-3 3 3 3"/></svg>',
+    ui:       '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M9.5 4.5v15"/></svg>',
+    download: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12"/><path d="M7 11l5 5 5-5"/><path d="M5 20h14"/></svg>',
+    slim:     '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h2.5l2-6 3 12 3-9 2 5 1.5-2H21"/></svg>',
+    search:   '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/></svg>',
+  };
+  const SX_SECTIONS = [
+    { id: 'upload',   title: 'Загрузка',       sub: 'Режим работы, плейлист, обложка и метаданные' },
+    { id: 'swap',     title: 'Подмена треков', sub: 'Треки играют в версиях из вашего сообщества' },
+    { id: 'ui',       title: 'Интерфейс',      sub: 'Колонки, панели и положение контента' },
+    { id: 'download', title: 'Скачивание',     sub: 'Скачивание плейлистов' },
+    { id: 'slim',     title: 'Обфускация',     sub: 'Приёмы, которые меняют звук и метаданные при загрузке' },
+  ];
+
+  // Visual state of the index status line: ok / busy / warn.
+  function previewIndexState(text) {
+    if (/Обновляется/.test(text)) return 'busy';
+    if (/не построен|другого ID/.test(text)) return 'warn';
+    return 'ok';
+  }
 
   function buildSettingsPanel() {
     const hasCover = !!settings.coverDataUrl;
     const isCheck = settings.workMode === 'check';
-    const tab = settingsActiveTab;
+    // anything saved from the old two-tab layout opens on the first section
+    const tab = SX_SECTIONS.some(s => s.id === settingsActiveTab) ? settingsActiveTab : 'upload';
     const slimOn = settings.slimEnabled;
     const slimSjOk = slimOn && settings.slimSj;
     const slimRdOk = slimOn && settings.slimRd;
@@ -5568,382 +5710,223 @@
     const slimTagOk = slimOn && settings.slimCommunityTag;
     const BROKEN_TYPES = ['HUGE (1–10 часов)', 'TINY (0–3 сек)', 'RANDOM (1–120 мин)', 'MAX'];
     const QUALITY_PRESETS = ['320 kbps', '256 kbps', '192 kbps', '128 kbps'];
-    return `
-      <div id="vmu-settings-panel" style="display:none">
-        <div class="vmu-settings-tabs" id="vmu-settings-tabs">
-          <button class="vmu-settings-tab${tab === 'general' ? ' active' : ''}" data-vmu-settings-tab="general">Основные</button>
-          <button class="vmu-settings-tab${tab === 'slim' ? ' active' : ''}" data-vmu-settings-tab="slim">Обфускация</button>
+
+    // ── small builders ──────────────────────────────────────────────────────
+    const tgl = (id, on) => `<label class="vmu-toggle"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>`;
+    // One setting: label + hint on the left, its control on the right.
+    // o.stack puts the control under the text (inputs that need the width).
+    const row = (label, hint, ctl, o = {}) => `
+      <div class="vmu-sx-row${o.stack ? ' vmu-sx-row-stack' : ''}${o.cls ? ' ' + o.cls : ''}"${o.id ? ` id="${o.id}"` : ''}>
+        <div class="vmu-sx-info">
+          <span class="vmu-sx-label">${label}</span>
+          ${hint ? `<span class="vmu-sx-hint">${hint}</span>` : ''}
         </div>
-        <div id="vmu-settings-tab-general"${tab !== 'general' ? ' style="display:none"' : ''}>
-        <div class="vmu-settings-section" id="vmu-general-section">
-          <div class="vmu-setting-row vmu-setting-row-wide">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Режим работы</span>
-              <span class="vmu-setting-hint">Проверка — сверить имена файлов с треками на странице, без загрузки</span>
-            </div>
-            <div class="vmu-mode-switch" id="vmu-mode-switch" role="tablist">
-              <button type="button" data-vmu-mode="upload" class="${isCheck ? '' : 'active'}">Загрузка</button>
-              <button type="button" data-vmu-mode="check" class="${isCheck ? 'active' : ''}">Проверка</button>
-            </div>
-          </div>
-
-          <div class="vmu-setting-row ${isCheck ? '' : 'vmu-row-disabled'}" id="vmu-check-scope-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Сканировать всю страницу</span>
-              <span class="vmu-setting-hint">По умолчанию — только первые 100 треков</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-check-fullpage-toggle" ${settings.checkFullPage ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Закрепить сайдбар</span>
-              <span class="vmu-setting-hint">Левая колонка следует за прокруткой страницы</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-pin-sidebar-toggle" ${settings.pinSidebar ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div class="vmu-setting-row vmu-slider-row vmu-setting-row-wide">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Смещение контента</span>
-              <span class="vmu-setting-hint">Сдвиг сайдбара и основной колонки по горизонтали</span>
-            </div>
-            <div class="vmu-slider-wrap">
-              <input type="range" id="vmu-offset-x" class="vmu-slider" min="-400" max="400" step="5" value="${settings.contentOffsetX}">
-              <span class="vmu-slider-value" id="vmu-offset-x-val">${settings.contentOffsetX > 0 ? '+' : ''}${settings.contentOffsetX}px</span>
-              <button type="button" id="vmu-offset-x-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
-            </div>
-          </div>
-
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Оптимизация больших плейлистов</span>
-              <span class="vmu-setting-hint">Пропускать рендеринг строк за пределами экрана — меньше лагов при скролле длинных списков</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-optimize-toggle" ${settings.optimizeBigPlaylists ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Скрыть кнопку «Наверх»</span>
-              <span class="vmu-setting-hint">Полностью убрать левую полосу со скроллом наверх</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-hide-stl-toggle" ${settings.hideScrollToTop ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Скрыть «Музыка друзей»</span>
-              <span class="vmu-setting-hint">Убрать блок с прослушанным у друзей на странице «Моя музыка»</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-hide-friends-music-toggle" ${settings.hideFriendsMusic ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Закрепить панель вкладок</span>
-              <span class="vmu-setting-hint">«Моя музыка» / «Обзор» / поиск сливаются с верхней панелью при прокрутке</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-pin-tabs-toggle" ${settings.pinTabsBar ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div class="vmu-setting-row vmu-slider-row vmu-setting-row-wide">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Потоков скачивания</span>
-              <span class="vmu-setting-hint">Сколько треков плейлиста скачивать одновременно</span>
-            </div>
-            <div class="vmu-slider-wrap">
-              <input type="range" id="vmu-dl-threads" class="vmu-slider" min="1" max="25" step="1" value="${settings.downloadThreads}">
-              <span class="vmu-slider-value" id="vmu-dl-threads-val">${settings.downloadThreads}</span>
-              <button type="button" id="vmu-dl-threads-reset" class="vmu-slider-reset" title="Сбросить">↺</button>
-            </div>
-          </div>
+        <div class="vmu-sx-ctl">${ctl}</div>
+      </div>`;
+    const card = (title, body, o = {}) => `
+      <div class="vmu-sx-card${o.cls ? ' ' + o.cls : ''}"${o.id ? ` id="${o.id}"` : ''}>
+        ${title ? `<div class="vmu-sx-card-title">${title}</div>` : ''}
+        ${body}
+      </div>`;
+    const slider = (id, min, max, step, val, shown, reset) => `
+      <div class="vmu-slider-wrap vmu-sx-slider">
+        <input type="range" id="${id}" class="vmu-slider" min="${min}" max="${max}" step="${step}" value="${val}">
+        <span class="vmu-slider-value" id="${id}-val">${shown}</span>
+        ${reset ? `<button type="button" id="${id}-reset" class="vmu-slider-reset" title="Сбросить">↺</button>` : ''}
+      </div>`;
+    // A group of the obfuscation pane: a header with its own switch + a body.
+    const group = (id, toggleId, checked, title, body, bodyOk) => `
+      <div class="vmu-sx-group${slimOn ? '' : ' vmu-row-disabled'}" id="${id}-group">
+        <div class="vmu-sx-group-head">
+          ${tgl(toggleId, checked)}
+          <span class="vmu-sx-group-title">${title}</span>
         </div>
+        <div class="vmu-sx-group-body${bodyOk ? '' : ' vmu-row-disabled'}" id="${id}-body">${body}</div>
+      </div>`;
 
-        <div class="vmu-settings-section ${isCheck ? 'vmu-row-disabled' : ''}" id="vmu-upload-only-section">
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Авто-плейлист</span>
-              <span class="vmu-setting-hint">Создать плейлист после загрузки</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-ap-toggle" ${settings.autoPlaylist ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
+    const indexStatus = previewIndexStatusText();
+    const offsetShown = `${settings.contentOffsetX > 0 ? '+' : ''}${settings.contentOffsetX}px`;
 
-          <div class="vmu-setting-row ${settings.autoPlaylist ? '' : 'vmu-row-disabled'}" id="vmu-dupcheck-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Проверка дубликатов плейлиста</span>
-              <span class="vmu-setting-hint">Спрашивать перед созданием, если плейлист с таким названием уже есть</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-dupcheck-toggle" ${settings.dupPlaylistCheck ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
+    // ── panes ───────────────────────────────────────────────────────────────
+    const paneUpload = `
+      ${card('Режим работы', `
+        ${row('Режим', 'Проверка — сверить имена файлов с треками на странице, без загрузки', `
+          <div class="vmu-mode-switch" id="vmu-mode-switch" role="tablist">
+            <button type="button" data-vmu-mode="upload" class="${isCheck ? '' : 'active'}">Загрузка</button>
+            <button type="button" data-vmu-mode="check" class="${isCheck ? 'active' : ''}">Проверка</button>
+          </div>`)}
+        ${row('Сканировать всю страницу', 'По умолчанию проверяются только первые 100 треков', tgl('vmu-check-fullpage-toggle', settings.checkFullPage), { id: 'vmu-check-scope-row', cls: isCheck ? '' : 'vmu-row-disabled' })}
+      `, { id: 'vmu-general-section' })}
 
-          <div class="vmu-setting-row ${settings.autoPlaylist && settings.dupPlaylistCheck ? '' : 'vmu-row-disabled'}" id="vmu-autoadd-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Авто-добавление в существующий плейлист</span>
-              <span class="vmu-setting-hint">Если плейлист с таким названием уже есть — добавить в него дозалитые треки вместо вопроса о дубликате</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-autoadd-toggle" ${settings.autoAddToExistingPlaylist ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
+      <div class="vmu-sx-note${isCheck ? '' : ' vmu-sx-hidden'}" id="vmu-upload-only-note">
+        Сейчас включена «Проверка» — настройки загрузки ниже не действуют, пока не вернётесь в режим «Загрузка».
+      </div>
 
-          <div class="vmu-setting-row ${settings.autoPlaylist && settings.dupPlaylistCheck && settings.autoAddToExistingPlaylist ? '' : 'vmu-row-disabled'}" id="vmu-geniusvalidate-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Сверять с Genius перед добавлением</span>
-              <span class="vmu-setting-hint">Добавлять только треки, которых реально не хватает в плейлисте по треклисту с Genius (иначе просто спросит про дубликат). Медленнее — открывает ещё вкладки</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-geniusvalidate-toggle" ${settings.geniusValidateAutoAdd ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div id="vmu-cover-row" class="vmu-setting-row vmu-setting-row-wide ${settings.autoPlaylist ? '' : 'vmu-row-disabled'}">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Обложка</span>
-              <span class="vmu-setting-hint">Выберите базовый JPG/PNG (1000×1000)</span>
-            </div>
-            <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+      <div class="vmu-sx-stack${isCheck ? ' vmu-row-disabled' : ''}" id="vmu-upload-only-section">
+        ${card('Авто-плейлист', `
+          ${row('Создавать плейлист после загрузки', 'Загруженные треки сразу попадут в новый плейлист', tgl('vmu-ap-toggle', settings.autoPlaylist))}
+          ${row('Проверять дубликаты плейлиста', 'Спросить перед созданием, если плейлист с таким названием уже есть', tgl('vmu-dupcheck-toggle', settings.dupPlaylistCheck), { id: 'vmu-dupcheck-row', cls: `vmu-sx-sub${settings.autoPlaylist ? '' : ' vmu-row-disabled'}` })}
+          ${row('Добавлять в существующий плейлист', 'Если такой плейлист уже есть — добавить в него дозалитые треки вместо вопроса о дубликате', tgl('vmu-autoadd-toggle', settings.autoAddToExistingPlaylist), { id: 'vmu-autoadd-row', cls: `vmu-sx-sub vmu-sx-sub2${settings.autoPlaylist && settings.dupPlaylistCheck ? '' : ' vmu-row-disabled'}` })}
+          ${row('Сверять с Genius перед добавлением', 'Добавлять только недостающие по треклисту Genius. Медленнее — открывает дополнительные вкладки', tgl('vmu-geniusvalidate-toggle', settings.geniusValidateAutoAdd), { id: 'vmu-geniusvalidate-row', cls: `vmu-sx-sub vmu-sx-sub3${settings.autoPlaylist && settings.dupPlaylistCheck && settings.autoAddToExistingPlaylist ? '' : ' vmu-row-disabled'}` })}
+        `)}
+        ${card('Обложка и метаданные', `
+          ${row('Обложка плейлиста', 'Базовый JPG/PNG, лучше 1000×1000', `
+            <div class="vmu-sx-coverctl">
               ${hasCover ? `<div id="vmu-cover-preview" title="Нажмите для смены"></div>` : ''}
               <label class="vmu-cover-pick-btn" title="Выбрать обложку">
                 ${hasCover ? '↺' : '+ Выбрать'}
                 <input type="file" id="vmu-cover-input" accept="image/*" style="display:none">
               </label>
               ${hasCover ? `<button id="vmu-cover-clear" title="Удалить обложку">✕</button>` : ''}
-            </div>
-          </div>
+            </div>`, { id: 'vmu-cover-row', cls: settings.autoPlaylist ? '' : 'vmu-row-disabled' })}
+          ${row('Обложка из ID3', 'Брать встроенную обложку первого трека, если выше ничего не выбрано', tgl('vmu-id3cover-toggle', settings.autoCoverFromId3), { id: 'vmu-id3cover-row', cls: settings.autoPlaylist && !settings.coverDataUrl ? '' : 'vmu-row-disabled' })}
+          ${row('Авто-метаданные', 'Заполнить исполнителя и название из имени файла, если теги пусты', tgl('vmu-meta-toggle', settings.autoMeta))}
+        `)}
+      </div>`;
 
-          <div class="vmu-setting-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Авто-метаданные</span>
-              <span class="vmu-setting-hint">Заполнить исполнителя и название из имени файла, если теги пусты</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-meta-toggle" ${settings.autoMeta ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
-
-          <div class="vmu-setting-row ${settings.autoPlaylist && !settings.coverDataUrl ? '' : 'vmu-row-disabled'}" id="vmu-id3cover-row">
-            <div class="vmu-setting-info">
-              <span class="vmu-setting-label">Обложка из ID3</span>
-              <span class="vmu-setting-hint">Использовать встроенную обложку первого трека (если нет выбранной выше)</span>
-            </div>
-            <label class="vmu-toggle">
-              <input type="checkbox" id="vmu-id3cover-toggle" ${settings.autoCoverFromId3 ? 'checked' : ''}>
-              <span class="vmu-toggle-track"></span>
-            </label>
-          </div>
+    const paneSwap = `
+      ${card('', `
+        ${row(`Подменять треки на наши <span class="vmu-sx-badge">бета</span>${helpIcon('Бета: проверено на единичных треках.\nИногда подмена не срабатывает\nили берётся не тот трек.')}`,
+          'Если такой же трек (по автору и названию) есть в сообществе — плеер играет его версию, очередь не трогается',
+          tgl('vmu-previewswap-toggle', settings.previewSwapEnabled))}
+      `)}
+      ${card('Источник', `
+        ${row('ID сообщества', 'Откуда брать полные версии', `
+          <div class="vmu-sx-inline">
+            <input type="text" id="vmu-previewswap-owner" class="vmu-sx-input" placeholder="-206614096" value="${escHtml(settings.previewSwapOwnerId || '')}" style="width:120px">
+            <button type="button" id="vmu-previewswap-usepage" class="vmu-sx-btn">Текущая страница</button>
+          </div>`)}
+        ${row('Индекс треков', 'Собирается и обновляется сам: при первом запуске, раз в несколько часов, при смене источника и когда для трека не нашлось пары',
+          `<button type="button" id="vmu-previewswap-rebuild" class="vmu-sx-btn">Обновить сейчас</button>`)}
+        <div class="vmu-sx-statusline">
+          <span class="vmu-sx-status" data-state="${previewIndexState(indexStatus)}"><i class="vmu-sx-dot"></i><span id="vmu-previewswap-status">${escHtml(indexStatus)}</span></span>
         </div>
-        </div><!-- /vmu-settings-tab-general -->
-        <div id="vmu-settings-tab-slim"${tab !== 'slim' ? ' style="display:none"' : ''}>
-          <div class="vmu-settings-section">
-            <div class="vmu-setting-row vmu-setting-row-wide">
-              <div class="vmu-setting-info">
-                <span class="vmu-setting-label">Обфускация аудио</span>
-              </div>
-              <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-enabled" ${slimOn ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-            </div>
+      `)}
+      ${card('Исключения', `
+        ${row('Исключить плейлисты из подмены', 'ID плейлистов через запятую (например альтернативные или цензурные версии) — их треки не предлагаются как замена',
+          `<input type="text" id="vmu-previewswap-exclude" class="vmu-sx-input" placeholder="44, 123" value="${escHtml(settings.previewSwapExcludePlaylists || '')}">`, { stack: true })}
+      `)}`;
 
-            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-sj-group">
-              <div class="vmu-slim-group-head">
-                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj" ${settings.slimSj ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                <span class="vmu-setting-label">Спектральный джиттер</span>
-              </div>
-              <div class="vmu-slim-group-body${slimSjOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-sj-body">
-                <div class="vmu-setting-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Режим</span></div>
-                  ${buildDropdownHtml('vmu-slim-sj-mode-dd', ['Случайные', 'Конструктор'], settings.slimSjMode)}
-                </div>
-                <div class="vmu-setting-row vmu-slider-row">
-                    <div class="vmu-setting-info"><span class="vmu-setting-label">Количество полос</span></div>
-                    <div class="vmu-slider-wrap">
-                      <input type="range" id="vmu-slim-sj-count" class="vmu-slider" min="1" max="50" step="1" value="${settings.slimSjCount}">
-                      <span class="vmu-slider-value" id="vmu-slim-sj-count-val">${settings.slimSjCount}</span>
-                    </div>
-                  </div>
-                  <div class="vmu-setting-row vmu-slider-row">
-                    <div class="vmu-setting-info"><span class="vmu-setting-label">Глубина аттенюации (дБ)</span></div>
-                    <div class="vmu-slider-wrap">
-                      <input type="range" id="vmu-slim-sj-att" class="vmu-slider" min="1" max="40" step="0.5" value="${settings.slimSjAtt}">
-                      <span class="vmu-slider-value" id="vmu-slim-sj-att-val">${settings.slimSjAtt} дБ</span>
-                    </div>
-                  </div>
-                  <div class="vmu-setting-row" id="vmu-slim-sj-adaptive-row">
-                    <div class="vmu-setting-info"><span class="vmu-setting-label">Адаптивные частоты (пики спектра)</span></div>
-                    <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj-adaptive" ${settings.slimSjAdaptive ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                  </div>
-                  <div class="vmu-setting-row">
-                    <div class="vmu-setting-info"><span class="vmu-setting-label">Временна́я модуляция (±1.5 дБ, 0.15 Гц)</span></div>
-                    <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj-temporal" ${settings.slimSjTemporal ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                  </div>
-                  <div class="vmu-setting-row">
-                    <div class="vmu-setting-info"><span class="vmu-setting-label">Компенсирующий буст (+0.5 дБ на F×1.5)</span></div>
-                    <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj-boost" ${settings.slimSjBoost ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                  </div>
-                <div class="vmu-setting-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Добавить шум</span></div>
-                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-sj-noise" ${settings.slimSjNoise ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                </div>
-                <div id="vmu-slim-sj-constructor"${settings.slimSjMode !== 1 ? ' style="display:none"' : ''}>
-                  <div class="vmu-slim-sj-presets">
-                    <span style="font-size:10px;color:var(--vmu-text-hint-2)">Пресет:</span>
-                    ${['Мягкий','Лёгкий','Средний','Сильный','Жёсткий','Максимум'].map((n,i) =>
-                      `<button class="vmu-slim-preset-btn" data-sj-preset="${i}">${n}</button>`).join('')}
-                  </div>
-                  <div class="vmu-slim-sj-table-hdr">
-                    <span>Частота (Гц)</span><span>Ослаб. (дБ)</span><span>Q</span><span></span>
-                  </div>
-                  <div id="vmu-slim-sj-rows">
-                    ${(settings.slimSjManualFilters || []).map((flt, i) => `
-                    <div class="vmu-slim-sj-row" data-sj-row="${i}">
-                      <input type="number" class="vmu-slim-sj-num vmu-slim-sj-freq" min="20" max="20000" step="50" value="${flt.freq}">
-                      <input type="number" class="vmu-slim-sj-num vmu-slim-sj-att-v" min="1" max="40" step="0.5" value="${flt.att}">
-                      <input type="number" class="vmu-slim-sj-num vmu-slim-sj-q" min="0.5" max="10" step="0.1" value="${flt.q}">
-                      <button class="vmu-slim-sj-del-btn" data-del-row="${i}">✕</button>
-                    </div>`).join('')}
-                  </div>
-                  <button id="vmu-slim-sj-add-row">+ Добавить фильтр</button>
-                </div>
-              </div>
-            </div>
+    const paneUi = `
+      ${card('Колонки и панели', `
+        ${row('Закрепить сайдбар', 'Левая колонка следует за прокруткой страницы', tgl('vmu-pin-sidebar-toggle', settings.pinSidebar))}
+        ${row('Закрепить панель вкладок', '«Моя музыка» / «Обзор» / поиск сливаются с верхней панелью при прокрутке', tgl('vmu-pin-tabs-toggle', settings.pinTabsBar))}
+        ${row('Скрыть кнопку «Наверх»', 'Полностью убрать левую полосу со скроллом наверх', tgl('vmu-hide-stl-toggle', settings.hideScrollToTop))}
+        ${row('Скрыть «Музыка друзей»', 'Убрать блок с прослушанным у друзей на странице «Моя музыка»', tgl('vmu-hide-friends-music-toggle', settings.hideFriendsMusic))}
+      `)}
+      ${card('Положение', `
+        ${row('Смещение контента', 'Сдвиг сайдбара и основной колонки по горизонтали', slider('vmu-offset-x', -400, 400, 5, settings.contentOffsetX, offsetShown, true), { stack: true })}
+      `)}
+      ${card('Производительность', `
+        ${row('Оптимизация больших плейлистов', 'Пропускать отрисовку строк за пределами экрана — меньше лагов при прокрутке длинных списков', tgl('vmu-optimize-toggle', settings.optimizeBigPlaylists))}
+      `)}`;
 
-            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-rd-group">
-              <div class="vmu-slim-group-head">
-                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-rd" ${settings.slimRd ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                <span class="vmu-setting-label">Дрейф ресемплинга</span>
-              </div>
-              <div class="vmu-slim-group-body${slimRdOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-rd-body">
-                <div class="vmu-setting-row vmu-slider-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Величина дрейфа (Гц)</span></div>
-                  <div class="vmu-slider-wrap">
-                    <input type="range" id="vmu-slim-rd-amount" class="vmu-slider" min="1" max="100" step="1" value="${settings.slimRdAmount}">
-                    <span class="vmu-slider-value" id="vmu-slim-rd-amount-val">${settings.slimRdAmount} Гц</span>
-                  </div>
-                </div>
-                <div class="vmu-setting-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Вибрато-модуляция</span></div>
-                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-rd-var" ${settings.slimRdVar ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                </div>
-              </div>
-            </div>
+    const paneDownload = `
+      ${card('Плейлисты', `
+        ${row('Потоков скачивания', 'Сколько треков плейлиста скачивать одновременно', slider('vmu-dl-threads', 1, 25, 1, settings.downloadThreads, String(settings.downloadThreads), true), { stack: true })}
+      `)}`;
 
-            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-dc-group">
-              <div class="vmu-slim-group-head">
-                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-dc" ${settings.slimDc ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                <span class="vmu-setting-label">DC-смещение</span>
-              </div>
-              <div class="vmu-slim-group-body${slimDcOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-dc-body">
-                <div class="vmu-setting-row vmu-slider-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Величина смещения</span></div>
-                  <div class="vmu-slider-wrap">
-                    <input type="range" id="vmu-slim-dc-val" class="vmu-slider" min="1" max="1000" step="1" value="${Math.round(settings.slimDcVal * 1e6)}">
-                    <span class="vmu-slider-value" id="vmu-slim-dc-val-val">${(settings.slimDcVal).toExponential(1)}</span>
-                  </div>
-                </div>
-              </div>
-            </div>
+    const paneSlim = `
+      ${card('', `
+        ${row('Обфускация аудио', 'Главный переключатель. Ниже включаются отдельные приёмы — все они действуют только при включённой обфускации', tgl('vmu-slim-enabled', slimOn))}
+      `)}
 
-            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-mp-group">
-              <div class="vmu-slim-group-head">
-                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-mp" ${settings.slimMp ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                <span class="vmu-setting-label">Микропитч</span>
-              </div>
-              <div class="vmu-slim-group-body${slimMpOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-mp-body">
-                <div class="vmu-setting-row vmu-slider-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Сдвиг (центы)</span></div>
-                  <div class="vmu-slider-wrap">
-                    <input type="range" id="vmu-slim-mp-cents" class="vmu-slider" min="0.1" max="50" step="0.1" value="${settings.slimMpCents}">
-                    <span class="vmu-slider-value" id="vmu-slim-mp-cents-val">${settings.slimMpCents} ¢</span>
-                  </div>
-                </div>
-                <div class="vmu-setting-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Случайное направление (±)</span></div>
-                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-mp-rand" ${settings.slimMpRand ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                </div>
-              </div>
-            </div>
+      ${group('vmu-slim-sj', 'vmu-slim-sj', settings.slimSj, 'Спектральный джиттер', `
+        ${row('Режим', '', buildDropdownHtml('vmu-slim-sj-mode-dd', ['Случайные', 'Конструктор'], settings.slimSjMode))}
+        ${row('Количество полос', '', slider('vmu-slim-sj-count', 1, 50, 1, settings.slimSjCount, String(settings.slimSjCount)))}
+        ${row('Глубина аттенюации (дБ)', '', slider('vmu-slim-sj-att', 1, 40, 0.5, settings.slimSjAtt, `${settings.slimSjAtt} дБ`))}
+        ${row('Адаптивные частоты', 'По пикам спектра', tgl('vmu-slim-sj-adaptive', settings.slimSjAdaptive), { id: 'vmu-slim-sj-adaptive-row' })}
+        ${row('Временна́я модуляция', '±1.5 дБ, 0.15 Гц', tgl('vmu-slim-sj-temporal', settings.slimSjTemporal))}
+        ${row('Компенсирующий буст', '+0.5 дБ на F×1.5', tgl('vmu-slim-sj-boost', settings.slimSjBoost))}
+        ${row('Добавить шум', '', tgl('vmu-slim-sj-noise', settings.slimSjNoise))}
+        <div id="vmu-slim-sj-constructor"${settings.slimSjMode !== 1 ? ' style="display:none"' : ''}>
+          <div class="vmu-slim-sj-presets">
+            <span class="vmu-sx-mini">Пресет:</span>
+            ${['Мягкий', 'Лёгкий', 'Средний', 'Сильный', 'Жёсткий', 'Максимум'].map((n, i) =>
+              `<button class="vmu-slim-preset-btn" data-sj-preset="${i}">${n}</button>`).join('')}
+          </div>
+          <div class="vmu-slim-sj-table-hdr">
+            <span>Частота (Гц)</span><span>Ослаб. (дБ)</span><span>Q</span><span></span>
+          </div>
+          <div id="vmu-slim-sj-rows">
+            ${(settings.slimSjManualFilters || []).map((flt, i) => `
+            <div class="vmu-slim-sj-row" data-sj-row="${i}">
+              <input type="number" class="vmu-slim-sj-num vmu-slim-sj-freq" min="20" max="20000" step="50" value="${flt.freq}">
+              <input type="number" class="vmu-slim-sj-num vmu-slim-sj-att-v" min="1" max="40" step="0.5" value="${flt.att}">
+              <input type="number" class="vmu-slim-sj-num vmu-slim-sj-q" min="0.5" max="10" step="0.1" value="${flt.q}">
+              <button class="vmu-slim-sj-del-btn" data-del-row="${i}">✕</button>
+            </div>`).join('')}
+          </div>
+          <button id="vmu-slim-sj-add-row">+ Добавить фильтр</button>
+        </div>
+      `, slimSjOk)}
 
-            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-bd-group">
-              <div class="vmu-slim-group-head">
-                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-bd" ${settings.slimBd ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                <span class="vmu-setting-label">Поддельная длительность (TLEN)</span>
-              </div>
-              <div class="vmu-slim-group-body${slimBdOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-bd-body">
-                <div class="vmu-setting-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Тип фальсификации</span></div>
-                  ${buildDropdownHtml('vmu-slim-bd-type-dd', BROKEN_TYPES, settings.slimBdType)}
-                </div>
-              </div>
-            </div>
+      ${group('vmu-slim-rd', 'vmu-slim-rd', settings.slimRd, 'Дрейф ресемплинга', `
+        ${row('Величина дрейфа (Гц)', '', slider('vmu-slim-rd-amount', 1, 100, 1, settings.slimRdAmount, `${settings.slimRdAmount} Гц`))}
+        ${row('Вибрато-модуляция', '', tgl('vmu-slim-rd-var', settings.slimRdVar))}
+      `, slimRdOk)}
 
-            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-output-group">
-              <div class="vmu-slim-group-head">
-                <span class="vmu-setting-label">OUTPUT</span>
-              </div>
-              <div class="vmu-slim-group-body">
-                <div class="vmu-setting-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Битрейт MP3</span></div>
-                  ${buildDropdownHtml('vmu-slim-bitrate-dd', QUALITY_PRESETS, [320,256,192,128].indexOf(settings.slimBitrate))}
-                </div>
-                <div class="vmu-setting-row vmu-slider-row vmu-setting-row-wide">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Громкость выхода</span></div>
-                  <div class="vmu-slider-wrap">
-                    <input type="range" id="vmu-slim-volume" class="vmu-slider" min="0" max="200" step="1" value="${settings.slimVolume}">
-                    <span class="vmu-slider-value" id="vmu-slim-volume-val">${settings.slimVolume}%</span>
-                  </div>
-                </div>
-                <div class="vmu-setting-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Сохранить метаданные</span></div>
-                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-preserve-meta" ${settings.slimPreserveMeta ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                </div>
-                <div class="vmu-setting-row">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Сохранить обложку</span></div>
-                  <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-preserve-cover" ${settings.slimPreserveCover ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                </div>
-              </div>
-            </div>
+      ${group('vmu-slim-dc', 'vmu-slim-dc', settings.slimDc, 'DC-смещение', `
+        ${row('Величина смещения', '', slider('vmu-slim-dc-val', 1, 1000, 1, Math.round(settings.slimDcVal * 1e6), (settings.slimDcVal).toExponential(1)))}
+      `, slimDcOk)}
 
-            <div class="vmu-slim-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-tag-group">
-              <div class="vmu-slim-group-head">
-                <label class="vmu-toggle"><input type="checkbox" id="vmu-slim-tag" ${settings.slimCommunityTag ? 'checked' : ''}><span class="vmu-toggle-track"></span></label>
-                <span class="vmu-setting-label">Тег сообщества</span>
+      ${group('vmu-slim-mp', 'vmu-slim-mp', settings.slimMp, 'Микропитч', `
+        ${row('Сдвиг (центы)', '', slider('vmu-slim-mp-cents', 0.1, 50, 0.1, settings.slimMpCents, `${settings.slimMpCents} ¢`))}
+        ${row('Случайное направление (±)', '', tgl('vmu-slim-mp-rand', settings.slimMpRand))}
+      `, slimMpOk)}
+
+      ${group('vmu-slim-bd', 'vmu-slim-bd', settings.slimBd, 'Поддельная длительность (TLEN)', `
+        ${row('Тип фальсификации', '', buildDropdownHtml('vmu-slim-bd-type-dd', BROKEN_TYPES, settings.slimBdType))}
+      `, slimBdOk)}
+
+      <div class="vmu-sx-group${slimOn ? '' : ' vmu-row-disabled'}" id="vmu-slim-output-group">
+        <div class="vmu-sx-group-head"><span class="vmu-sx-group-title">Выходной файл</span></div>
+        <div class="vmu-sx-group-body">
+          ${row('Битрейт MP3', '', buildDropdownHtml('vmu-slim-bitrate-dd', QUALITY_PRESETS, [320, 256, 192, 128].indexOf(settings.slimBitrate)))}
+          ${row('Громкость выхода', '', slider('vmu-slim-volume', 0, 200, 1, settings.slimVolume, `${settings.slimVolume}%`))}
+          ${row('Сохранить метаданные', '', tgl('vmu-slim-preserve-meta', settings.slimPreserveMeta))}
+          ${row('Сохранить обложку', '', tgl('vmu-slim-preserve-cover', settings.slimPreserveCover))}
+        </div>
+      </div>
+
+      ${group('vmu-slim-tag', 'vmu-slim-tag', settings.slimCommunityTag, 'Тег сообщества', `
+        ${row('Текст метки', '', `<input type="text" id="vmu-slim-tag-text" class="vmu-sx-input" placeholder="@club123456" value="${settings.slimCommunityTagText ? settings.slimCommunityTagText.replace(/"/g, '&quot;') : ''}" maxlength="120">`, { stack: true })}
+      `, slimTagOk)}`;
+
+    const panes = { upload: paneUpload, swap: paneSwap, ui: paneUi, download: paneDownload, slim: paneSlim };
+    const cur = SX_SECTIONS.find(s => s.id === tab);
+
+    return `
+      <div id="vmu-settings-panel" style="display:none">
+        <div class="vmu-sx-shell">
+          <nav class="vmu-sx-nav" id="vmu-sx-nav" aria-label="Разделы настроек">
+            ${SX_SECTIONS.map(s => `
+              <button type="button" class="vmu-sx-nav-item${s.id === tab ? ' active' : ''}" data-vmu-sx-tab="${s.id}" title="${s.title}">
+                <span class="vmu-sx-nav-ico">${SX_ICON[s.id]}</span><span class="vmu-sx-nav-txt">${s.title}</span>
+              </button>`).join('')}
+            <div class="vmu-sx-nav-foot">Изменения сохраняются сразу</div>
+          </nav>
+          <div class="vmu-sx-main">
+            <div class="vmu-sx-top">
+              <div class="vmu-sx-heading">
+                <div class="vmu-sx-h1" id="vmu-sx-h1">${cur.title}</div>
+                <div class="vmu-sx-h2" id="vmu-sx-h2">${cur.sub}</div>
               </div>
-              <div class="vmu-slim-group-body${slimTagOk ? '' : ' vmu-row-disabled'}" id="vmu-slim-tag-body">
-                <div class="vmu-setting-row vmu-setting-row-wide">
-                  <div class="vmu-setting-info"><span class="vmu-setting-label">Текст метки</span></div>
-                  <input type="text" id="vmu-slim-tag-text" class="vmu-slim-text-input" placeholder="@club123456" value="${settings.slimCommunityTagText ? settings.slimCommunityTagText.replace(/"/g,'&quot;') : ''}" maxlength="120">
-                </div>
-              </div>
+              <label class="vmu-sx-search">
+                <span class="vmu-sx-search-ico">${SX_ICON.search}</span>
+                <input type="text" id="vmu-sx-search" placeholder="Поиск по настройкам" autocomplete="off" spellcheck="false">
+              </label>
+            </div>
+            <div class="vmu-sx-scroll" id="vmu-sx-scroll">
+              ${SX_SECTIONS.map(s => `
+                <section class="vmu-sx-pane" id="vmu-sx-pane-${s.id}" data-vmu-sx-pane="${s.id}"${s.id !== tab ? ' style="display:none"' : ''}>
+                  <div class="vmu-sx-pane-title">${s.title}</div>
+                  ${panes[s.id]}
+                </section>`).join('')}
+              <div class="vmu-sx-empty" id="vmu-sx-empty" style="display:none">Ничего не найдено</div>
             </div>
           </div>
         </div>
-
       </div>`;
   }
 
@@ -5963,6 +5946,7 @@
         const isCheck = mode === 'check';
         document.getElementById('vmu-upload-only-section')?.classList.toggle('vmu-row-disabled', isCheck);
         document.getElementById('vmu-check-scope-row')?.classList.toggle('vmu-row-disabled', !isCheck);
+        document.getElementById('vmu-upload-only-note')?.classList.toggle('vmu-sx-hidden', !isCheck);
         // Update dropzone hint to reflect the active mode
         const dzLabel = document.querySelector('#vmu-dropzone .vmu-dz-label');
         const dzHint = document.querySelector('#vmu-dropzone .vmu-dz-hint');
@@ -6019,6 +6003,53 @@
         settings.pinSidebar = pinSidebarToggle.checked;
         saveSettings();
         applyLayoutCustomizations();
+      });
+    }
+
+    const previewSwapToggle = document.getElementById('vmu-previewswap-toggle');
+    if (previewSwapToggle) {
+      previewSwapToggle.addEventListener('change', () => {
+        settings.previewSwapEnabled = previewSwapToggle.checked;
+        saveSettings();
+        sendPreviewSwapConfig();
+        autoRefreshPreviewIndex('load');
+        setPreviewIndexStatus(previewIndexStatusText());
+      });
+    }
+    const previewSwapOwnerInput = document.getElementById('vmu-previewswap-owner');
+    if (previewSwapOwnerInput) {
+      previewSwapOwnerInput.addEventListener('change', () => {
+        settings.previewSwapOwnerId = previewSwapOwnerInput.value.trim();
+        saveSettings();
+        sendPreviewSwapConfig();
+        autoRefreshPreviewIndex('settings');
+        setPreviewIndexStatus(previewIndexStatusText());
+      });
+    }
+    const previewSwapUsePage = document.getElementById('vmu-previewswap-usepage');
+    if (previewSwapUsePage) {
+      previewSwapUsePage.addEventListener('click', () => {
+        const ownerMatch = location.href.match(/audios(-?\d+)/);
+        if (!ownerMatch) {
+          showProgressToast('Открой страницу аудио сообщества (vk.ru/audios-…)', { kind: 'error', id: 'vmu-previewswap-toast' });
+          return;
+        }
+        settings.previewSwapOwnerId = ownerMatch[1];
+        saveSettings();
+        sendPreviewSwapConfig();
+        if (previewSwapOwnerInput) previewSwapOwnerInput.value = ownerMatch[1];
+        autoRefreshPreviewIndex('settings');
+        setPreviewIndexStatus(previewIndexStatusText());
+      });
+    }
+    const previewSwapRebuild = document.getElementById('vmu-previewswap-rebuild');
+    if (previewSwapRebuild) previewSwapRebuild.addEventListener('click', rebuildPreviewSwapIndex);
+    const previewSwapExclude = document.getElementById('vmu-previewswap-exclude');
+    if (previewSwapExclude) {
+      previewSwapExclude.addEventListener('change', () => {
+        settings.previewSwapExcludePlaylists = previewSwapExclude.value.trim();
+        saveSettings();
+        autoRefreshPreviewIndex('settings'); // the exclusions change what the index contains
       });
     }
 
@@ -6175,19 +6206,70 @@
       });
     }
 
-    // ─── Settings tab switching ─────────────────────────────────────────────
-    const settingsTabs = document.getElementById('vmu-settings-tabs');
-    if (settingsTabs) {
-      settingsTabs.addEventListener('click', e => {
-        const btn = e.target.closest('button[data-vmu-settings-tab]');
-        if (!btn) return;
-        const tab = btn.dataset.vmuSettingsTab;
-        settingsActiveTab = tab;
-        settingsTabs.querySelectorAll('button').forEach(b => {
-          b.classList.toggle('active', b.dataset.vmuSettingsTab === tab);
+    // ─── Section rail + search ──────────────────────────────────────────────
+    // One pane is shown at a time; typing in the search box instead shows every
+    // pane with only the matching settings (cards/groups with no match are
+    // hidden along with their pane), so a setting can be found without
+    // knowing which section it lives in.
+    const sxNav = document.getElementById('vmu-sx-nav');
+    const sxSearch = document.getElementById('vmu-sx-search');
+    const sxScroll = document.getElementById('vmu-sx-scroll');
+    const sxPanes = () => [...document.querySelectorAll('#vmu-settings-panel .vmu-sx-pane')];
+    function sxShowTab(tab) {
+      settingsActiveTab = tab;
+      sxNav?.querySelectorAll('.vmu-sx-nav-item').forEach(b => b.classList.toggle('active', b.dataset.vmuSxTab === tab));
+      sxPanes().forEach(p => { p.style.display = p.dataset.vmuSxPane === tab ? '' : 'none'; });
+      const meta = SX_SECTIONS.find(s => s.id === tab);
+      const h1 = document.getElementById('vmu-sx-h1'), h2 = document.getElementById('vmu-sx-h2');
+      if (meta && h1) h1.textContent = meta.title;
+      if (meta && h2) h2.textContent = meta.sub;
+      if (sxScroll) sxScroll.scrollTop = 0;
+    }
+    function sxApplySearch() {
+      const q = (sxSearch?.value || '').trim().toLowerCase();
+      const root = document.getElementById('vmu-settings-panel');
+      if (!root) return;
+      root.classList.toggle('vmu-sx-searching', !!q);
+      const items = root.querySelectorAll('.vmu-sx-row, .vmu-sx-group, .vmu-sx-card, .vmu-sx-note');
+      items.forEach(el => el.classList.remove('vmu-sx-nomatch'));
+      let any = false;
+      if (!q) {
+        sxPanes().forEach(p => { p.style.display = p.dataset.vmuSxPane === settingsActiveTab ? '' : 'none'; });
+        document.getElementById('vmu-sx-empty').style.display = 'none';
+        return;
+      }
+      sxPanes().forEach(p => {
+        let paneHit = false;
+        p.querySelectorAll('.vmu-sx-card, .vmu-sx-group').forEach(box => {
+          const rows = [...box.querySelectorAll('.vmu-sx-row')];
+          const titleHit = (box.querySelector('.vmu-sx-card-title, .vmu-sx-group-title')?.textContent || '').toLowerCase().includes(q);
+          let hit = titleHit;
+          rows.forEach(r => {
+            const m = titleHit || r.textContent.toLowerCase().includes(q);
+            r.classList.toggle('vmu-sx-nomatch', !m);
+            if (m) hit = true;
+          });
+          box.classList.toggle('vmu-sx-nomatch', !hit);
+          if (hit) paneHit = true;
         });
-        document.getElementById('vmu-settings-tab-general').style.display = tab === 'general' ? '' : 'none';
-        document.getElementById('vmu-settings-tab-slim').style.display = tab === 'slim' ? '' : 'none';
+        p.querySelectorAll('.vmu-sx-note').forEach(n => n.classList.add('vmu-sx-nomatch'));
+        p.style.display = paneHit ? '' : 'none';
+        if (paneHit) any = true;
+      });
+      document.getElementById('vmu-sx-empty').style.display = any ? 'none' : '';
+    }
+    if (sxNav) {
+      sxNav.addEventListener('click', e => {
+        const btn = e.target.closest('button[data-vmu-sx-tab]');
+        if (!btn) return;
+        if (sxSearch && sxSearch.value) { sxSearch.value = ''; sxApplySearch(); }
+        sxShowTab(btn.dataset.vmuSxTab);
+      });
+    }
+    if (sxSearch) {
+      sxSearch.addEventListener('input', sxApplySearch);
+      sxSearch.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && sxSearch.value) { e.stopPropagation(); sxSearch.value = ''; sxApplySearch(); }
       });
     }
 
@@ -7282,7 +7364,7 @@
       // so the trailing-paren strip above only eats the innermost group and
       // leaves "(при участии ..." dangling with a "(" immediately before it
       // instead of whitespace.
-      .replace(/[\s(]+(?:feat\.?|ft\.?|(?:при|с)\s+уч[а-я-]*\.?)\s+.*$/i, '')
+      .replace(/[\s(]+(?:feat\.?|ft\.?|featuring|(?:при|с)\s+уч[а-я-]*\.?|уч\.)\s+.*$/i, '')
       .replace(/[«»"'`’]/g, '')
       // Trailing "?"/"!" is often present on only one side of a match —
       // Genius keeps title punctuation, reuploaded filenames routinely drop
@@ -10625,6 +10707,39 @@
   // see its CSS for the shared visual language) instead of the old ad-hoc
   // bottom-left colored boxes, so every extension notice reads as one
   // consistent design instead of two different ones.
+  // Check / cross as SVG (the plain ✓ ✕ glyphs render differently per font and
+  // look rough); the tick draws itself once when the notice appears.
+  const ICON_NOTICE_OK = '<svg class="vmu-notice-svg" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path class="vmu-notice-tick" d="M3.4 8.7l3.1 3.1 6.1-7.3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const ICON_NOTICE_ERR = '<svg class="vmu-notice-svg" width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4.6 4.6l6.8 6.8M11.4 4.6l-6.8 6.8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+
+  // Short «Подменено» notice for the track swap. Several swapped tracks in a
+  // row keep ONE notice on screen: it only refreshes (tick redraws, a small
+  // pulse, timer restarts) instead of sliding out and in for every track.
+  function showSwapToast() {
+    let el = document.getElementById('vmu-swap-toast');
+    if (!el) {
+      document.getElementById('vmu-toast')?.remove();
+      el = document.createElement('div');
+      el.id = 'vmu-swap-toast';
+      el.className = 'vmu-notice vmu-notice-compact';
+      el.innerHTML = '<div class="vmu-notice-icon vmu-notice-icon-success"></div><div class="vmu-notice-text">Подменено</div>';
+      document.body.appendChild(el);
+      requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('vmu-notice-shown')));
+    } else {
+      el.classList.remove('vmu-notice-pulse');
+      void el.offsetWidth;
+      el.classList.add('vmu-notice-pulse');
+    }
+    el.querySelector('.vmu-notice-icon').innerHTML = ICON_NOTICE_OK;
+    clearTimeout(el._vmuTimer);
+    clearTimeout(el._vmuRemoveTimer);
+    el.classList.add('vmu-notice-shown');
+    el._vmuTimer = setTimeout(() => {
+      el.classList.remove('vmu-notice-shown');
+      el._vmuRemoveTimer = setTimeout(() => el.remove(), 300);
+    }, 1800);
+  }
+
   function showToast(msg, isError) {
     document.getElementById('vmu-toast')?.remove();
     const el = document.createElement('div');
@@ -10632,7 +10747,7 @@
     el.className = 'vmu-notice';
     const icon = document.createElement('div');
     icon.className = 'vmu-notice-icon ' + (isError ? 'vmu-notice-icon-error' : 'vmu-notice-icon-success');
-    icon.textContent = isError ? '✕' : '✓';
+    icon.innerHTML = isError ? ICON_NOTICE_ERR : ICON_NOTICE_OK;
     const text = document.createElement('div');
     text.className = 'vmu-notice-text';
     text.textContent = msg;
@@ -10677,7 +10792,7 @@
     el.classList.add('vmu-notice-shown');
     const iconEl = el.querySelector('.vmu-notice-icon');
     iconEl.className = 'vmu-notice-icon ' + (kind === 'error' ? 'vmu-notice-icon-error' : kind === 'done' ? 'vmu-notice-icon-success' : 'vmu-notice-icon-progress');
-    iconEl.innerHTML = kind === 'error' ? '✕' : kind === 'done' ? '✓' : '<span class="vmu-notice-spin"></span>';
+    iconEl.innerHTML = kind === 'error' ? ICON_NOTICE_ERR : kind === 'done' ? ICON_NOTICE_OK : '<span class="vmu-notice-spin"></span>';
     el.querySelector('.vmu-notice-text').textContent = title || '';
     const bar = el.querySelector('.vmu-notice-bar');
     const fill = el.querySelector('.vmu-notice-bar-fill');
@@ -11516,7 +11631,7 @@
     }
     return el;
   }
-  function showDlTooltip(btn) {
+  function showDlTooltip(btn, forceNew) {
     const text = btn.getAttribute('data-vmu-tip');
     if (!text) return;
     const el = getDlTooltipEl();
@@ -11524,12 +11639,17 @@
     // Default flavour matches VK's old tt_w.tt_black tooltip (used across the
     // legacy audio rows and top-bar icons). Buttons inside the new vkui
     // playlist modal get the vkui-style tooltip via .vmu-tooltip-new.
-    const isNewVk = btn.classList.contains('vmu-single-dl-vkit')
+    const isNewVk = !!forceNew
+      || btn.classList.contains('vmu-single-dl-vkit')
       || btn.classList.contains('vmu-single-dl-after')
       || btn.classList.contains('vmu-audiofx-btn')
       || btn.id === 'vmu-bulkops-btn'
       || btn.id === 'vmu-toolbar-settings-btn'
-      || btn.id === 'vmu-toolbar-sc-btn';
+      || btn.id === 'vmu-toolbar-sc-btn'
+      || btn.classList.contains('vmu-help-icon') // long hints: wrapped vkui bubble, not one endless legacy line
+      || btn.classList.contains('vmu-swap-btn')  // original ↔ community toggle (panel + VK's native block)
+      || !!btn.closest('#vmu-overlay-panel')
+      || !!btn.closest('.vmu-settings-modal'); // the settings window is new-VK styled throughout
     el.classList.toggle('vmu-tooltip-new', isNewVk);
     // Reset placement modifier before measuring so layout reflects the
     // default-above tail height.
@@ -11574,7 +11694,9 @@
     _vmuTitleHoverEl = el;
     el.setAttribute('data-vmu-tip', text);
     el.removeAttribute('title');
-    showDlTooltip(el);
+    // every title in the extension's own panels gets the current VK bubble
+    // (dark, rounded, wrapped) — the legacy black one is only for the old rows' explicit buttons
+    showDlTooltip(el, true);
   }, true);
   document.addEventListener('mouseout', e => {
     if (!_vmuTitleHoverEl) return;

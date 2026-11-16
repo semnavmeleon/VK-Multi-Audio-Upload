@@ -3703,7 +3703,9 @@
     const origPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function (...args) {
       lastAudioEl = this;
-      if (fxNeeded()) attachFx(this);
+      // __vmuSkipFx: the preview-swap overlay when its CDN refused CORS — a
+      // MediaElementSource on such a source outputs pure silence.
+      if (fxNeeded() && !this.__vmuSkipFx) attachFx(this);
       return origPlay.apply(this, args);
     };
 
@@ -3792,5 +3794,1770 @@
         ctxState: ctx && ctx.state,
       };
     });
+  })();
+
+  // ─── Preview-track swap ────────────────────────────────────────────────────
+  // Some tracks VK serves are copyright-restricted previews (a short clip,
+  // flagged in VK's own UI with a small "i" badge —
+  // [data-testid="audioplayeraudioinfo-titleNoticeIcon"] inside the global
+  // mini-player's [data-testid="AudioPlayerBlock_AudioMedia"], confirmed live
+  // against VK's build in 2026-11; it's the one stable anchor across an
+  // otherwise fully-hashed vkit-* class tree). If the exact same track (by
+  // artist+title) is already uploaded in a community the user picked, this
+  // swaps the player over to that copy instead — reading/writing
+  // window.ap._currentAudio directly rather than touching _playlistQueue, so
+  // the current shuffle/queue order is untouched: the next track still
+  // resolves from the original list.
+  (function () {
+    const INDEX_KEY = 'vmu_preview_swap_index_v1';
+    const INDEX_META_KEY = 'vmu_preview_swap_index_meta_v1';
+
+    let enabled = false;
+    let ownerId = null;
+    let indexMap = null;
+    let indexForOwner = null;
+
+    // Seeded once from whatever content.js last saved — covers the window
+    // between this script running and content.js's own config push landing
+    // (postMessage isn't queued for a listener that isn't attached yet).
+    try {
+      const s = JSON.parse(localStorage.getItem('vmu_settings_v2') || 'null');
+      if (s) {
+        enabled = !!s.previewSwapEnabled;
+        ownerId = s.previewSwapOwnerId ? Number(s.previewSwapOwnerId) : null;
+      }
+    } catch {}
+
+    window.addEventListener('message', e => {
+      if (e.source !== window || !e.data) return;
+      if (e.data.type === 'VKD_PREVIEW_SWAP_CONFIG') {
+        enabled = !!e.data.enabled;
+        const newOwnerId = e.data.ownerId ? Number(e.data.ownerId) : null;
+        if (newOwnerId !== ownerId) { indexMap = null; indexForOwner = null; }
+        ownerId = newOwnerId;
+      } else if (e.data.type === 'VKD_BUILD_PREVIEW_INDEX') {
+        buildIndex(Number(e.data.ownerId), Array.isArray(e.data.excludePlaylistIds) ? e.data.excludePlaylistIds : []);
+      }
+    });
+
+    // Pulls one playlist's track ids (paginated, 200/call) so its tracks can
+    // be excluded from the index wholesale — e.g. a "без мата"/censored-edit
+    // playlist the community keeps alongside the real uploads, which would
+    // otherwise be a same-title, same-artist false match for the real thing.
+    async function fetchPlaylistTrackIds(targetOwnerId, playlistId) {
+      const ids = new Set();
+      const CHUNK = 200;
+      let total = Infinity;
+      for (let off = 0; off < total; off += CHUNK) {
+        const page = await vkApiFetch('audio.get', { owner_id: targetOwnerId, playlist_id: playlistId, count: CHUNK, offset: off });
+        total = page?.count ?? ids.size;
+        const pageItems = page?.items || [];
+        for (const it of pageItems) ids.add(it.id);
+        if (!pageItems.length) break;
+      }
+      return ids;
+    }
+
+    // ── Cookie-session fallback ────────────────────────────────────────────
+    // The web API token (vkApiFetch) is bound to the IP it was issued for.
+    // Behind a VPN whose exit IP differs between login.vk.ru and the API
+    // host, every API call fails with "access_token was given to another ip
+    // address" (verified live: even users.get). al_audio.php rides the page's
+    // own cookie session, so it keeps working; it only hands out stream URLs
+    // in VK's masked form, undone below with VK's own algorithm (taken from
+    // its bundle: the base64 alphabet has '0' and 'O' swapped on purpose, and
+    // the shuffle seed is vk.id XOR the op parameter, computed in BigInt).
+    const AL_B64 = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN0PQRSTUVWXYZO123456789+/=';
+    function alB64Decode(t) {
+      if (!t || t.length % 4 === 1) return false;
+      let e, i, o = 0, a = 0, s = '';
+      while ((i = t.charAt(a++))) {
+        i = AL_B64.indexOf(i);
+        if (~i) {
+          e = o % 4 ? 64 * e + i : i;
+          if (o++ % 4) s += String.fromCharCode(255 & e >> (-2 * o & 6));
+        }
+      }
+      return s;
+    }
+    function alShuffle(t, seed) {
+      const n = t.length;
+      if (!n) return t;
+      const order = Array(n);
+      const w = BigInt(n);
+      let v = BigInt(seed);
+      if (v < 0n) v = -v;
+      for (let k = n - 1; k >= 0; k--) {
+        v = (w * BigInt(k + 1) ^ v + BigInt(k)) % w;
+        order[k] = Number(v);
+      }
+      const arr = t.split('');
+      for (let k = 1; k < n; k++) arr[k] = arr.splice(order[n - 1 - k], 1, arr[k])[0];
+      return arr.join('');
+    }
+    const AL_OPS = {
+      v: t => t.split('').reverse().join(''),
+      r: (t, b) => {
+        const arr = t.split('');
+        const w = AL_B64 + AL_B64;
+        for (let k = arr.length, y; k--;) { y = w.indexOf(arr[k]); if (~y) arr[k] = w.substr(y - b, 1); }
+        return arr.join('');
+      },
+      s: alShuffle,
+      i: (t, b) => alShuffle(t, BigInt((window.vk && window.vk.id) || 0) ^ BigInt(parseInt(b, 10) || 0)),
+      x: (t, b) => { const c = b.charCodeAt(0); return t.split('').map(ch => String.fromCharCode(ch.charCodeAt(0) ^ c)).join(''); },
+    };
+    function alUnmaskUrl(url) {
+      if (!url || !~url.indexOf('audio_api_unavailable')) return url;
+      const p = url.split('?extra=')[1].split('#');
+      let ops = p[1] === '' ? '' : alB64Decode(p[1]);
+      let cur = alB64Decode(p[0]);
+      if (typeof ops !== 'string' || !cur) return url;
+      ops = ops ? ops.split('\t') : [];
+      for (let s = ops.length; s--;) {
+        const args = ops[s].split('\v');
+        const name = args.splice(0, 1, cur)[0];
+        if (!AL_OPS[name]) return url;
+        cur = AL_OPS[name].apply(null, args);
+      }
+      return cur && cur.substr(0, 4) === 'http' ? cur : url;
+    }
+
+    function decodeEntities(s) {
+      return String(s || '').replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (m, e) => {
+        if (e[0] === '#') {
+          const c = (e[1] === 'x' || e[1] === 'X') ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+          try { return String.fromCodePoint(c); } catch { return m; }
+        }
+        return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[e.toLowerCase()];
+      });
+    }
+
+    async function alAudioPost(act, params) {
+      const res = await fetch('/al_audio.php?act=' + act, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+        body: new URLSearchParams({ act, al: '1', ...params }).toString(),
+      });
+      // VK's legacy endpoints answer in windows-1251
+      const text = new TextDecoder('windows-1251').decode(await res.arrayBuffer());
+      let json;
+      try { json = JSON.parse(text); } catch { throw new Error('al_audio: unparsable response'); }
+      if (!json || !Array.isArray(json.payload) || json.payload[0] !== 0) throw new Error('al_audio: request rejected');
+      return json.payload[1];
+    }
+
+    // One playlist (-1 = the owner's whole audio list) as raw VK audio rows.
+    async function alLoadSection(targetOwnerId, playlistId, onPage) {
+      const rows = [];
+      let offset = 0;
+      for (;;) {
+        const payload = await alAudioPost('load_section', {
+          claim: '0', offset: String(offset), owner_id: String(targetOwnerId),
+          playlist_id: String(playlistId), type: 'playlist', access_hash: '', is_loading_all: '1',
+        });
+        const pl = payload && payload[0];
+        if (!pl || !Array.isArray(pl.list)) throw new Error('al_audio: no playlist in response');
+        for (const row of pl.list) rows.push(row);
+        if (onPage) onPage(rows.length, pl.totalCount);
+        if (!pl.hasMore || !pl.list.length) break;
+        offset = pl.nextOffset;
+      }
+      return rows;
+    }
+
+    // Row field 13 is "h0/h1/h2/h3/h4/h5/h6"; reload_audios wants h2 and h5.
+    function alRowHash(row) {
+      const h = String(row[13] || '').split('/');
+      return (h[2] && h[5]) ? h[2] + '_' + h[5] : '';
+    }
+
+    async function buildIndexViaWeb(targetOwnerId, excludePlaylistIds) {
+      const excludedIds = new Set();
+      for (const plId of (excludePlaylistIds || [])) {
+        try {
+          const rows = await alLoadSection(targetOwnerId, plId);
+          rows.forEach(r => excludedIds.add(r[0]));
+        } catch (err) {
+          console.warn('[vmu] preview-swap: failed reading exclude playlist (web)', plId, err);
+        }
+      }
+      const rows = await alLoadSection(targetOwnerId, -1, (loaded, total) => {
+        window.postMessage({ type: 'VKD_PREVIEW_INDEX_PROGRESS', loaded, total }, '*');
+      });
+      const items = [];
+      for (const r of rows) {
+        if (excludedIds.has(r[0])) continue;
+        items.push({ id: r[0], ownerId: r[1], accessKey: '', title: decodeEntities(r[3]), artist: decodeEntities(r[4]), duration: r[5] || 0, hash: alRowHash(r) });
+      }
+      return items;
+    }
+
+    // id -> hash for rows fetched on demand, when an indexed hash went stale.
+    const webHashes = new Map();
+    let webHashesLoading = null;
+    function refreshWebHashes(targetOwnerId) {
+      if (!webHashesLoading) {
+        webHashesLoading = alLoadSection(targetOwnerId, -1)
+          .then(rows => { for (const r of rows) webHashes.set(r[1] + '_' + r[0], alRowHash(r)); })
+          .finally(() => { webHashesLoading = null; });
+      }
+      return webHashesLoading;
+    }
+
+    async function resolveStreamUrlViaWeb(match) {
+      const key = match.ownerId + '_' + match.id;
+      const tryReload = async hash => {
+        const payload = await alAudioPost('reload_audios', { audio_ids: key + (hash ? '_' + hash : '') });
+        const row = payload && payload[0] && payload[0][0];
+        const url = row && alUnmaskUrl(row[2]);
+        return (url && /^https?:\/\//.test(url) && !~url.indexOf('audio_api_unavailable')) ? url : null;
+      };
+      let url = await tryReload(webHashes.get(key) || match.hash || '');
+      if (!url) {
+        await refreshWebHashes(match.ownerId);
+        url = await tryReload(webHashes.get(key) || '');
+      }
+      return url;
+    }
+
+    // After an "another ip address" failure the API stays off for a while
+    // instead of costing a failed round trip on every track.
+    let apiBlockedUntil = 0;
+    function noteApiFailure(err) {
+      if (/another ip|authorization failed|access_token/i.test(String(err && err.message))) apiBlockedUntil = Date.now() + 5 * 60 * 1000;
+    }
+
+    async function resolveStreamUrl(match) {
+      if (Date.now() >= apiBlockedUntil) {
+        try {
+          const audios = match.ownerId + '_' + match.id + (match.accessKey ? '_' + match.accessKey : '');
+          const resolved = await vkApiFetch('audio.getById', { audios });
+          const url = resolved && resolved[0] && resolved[0].url;
+          if (url) return url;
+        } catch (err) {
+          noteApiFailure(err);
+          console.warn('[vmu] preview-swap: API could not resolve stream url, using the web session —', err && err.message);
+        }
+      }
+      try {
+        const t0 = Date.now();
+        const url = await resolveStreamUrlViaWeb(match);
+        console.info('[vmu] preview-swap: stream url via the web session ' + (url ? 'found' : 'NOT found') + ' in ' + (Date.now() - t0) + ' ms');
+        return url;
+      } catch (err) {
+        console.warn('[vmu] preview-swap: web session could not resolve stream url for', match.ownerId + '_' + match.id, err);
+        return null;
+      }
+    }
+
+    // The index built through the API carries no per-track hashes, so the web
+    // route has to load the community's whole list once before it can fetch
+    // any stream (~30 requests). Left to the first swap, that took longer than
+    // VK needs to give up on the blocked original — the first swap after every
+    // page load was lost. So when the API turns out to be unusable (IP-bound
+    // token behind a VPN), the list is fetched in the background right after
+    // load, long before anything is played.
+    async function warmUpWebRoute() {
+      if (!enabled || !ownerId) return;
+      try { await vkApiFetch('users.get', {}); return; } catch (err) { noteApiFailure(err); }
+      if (Date.now() < apiBlockedUntil) {
+        const t0 = Date.now();
+        try {
+          await refreshWebHashes(ownerId);
+          console.info('[vmu] preview-swap: web route warmed up in ' + (Date.now() - t0) + ' ms (' + webHashes.size + ' tracks)');
+        } catch (err) { console.warn('[vmu] preview-swap: web route warm-up failed', err && err.message); }
+      }
+    }
+    setTimeout(warmUpWebRoute, 2500);
+
+    async function buildIndexViaApi(targetOwnerId, excludePlaylistIds) {
+      const CHUNK = 200;
+      const items = [];
+      let excludedIds = new Set();
+      for (const plId of (excludePlaylistIds || [])) {
+        try {
+          const ids = await fetchPlaylistTrackIds(targetOwnerId, plId);
+          ids.forEach(id => excludedIds.add(id));
+        } catch (err) {
+          // Token problems are not a per-playlist failure — surface them so
+          // the whole build can switch to the web session.
+          if (/another ip|authorization failed|access_token/i.test(String(err && err.message))) throw err;
+          console.warn('[vmu] preview-swap: failed reading exclude playlist', plId, err);
+        }
+      }
+      let total = Infinity;
+      for (let off = 0; off < total; off += CHUNK) {
+        const page = await vkApiFetch('audio.get', { owner_id: targetOwnerId, count: CHUNK, offset: off });
+        total = page?.count ?? items.length;
+        const pageItems = page?.items || [];
+        for (const it of pageItems) {
+          if (excludedIds.has(it.id)) continue;
+          items.push({ id: it.id, ownerId: it.owner_id, accessKey: it.access_key || '', title: it.title || '', artist: it.artist || '', duration: it.duration || 0 });
+        }
+        window.postMessage({ type: 'VKD_PREVIEW_INDEX_PROGRESS', loaded: items.length, total }, '*');
+        if (!pageItems.length) break;
+      }
+      return items;
+    }
+
+    async function buildIndex(targetOwnerId, excludePlaylistIds) {
+      if (!targetOwnerId) return;
+      try {
+        let items;
+        try {
+          items = await buildIndexViaApi(targetOwnerId, excludePlaylistIds);
+        } catch (apiErr) {
+          noteApiFailure(apiErr);
+          console.warn('[vmu] preview-swap: API index build failed, using the web session —', apiErr && apiErr.message);
+          items = await buildIndexViaWeb(targetOwnerId, excludePlaylistIds);
+        }
+        localStorage.setItem(INDEX_KEY, JSON.stringify({ ownerId: targetOwnerId, items }));
+        localStorage.setItem(INDEX_META_KEY, JSON.stringify({ ownerId: targetOwnerId, count: items.length, builtAt: Date.now() }));
+        // Reset the index cache AND the "already checked, no match" memory of
+        // the currently-playing slot — a track that missed before the index
+        // existed (or was built for a different owner) deserves one more
+        // look against what was just fetched, instead of staying silently
+        // skipped until the user replays it.
+        if (targetOwnerId === ownerId) { indexMap = null; indexForOwner = null; lastSlotKey = null; }
+        window.postMessage({ type: 'VKD_PREVIEW_INDEX_DONE', ok: true, count: items.length }, '*');
+      } catch (err) {
+        window.postMessage({ type: 'VKD_PREVIEW_INDEX_DONE', ok: false, error: String(err?.message || err) }, '*');
+      }
+    }
+
+    // Duplicated from content.js' normalizeNamePart/normalizeKey (separate JS
+    // worlds, can't share a module) — keep the two in sync if one changes.
+    const NAME_TRANSLIT_ALIASES = { intro: 'интро', outro: 'аутро', skit: 'скит' };
+    function normalizeNamePart(str) {
+      const norm = String(str || '')
+        .normalize('NFC')
+        .toLowerCase()
+        .replace(/ё/g, 'е')
+        .replace(/[–—]/g, '-')
+        .replace(/[\[\{].*?[\]\}]/g, ' ')
+        .replace(/\([^)]*\)\s*$/g, ' ')
+        .replace(/[\s(]+(?:feat\.?|ft\.?|featuring|(?:при|с)\s+уч[а-я-]*\.?|уч\.)\s+.*$/i, '')
+        .replace(/[«»"'`’]/g, '')
+        .replace(/[?!]+\s*$/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return NAME_TRANSLIT_ALIASES[norm] || norm;
+    }
+    // A reupload is frequently credited under a transliterated spelling of
+    // the same artist name (verified live: VK's own "Гуф умер (feat. Баста)"
+    // vs the community's "Гуф умер feat. Баста [vk.com/reuploadunder]" by
+    // "Guf" — same person, "ГУФ" vs "Guf") — plain string equality on the
+    // artist would never match that, so matching keys primarily on the
+    // (much more stable) normalized title, with the artist compared both
+    // as-is and through a rough Cyrillic→Latin transliteration in either
+    // direction. Not a real linguistic transliterator — just enough to
+    // bridge the common "same name, different script" case; a title
+    // collision between two unrelated same-named artists this can't tell
+    // apart is the accepted tradeoff (same one plmakeMatch/matchByTitleThenArtist
+    // already make elsewhere in this extension, for the same reason: formats
+    // disagree on artist credits far more than on the title itself).
+    const CYR_TO_LAT = { а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',н:'n',о:'o',п:'p',р:'r',с:'s',т:'t',у:'u',ф:'f',х:'kh',ц:'ts',ч:'ch',ш:'sh',щ:'shch',ъ:'',ы:'y',ь:'',э:'e',ю:'yu',я:'ya' };
+    function translit(s) {
+      return String(s || '').split('').map(ch => CYR_TO_LAT[ch] ?? ch).join('');
+    }
+    function artistVariants(artist) {
+      const norm = normalizeNamePart(artist);
+      const t = translit(norm);
+      return t === norm ? [norm] : [norm, t];
+    }
+    // The same credit is written many ways: "Баста, Гуф" / "Баста и Гуф",
+    // "SALUKI feat. FEDUK, FRIENDLY THUG" / "SALUKI, FEDUK & FRIENDLY THUG",
+    // "FRIENDLY THUG 52 NGG, Скриптонит" / "FRIENDLY THUG 52 NGG & Скриптонит".
+    // Checked live against 755 of the user's tracks: comparing the whole
+    // string missed 20 real matches that comparing the individual names found
+    // (and lost none). Credits are split into names; two credits match when
+    // the first-named artist of either one appears among the other's names.
+    function artistNames(artist) {
+      return String(artist || '')
+        .normalize('NFC')
+        .toLowerCase()
+        .replace(/ё/g, 'е')
+        .replace(/\[.*?\]/g, ' ')
+        .replace(/[(){}]/g, ',')
+        .split(/\s*[,;&\/]\s*|\s+(?:feat\.?|ft\.?|featuring|x|х|vs\.?|и|при\s+уч\.?)\s+/i)
+        .map(s => s.replace(/^(?:feat\.?|ft\.?)\s+/i, '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+    }
+    function artistsMatch(a, b) {
+      const na = artistNames(a), nb = artistNames(b);
+      if (!na.length || !nb.length) return !na.length && !nb.length;
+      const has = (list, name) => {
+        const vs = artistVariants(name);
+        return list.some(x => artistVariants(x).some(v => vs.includes(v)));
+      };
+      return has(nb, na[0]) || has(na, nb[0]);
+    }
+
+    function ensureIndexMap() {
+      if (indexMap && indexForOwner === ownerId) return indexMap;
+      indexMap = new Map(); // titleKey -> candidate[]
+      indexForOwner = ownerId;
+      if (!ownerId) return indexMap;
+      try {
+        const raw = JSON.parse(localStorage.getItem(INDEX_KEY) || 'null');
+        if (raw && raw.ownerId === ownerId && Array.isArray(raw.items)) {
+          for (const it of raw.items) {
+            const k = normalizeNamePart(it.title);
+            if (!k) continue;
+            if (!indexMap.has(k)) indexMap.set(k, []);
+            indexMap.get(k).push(it);
+          }
+        }
+      } catch {}
+      return indexMap;
+    }
+
+    function findMatch(artist, title) {
+      // VK's own rows may carry HTML entities (&#39; &amp; ...), the index
+      // never does — compare both sides entity-free.
+      const candidates = ensureIndexMap().get(normalizeNamePart(decodeEntities(title)));
+      if (!candidates || !candidates.length) return null;
+      const a = decodeEntities(artist);
+      return candidates.find(c => artistsMatch(a, c.artist)) || null;
+    }
+
+    function getNoticeIcon() {
+      return document.querySelector('[data-testid="AudioPlayerBlock_AudioMedia"] [data-testid="audioplayeraudioinfo-titleNoticeIcon"]');
+    }
+
+    // Mutating window.ap._currentAudio / _currentPlaylist / _playlistQueue
+    // (tried first) either gets silently ignored or replaces the real queue
+    // with a disposable one-track "temp" list (confirmed live) — VK's queue
+    // bookkeeping is private and too fragile to safely redirect this way.
+    // Instead: pause + mute VK's own <audio> element in place (a completely
+    // normal operation VK already handles fine) and play our replacement
+    // through a separate <audio> element of our own layered on top. VK's
+    // queue/shuffle/_currentPlaylist never changes at all, so next/prev and
+    // auto-advance keep working exactly as if nothing happened — once our
+    // overlay ends, the (still muted) original is resumed just long enough
+    // for VK's own preview-cutoff/end-of-track to fire and auto-advance
+    // normally, then the next slot is evaluated fresh.
+    let nativeAudioEl = null;
+    let lastSlotKey = null;
+    let overlay = null; // { audioEl, nativeEl, forSlotKey }
+    let pendingSwapSlot = null; // slotKey while startOverlay is fetching the stream URL
+    let lastIndexMissPost = 0;
+    // another VK tab rebuilt the index (it lives in the shared localStorage):
+    // drop the in-memory copy so the fresh one is read
+    window.addEventListener('storage', e => {
+      if (e.key === INDEX_KEY) { indexMap = null; indexForOwner = null; }
+    });
+
+    // --- Overlay panel: a live copy of VK's native player block ---------------
+    // Sits next to the native block in the DOM (same stacking context, so VK's
+    // modals and its top bar cover it exactly like the original) and slides in
+    // over it while a community version is playing. Its markup is the native
+    // block's own, mirrored from it; only play/pause, progress, volume and the
+    // title are driven by the overlay <audio>. A click on any other button is
+    // forwarded to the real one, so shuffle / repeat / like / lyrics / share /
+    // the extension's own EQ button all keep working.
+    let panelEl = null;
+    let panelCtl = null;
+    let panelTip = null;
+    let hidePanelTip = null;
+    let currentMatch = null;
+    const iconCache = { play: null, pause: null };
+
+    const NATIVE_PANEL_SELECTOR = 'section[data-testid="AudioPage_PlayerBlock"]';
+    const SEL_PREV = '[data-testid="audio-player-controls-backward-button"]';
+    const SEL_PLAY = '[data-testid="audio-player-controls-state-button"]';
+    const SEL_NEXT = '[data-testid="audio-player-controls-forward-button"]';
+    const SEL_PROGRESS = '[data-testid="audioplayerplaybackbody-progressbar"]';
+    const SEL_VOLUME = '[data-testid="audioplayervolumeslider-bar"]';
+    const SEL_TITLE = '[data-testid="audioplayeraudioinfo-title"]';
+    const SEL_EXTRA = '[data-testid="audioplayeraudioinfo-extra"]';
+    const SEL_NOTICE = '[data-testid="audioplayeraudioinfo-titleNoticeIcon"]';
+    const SEL_PROGRESSTIME = '[data-testid="audioplayerplaybackbody-progresstime"]';
+    const SEL_COVER = '[data-testid="audioplayerplaybackbody-cover"]';
+    const SEL_SHARE = '[data-testid="MusicAudio_Share"]';
+    const SWAP_ICON = '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 8h13"/><path d="M15 5l3 3-3 3"/><path d="M19 16H6"/><path d="M9 13l-3 3 3 3"/></svg>';
+    const SWAP_ACCENT = '#71aaeb';
+
+    function fmtTime(s) {
+      if (!isFinite(s) || s < 0) s = 0;
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = Math.floor(s % 60);
+      const ss = (sec < 10 ? '0' : '') + sec;
+      return h > 0 ? h + ':' + (m < 10 ? '0' : '') + m + ':' + ss : m + ':' + ss;
+    }
+
+    // VK renders the player block twice (in-flow + the pinned copy that takes
+    // over once the page scrolls — the extension pins it too). Only one is on
+    // screen; like content.js, take the on-screen one with the largest bottom.
+    // When two copies are on screen at once (scrolling hands the block over
+    // from one to the other) the one the user actually SEES is the one that is
+    // topmost at its own centre; the copy the panel must cover is that one.
+    function getVisibleNativePanel() {
+      let best = null, bestBottom = -Infinity;
+      let seen = null, seenBottom = -Infinity;
+      for (const el of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0 || r.bottom <= 0 || r.top >= window.innerHeight) continue;
+        if (r.bottom > bestBottom) { best = el; bestBottom = r.bottom; }
+        try {
+          const cx = Math.min(Math.max(r.left + r.width / 2, 0), window.innerWidth - 1);
+          const cy = Math.min(Math.max(r.top + r.height / 2, 0), window.innerHeight - 1);
+          const top = document.elementsFromPoint(cx, cy).find(e => !(panelEl && panelEl.contains(e)));
+          if (top && el.contains(top) && r.bottom > seenBottom) { seen = el; seenBottom = r.bottom; }
+        } catch {}
+      }
+      return seen || best || document.querySelector(NATIVE_PANEL_SELECTOR);
+    }
+
+    function nativeButtons(native) {
+      return [...native.querySelectorAll('button')].filter(b => !b.hasAttribute('data-vmu-swap-native'));
+    }
+    function panelButtons() {
+      return [...panelEl.querySelectorAll('button')].filter(b => !b.hasAttribute('data-vmu-swap'));
+    }
+
+    // The real button behind a button of the copy: by data-testid when it has
+    // one, otherwise by position (the copy has the same button order).
+    function nativeButtonFor(cloneBtn, native) {
+      const tid = cloneBtn.getAttribute('data-vmu-testid');
+      if (tid) {
+        const b = native.querySelector('[data-testid="' + tid + '"]');
+        if (b) return b;
+      }
+      const i = panelButtons().indexOf(cloneBtn);
+      return i >= 0 ? (nativeButtons(native)[i] || null) : null;
+    }
+
+    function clickNativeNavButton(dir) {
+      const sel = dir === 'next' ? SEL_NEXT : SEL_PREV;
+      const native = getVisibleNativePanel();
+      const btn = native ? native.querySelector(sel) : document.querySelector(sel);
+      if (btn) { btn.click(); return; }
+      if (window.ap) {
+        const m = dir === 'next' ? 'playNext' : 'playPrev';
+        try { if (typeof window.ap[m] === 'function') window.ap[m](); } catch {}
+      }
+    }
+
+    // Both states of the play button are remembered from the native block as
+    // it shows them, so the copy can show the right icon at any moment.
+    function cacheNativeIcon() {
+      cacheNativeBar();
+      const native = getVisibleNativePanel();
+      const btn = native && native.querySelector(SEL_PLAY);
+      const svg = btn && btn.querySelector('svg');
+      if (!svg) return;
+      const cls = svg.getAttribute('class') || '';
+      if (cls.includes('play_circle')) iconCache.play = btn.innerHTML;
+      else if (cls.includes('pause_circle')) iconCache.pause = btn.innerHTML;
+    }
+
+    // The native progress bar has two looks: a «loading» skeleton (one full
+    // fill + animated stripes, no hover layer) while VK thinks it is
+    // buffering, and the real three-layer bar (buffered / played / hover, the
+    // last one carrying the pointer cursor). A copy taken during loading never
+    // gets the real structure by itself — it stayed striped with a dead
+    // timeline for the whole track. So the real markup is remembered whenever
+    // the native bar shows it, and the copy is given it as soon as it can.
+    let progressBarCache = null;
+    function barFills(bar) { return bar ? bar.querySelectorAll('div[style*="width"]') : []; }
+    function isReadyBar(bar) { return barFills(bar).length >= 3; }
+    function cacheNativeBar() {
+      for (const native of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
+        const bar = native.querySelector(SEL_PROGRESS);
+        if (isReadyBar(bar)) { progressBarCache = bar.innerHTML; return; }
+      }
+    }
+    function ensureReadyBar() {
+      const bar = panelCtl && panelCtl.progressBar;
+      if (!bar || isReadyBar(bar)) return false;
+      if (progressBarCache) {
+        bar.innerHTML = progressBarCache;
+        renameTestIds(bar);
+        for (const f of barFills(bar)) f.style.width = '0%';
+        return true;
+      }
+      // nothing real seen yet: at least drop the loading stripes
+      bar.querySelectorAll('div').forEach(n => {
+        if (/repeating-linear-gradient/.test(getComputedStyle(n).backgroundImage)) n.style.display = 'none';
+      });
+      return false;
+    }
+
+    function renameTestIds(root) {
+      root.querySelectorAll('[data-testid]').forEach(n => {
+        n.setAttribute('data-vmu-testid', n.getAttribute('data-testid'));
+        n.removeAttribute('data-testid');
+      });
+    }
+
+    // The toggle button is a stripped clone of the native share button, so it
+    // gets VK's own size / hover / colours.
+    function makeSwapButton(native, title, attr, active) {
+      const share = native.querySelector(SEL_SHARE);
+      const b = share ? share.cloneNode(false) : document.createElement('button');
+      b.removeAttribute('data-testid');
+      b.removeAttribute('data-vmu-testid');
+      b.removeAttribute('id');
+      b.setAttribute(attr, '1');
+      b.setAttribute('type', 'button');
+      // the vmu- class lets content.js' title→tooltip bridge pick the button up
+      // (it only acts on vmu- elements) — otherwise the browser's own grey
+      // tooltip shows on the copy VK's native block carries
+      b.classList.add('vmu-swap-btn');
+      b.setAttribute('title', title);
+      b.setAttribute('aria-label', title);
+      b.innerHTML = SWAP_ICON;
+      if (active) b.style.color = SWAP_ACCENT;
+      return b;
+    }
+
+    function ensurePanelShell() {
+      if (panelEl) return;
+      panelEl = document.createElement('section');
+      panelEl.id = 'vmu-overlay-panel';
+      Object.assign(panelEl.style, {
+        position: 'fixed',
+        top: '0px',
+        left: '0px',
+        width: '0px',
+        margin: '0',
+        opacity: '0',
+        pointerEvents: 'none',
+        transition: 'none',
+        boxSizing: 'border-box',
+      });
+      // no shadow at all — neither ours nor one that comes with the copied classes
+      panelEl.style.setProperty('box-shadow', 'none', 'important');
+
+      const stop = e => { e.stopPropagation(); e.preventDefault(); };
+      let dragging = null;
+      const ratioIn = (el, clientX) => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : null;
+      };
+      const seekTo = clientX => {
+        if (!overlay || !panelCtl || !panelCtl.progressBar) return;
+        const dur = overlay.audioEl.duration;
+        const ratio = ratioIn(panelCtl.progressBar, clientX);
+        if (ratio === null || !isFinite(dur) || dur <= 0) return;
+        overlay.audioEl.currentTime = ratio * dur;
+        updatePanel();
+      };
+      const setVolumeTo = clientX => {
+        if (!overlay || !panelCtl || !panelCtl.volumeBar) return;
+        const pos = ratioIn(panelCtl.volumeBar, clientX);
+        if (pos === null) return;
+        // VK's volume slider is logarithmic: position → volume = (35^pos − 1) / 34.
+        // VK's own volume is the source of truth (its sliders, the top bar,
+        // the saved setting all follow it); the overlay follows VK.
+        const vol = (Math.pow(35, pos) - 1) / 34;
+        try { window.ap.setVolume(vol); } catch {}
+        overlay.audioEl.muted = false;
+        overlay.audioEl.volume = Math.min(1, Math.max(0, vol));
+        updatePanel();
+      };
+
+      panelEl.addEventListener('mousedown', e => {
+        if (!overlay || !panelCtl) return;
+        if (panelCtl.progressBar && panelCtl.progressBar.contains(e.target)) { stop(e); dragging = 'seek'; seekTo(e.clientX); }
+        else if (panelCtl.volumeBar && panelCtl.volumeBar.contains(e.target)) { stop(e); dragging = 'volume'; setVolumeTo(e.clientX); }
+      }, true);
+      window.addEventListener('mousemove', e => {
+        if (dragging === 'seek') seekTo(e.clientX);
+        else if (dragging === 'volume') setVolumeTo(e.clientX);
+      });
+      window.addEventListener('mouseup', () => { dragging = null; });
+
+      // Time tooltip over the timeline, drawn like VK's own (dark bubble above
+      // the pointer), plus the lighter «hover» fill of the bar. VK's version is
+      // React-driven and does not survive the copy.
+      panelTip = document.createElement('div');
+      Object.assign(panelTip.style, {
+        position: 'fixed', display: 'none', zIndex: '2147483000', pointerEvents: 'none',
+        background: 'rgb(50, 50, 50)', color: 'rgb(225, 227, 230)', font: '400 13px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif',
+        padding: '9px 12px 10px', borderRadius: '8px', whiteSpace: 'nowrap',
+        boxShadow: '0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.4)',
+      });
+      document.body.appendChild(panelTip);
+      const hoverFill = () => {
+        if (!panelCtl || !panelCtl.progressBar) return null;
+        const fills = panelCtl.progressBar.querySelectorAll('div[style*="width"]');
+        return fills[2] || null;
+      };
+      const hideTip = () => {
+        if (panelTip) panelTip.style.display = 'none';
+        const f = hoverFill(); if (f) f.style.width = '0%';
+      };
+      hidePanelTip = hideTip;
+      panelEl.addEventListener('mousemove', e => {
+        if (!overlay || !panelCtl) return hideTip();
+        // volume slider: VK's hint is the slider position as a percentage
+        if (panelCtl.volumeBar && (panelCtl.volumeBar.contains(e.target) || dragging === 'volume')) {
+          const pos = ratioIn(panelCtl.volumeBar, e.clientX);
+          if (pos === null) return hideTip();
+          panelTip.textContent = Math.floor(100 * pos) + '%';
+          panelTip.style.display = 'block';
+          const vr = panelCtl.volumeBar.getBoundingClientRect();
+          const w = panelTip.offsetWidth, h = panelTip.offsetHeight;
+          panelTip.style.left = Math.max(4, Math.min(window.innerWidth - w - 4, e.clientX - w / 2)) + 'px';
+          panelTip.style.top = Math.max(4, vr.top - h - 6) + 'px';
+          return;
+        }
+        if (!panelCtl.progressBar) return hideTip();
+        const bar = panelCtl.progressBar;
+        if (!bar.contains(e.target) && dragging !== 'seek') return hideTip();
+        const dur = overlay.audioEl.duration;
+        const ratio = ratioIn(bar, e.clientX);
+        if (ratio === null || !isFinite(dur) || dur <= 0) return hideTip();
+        panelTip.textContent = fmtTime(ratio * dur);
+        panelTip.style.display = 'block';
+        const br = bar.getBoundingClientRect();
+        const tw = panelTip.offsetWidth, th = panelTip.offsetHeight;
+        panelTip.style.left = Math.max(4, Math.min(window.innerWidth - tw - 4, e.clientX - tw / 2)) + 'px';
+        panelTip.style.top = Math.max(4, br.top - th - 6) + 'px';
+        const f = hoverFill(); if (f) f.style.width = (ratio * 100) + '%';
+      });
+      panelEl.addEventListener('mouseleave', hideTip);
+
+      panelEl.addEventListener('click', e => {
+        if (!overlay || !panelCtl) return;
+        if ((panelCtl.progressBar && panelCtl.progressBar.contains(e.target)) ||
+            (panelCtl.volumeBar && panelCtl.volumeBar.contains(e.target))) { stop(e); return; }
+        if (panelCtl.progressTime && panelCtl.progressTime.contains(e.target)) {
+          stop(e);
+          try { window.ap.toggleDurationType(); } catch {}
+          updatePanel();
+          return;
+        }
+        const btn = e.target.closest && e.target.closest('button');
+        if (!btn || !panelEl.contains(btn)) return;
+        stop(e);
+        if (btn.hasAttribute('data-vmu-swap')) { switchToOriginal(); return; }
+        if (btn === panelCtl.playBtn) {
+          if (overlay.audioEl.paused) overlay.audioEl.play().catch(() => {});
+          else overlay.audioEl.pause();
+          return;
+        }
+        if (btn === panelCtl.volButton) {
+          // VK's mute is «volume 0, previous volume remembered»
+          try { window.ap.toggleMuted(); } catch {}
+          followVkVolume();
+          updatePanel();
+          return;
+        }
+        const native = getVisibleNativePanel();
+        const real = native && nativeButtonFor(btn, native);
+        if (real) real.click();
+      }, true);
+    }
+
+    // Fresh copy of the native block's current markup + the toggle button.
+    function rebuildPanelContent(native) {
+      panelEl.className = native.className;
+      panelEl.innerHTML = native.innerHTML;
+      panelEl.querySelectorAll('[id]').forEach(n => n.removeAttribute('id'));
+      panelEl.querySelectorAll('[data-vmu-swap-native]').forEach(n => n.remove());
+      renameTestIds(panelEl);
+      const q = sel => panelEl.querySelector(sel.replace('data-testid', 'data-vmu-testid'));
+      panelCtl = {
+        playBtn: q(SEL_PLAY),
+        progressBar: q(SEL_PROGRESS),
+        volumeBar: q(SEL_VOLUME),
+        titleEl: q(SEL_TITLE),
+        extraEl: q(SEL_EXTRA),
+        noticeIcon: q(SEL_NOTICE),
+        progressTime: q(SEL_PROGRESSTIME),
+        cover: q(SEL_COVER),
+        volButton: null,
+      };
+      // the button right before the volume slider is VK's mute toggle
+      if (panelCtl.volumeBar) {
+        for (const b of panelEl.querySelectorAll('button')) {
+          if (b.compareDocumentPosition(panelCtl.volumeBar) & Node.DOCUMENT_POSITION_FOLLOWING) panelCtl.volButton = b;
+        }
+      }
+      const share = q(SEL_SHARE);
+      const sw = makeSwapButton(native, 'Включить оригинал', 'data-vmu-swap', true);
+      if (share && share.parentNode) share.parentNode.insertBefore(sw, share);
+      else panelEl.appendChild(sw);
+    }
+
+    // Texts / bars of the copy are ours, everything else stays native.
+    function applyOverrides(match) {
+      if (!panelCtl) return;
+      if (panelCtl.titleEl) panelCtl.titleEl.textContent = decodeEntities(match.title || '');
+      if (panelCtl.extraEl) panelCtl.extraEl.textContent = decodeEntities(match.artist || '');
+      if (panelCtl.noticeIcon) panelCtl.noticeIcon.style.display = 'none';
+      if (panelCtl.progressBar) {
+        ensureReadyBar();
+        const fills = panelCtl.progressBar.querySelectorAll('div[style*="width"]');
+        if (fills[0]) fills[0].style.width = '100%'; // buffered
+        if (fills[1]) fills[1].style.width = '0%';   // played
+        // a copy taken while VK was still buffering carries its loading animation
+        panelCtl.progressBar.querySelectorAll('*').forEach(n => {
+          if (getComputedStyle(n).animationName !== 'none') n.style.animation = 'none';
+        });
+      }
+      updatePanel();
+    }
+
+    // Keeps the copy's buttons (toggle states, like, dislike...) and cover in
+    // step with the native block.
+    function syncFromNative() {
+      if (!panelEl || !panelCtl) return;
+      const native = getVisibleNativePanel();
+      if (!native) return;
+      if (panelCtl.progressBar && !isReadyBar(panelCtl.progressBar) && ensureReadyBar() && currentMatch) applyOverrides(currentMatch);
+      const nb = nativeButtons(native), cb = panelButtons();
+      if (nb.length !== cb.length) {
+        rebuildPanelContent(native);
+        if (currentMatch) applyOverrides(currentMatch);
+        return;
+      }
+      for (let i = 0; i < nb.length; i++) {
+        const n = nb[i], c = cb[i];
+        if (c === panelCtl.playBtn) continue; // (the mute button follows VK's volume like the rest)
+        if (c.className !== n.className) c.className = n.className;
+        for (const a of n.attributes) {
+          if (a.name === 'data-testid' || a.name === 'style' || a.name === 'id') continue;
+          if (c.getAttribute(a.name) !== a.value) c.setAttribute(a.name, a.value);
+        }
+        for (const a of [...c.attributes]) {
+          if (/^(data-vmu|style$|id$|data-testid$)/.test(a.name)) continue;
+          if (!n.hasAttribute(a.name)) c.removeAttribute(a.name);
+        }
+        if (c.__vmuSig !== n.innerHTML) {
+          c.innerHTML = n.innerHTML;
+          c.__vmuSig = n.innerHTML;
+          renameTestIds(c);
+        }
+      }
+      const nc = native.querySelector(SEL_COVER);
+      if (nc && panelCtl.cover && panelCtl.cover.__vmuSig !== nc.innerHTML) {
+        panelCtl.cover.innerHTML = nc.innerHTML;
+        panelCtl.cover.__vmuSig = nc.innerHTML;
+        renameTestIds(panelCtl.cover);
+      }
+    }
+
+    // The small player in VK's top bar (shown while the big block is scrolled
+    // out of view) carries «Artist — Title» of the ORIGINAL and the restriction
+    // icon. While the community version plays it shows the same text as the
+    // panel. React owns these nodes, so only the data of existing text nodes
+    // is changed (never the structure), re-asserted on a timer in case VK
+    // rewrites it, and handed back only if it is still our text.
+    let topSaved = null; // { root, recs: [{ n, orig, ours }], icon, iconDisplay }
+    function applyTopPlayer(match) {
+      const root = document.querySelector('[data-testid="TopAudioPlayer_Title"]');
+      if (!root || !match) return;
+      const nodes = [];
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) nodes.push(walker.currentNode);
+      if (topSaved && topSaved.root === root && topSaved.match === match && nodes.length === topSaved.recs.length && nodes.every((n, i) => topSaved.recs[i].n === n)) {
+        for (const r of topSaved.recs) if (r.n.data !== r.ours) r.n.data = r.ours;
+        if (topSaved.icon && topSaved.icon.style.display !== 'none') topSaved.icon.style.display = 'none';
+        return;
+      }
+      if (!nodes.length) return;
+      if (topSaved) restoreTopPlayer(); // a previous track's record: undo what is still ours first
+      const artist = decodeEntities(match.artist || ''), title = decodeEntities(match.title || '');
+      const sep = nodes.findIndex(n => /^\s*[—–-]\s*$/.test(n.data));
+      const recs = nodes.map((n, i) => {
+        let ours;
+        if (sep < 0) ours = i === nodes.length - 1 ? title : n.data;
+        else if (i < sep) ours = i === 0 ? artist : '';
+        else if (i === sep) ours = n.data;
+        else ours = i === nodes.length - 1 ? title : '';
+        return { n, orig: n.data, ours };
+      });
+      const icon = root.querySelector('svg');
+      topSaved = { root, recs, icon, iconDisplay: icon ? icon.style.display : '', match };
+      for (const r of recs) r.n.data = r.ours;
+      if (icon) icon.style.display = 'none';
+    }
+    function restoreTopPlayer() {
+      const s = topSaved;
+      topSaved = null;
+      if (!s) return;
+      for (const r of s.recs) if (r.n.data === r.ours) r.n.data = r.orig;
+      if (s.icon) s.icon.style.display = s.iconDisplay;
+    }
+
+    function updatePanelPlayIcon(isPlaying) {
+      if (!panelCtl || !panelCtl.playBtn) return;
+      // one of the two looks may never have been seen on the native button yet
+      // (it only shows the state it is in) — derive it from the other one
+      const swapIcon = (html, from, to) => (html ? html.replace(new RegExp(from + '_circle', 'g'), to + '_circle') : null);
+      const desired = isPlaying
+        ? (iconCache.pause || swapIcon(iconCache.play, 'play', 'pause'))
+        : (iconCache.play || swapIcon(iconCache.pause, 'pause', 'play'));
+      if (desired && panelCtl.playBtn.innerHTML !== desired) {
+        try { panelCtl.playBtn.innerHTML = desired; } catch {}
+      }
+    }
+
+    // Returns the native panel's on-screen rect (the content column can be
+    // shifted by the extension's «Смещение контента» slider with a left
+    // transition, and the pinned copy moves while scrolling — so this is
+    // re-read continuously instead of on a few events).
+    let _lastRect = null;
+    function positionOverNative() {
+      if (!panelEl) return null;
+      const native = getVisibleNativePanel();
+      if (!native) return _lastRect;
+      const r = native.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return _lastRect;
+      _lastRect = r;
+      if (panelEl.previousElementSibling !== native) {
+        native.after(panelEl);
+        const nz = parseInt(getComputedStyle(native).zIndex, 10);
+        panelEl.style.zIndex = String(isFinite(nz) ? nz + 1 : 2);
+      }
+      // the corner radius comes from the native block's context, not from its
+      // classes, so the copy would be square — and the pinned copy rounds
+      // differently from the in-flow one, hence read on every move
+      const nbr = getComputedStyle(native).borderRadius;
+      if (panelEl.style.borderRadius !== nbr) panelEl.style.borderRadius = nbr;
+      // the thin outline of the native block is an inset ring on its ::before,
+      // which the copy does not get; the copy draws the same ring on itself
+      // (and still no outer shadow)
+      // (the in-flow block keeps it on ::before, the pinned one on itself as
+      // inset shadows — both are read, outer shadows are dropped)
+      const insetParts = css => (css && css !== 'none' ? css.split(/,(?![^(]*\))/).map(s => s.trim()).filter(s => /\binset\b/.test(s)) : []);
+      const rings = insetParts(getComputedStyle(native).boxShadow).concat(insetParts(getComputedStyle(native, '::before').boxShadow));
+      const wantRing = rings.length ? rings.join(', ') : 'none';
+      if (panelEl.__vmuRing !== wantRing) {
+        panelEl.__vmuRing = wantRing;
+        panelEl.style.setProperty('box-shadow', wantRing, 'important');
+      }
+      panelEl.style.left = r.left + 'px';
+      panelEl.style.top = r.top + 'px';
+      panelEl.style.width = r.width + 'px';
+      panelEl.style.height = r.height + 'px';
+      return r;
+    }
+
+    // setInterval, not rAF: rAF stops in a background tab, and the panel
+    // must stay glued to the native one for as long as it is shown.
+    // While the copy is on screen the native block(s) underneath are made
+    // invisible (opacity, not display/visibility: the block keeps its place,
+    // its geometry and its hit-testing, which the copy and the forwarded
+    // clicks rely on). The 40 ms tracker also catches the second copy VK
+    // swaps in while scrolling. Everything is handed back the moment the copy
+    // starts to leave.
+    let panelShownAt = 0;
+    function setNativesHidden(hide) {
+      for (const n of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
+        if (hide) {
+          if (n.dataset.vmuHid !== '1') { n.dataset.vmuHid = '1'; n.dataset.vmuOp = n.style.opacity || ''; }
+          if (n.style.opacity !== '0') n.style.opacity = '0';
+        } else if (n.dataset.vmuHid === '1') {
+          n.style.opacity = n.dataset.vmuOp || '';
+          delete n.dataset.vmuHid;
+          delete n.dataset.vmuOp;
+        }
+      }
+    }
+    let _trackTimer = null;
+    let _trackTick = 0;
+    function startPositionTracking() {
+      if (_trackTimer) return;
+      _trackTimer = setInterval(() => {
+        positionOverNative();
+        // after the slide-in has finished
+        if (overlay && overlay.mode === 'community' && panelShownAt && Date.now() - panelShownAt > 450) setNativesHidden(true);
+        if (++_trackTick % 5 === 0) {
+          syncFromNative();
+          updatePanel(); // the play/pause icon and the timer must not wait for the next timeupdate
+          // VK sets its own media metadata a moment after a track starts (page-load
+          // autoplay especially) — the community title is put back
+          try {
+            if (overlay && overlay.mode === 'community' && ourMediaMetadata && navigator.mediaSession
+              && navigator.mediaSession.metadata !== ourMediaMetadata) navigator.mediaSession.metadata = ourMediaMetadata;
+          } catch {}
+          if (overlay && overlay.mode === 'community') applyTopPlayer(overlay.match);
+          else if (topSaved && !panelGrace) restoreTopPlayer();
+        }
+      }, 40);
+    }
+    function stopPositionTracking() {
+      if (_trackTimer) { clearInterval(_trackTimer); _trackTimer = null; }
+    }
+
+    let _hideTimer = null;
+    // Consecutive swapped tracks: the panel is NOT taken away and brought back
+    // between them. On teardown it waits a moment (_graceTimer); if the next
+    // track is swapped too, showPanel just refills the panel that is already
+    // on screen — no slide, no flash of VK's own block, no header flicker.
+    let panelVisible = false;
+    let panelGrace = false;
+    let _graceTimer = null;
+    function showPanel(match) {
+      const native = getVisibleNativePanel();
+      if (!native || !overlay) return;
+      currentMatch = match;
+      if (_graceTimer) { clearTimeout(_graceTimer); _graceTimer = null; }
+      panelGrace = false;
+      const recopy = () => {
+        // the native block may still have been in its loading state when it was
+        // copied just now — take a second copy once VK has settled
+        const live = overlay && overlay.mode !== 'original' && panelEl && getVisibleNativePanel();
+        if (!live) return;
+        rebuildPanelContent(live);
+        applyOverrides(match);
+      };
+      if (panelVisible && panelEl && panelEl.isConnected) {
+        ensurePanelShell();
+        rebuildPanelContent(native);
+        positionOverNative();
+        applyOverrides(match);
+        applyTopPlayer(match);
+        startPositionTracking();
+        setTimeout(recopy, 400);
+        return;
+      }
+      panelShownAt = Date.now();
+      ensurePanelShell();
+      rebuildPanelContent(native);
+      const r = positionOverNative();
+      applyOverrides(match);
+      applyTopPlayer(match);
+      startPositionTracking();
+
+      // Slide down from above onto the native block. The start state is
+      // applied without a transition and flushed with a reflow, so the browser
+      // has a real "from" value to animate from. The content column sits
+      // below VK's top bar in the stacking order, so it emerges from under it.
+      const hiddenY = r ? -(r.top + r.height + 24) : -160;
+      if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
+      panelEl.style.transition = 'none';
+      panelEl.style.opacity = '0';
+      panelEl.style.transform = 'translateY(' + hiddenY + 'px)';
+      panelEl.style.pointerEvents = 'auto';
+      void panelEl.offsetHeight;
+      panelEl.style.transition = 'transform 0.42s cubic-bezier(0.2, 0.9, 0.3, 1), opacity 0.25s ease-out';
+      panelEl.style.opacity = '1';
+      panelEl.style.transform = 'translateY(0)';
+      panelVisible = true;
+      setTimeout(recopy, 400);
+    }
+
+    // graceMs: keep the panel for that long in case the next track is swapped
+    // too (see above); without it the panel leaves right away.
+    function hidePanel(graceMs) {
+      if (!panelEl) return;
+      if (graceMs && panelVisible) {
+        panelGrace = true;
+        if (_graceTimer) clearTimeout(_graceTimer);
+        _graceTimer = setTimeout(() => {
+          _graceTimer = null;
+          panelGrace = false;
+          if (!overlay || overlay.mode === 'original') { restoreTopPlayer(); hidePanel(); }
+        }, graceMs);
+        return;
+      }
+      if (_graceTimer) { clearTimeout(_graceTimer); _graceTimer = null; }
+      panelGrace = false;
+      panelVisible = false;
+      const r = _lastRect;
+      const hiddenY = r ? -(r.top + r.height + 24) : -160;
+      if (hidePanelTip) hidePanelTip();
+      panelShownAt = 0;
+      setNativesHidden(false);
+      panelEl.style.pointerEvents = 'none';
+      panelEl.style.transition = 'transform 0.3s cubic-bezier(0.5, 0, 0.8, 0.4), opacity 0.25s ease-in';
+      panelEl.style.opacity = '0';
+      panelEl.style.transform = 'translateY(' + hiddenY + 'px)';
+      if (_hideTimer) clearTimeout(_hideTimer);
+      _hideTimer = setTimeout(() => {
+        _hideTimer = null;
+        if (!overlay || overlay.mode === 'original') { stopPositionTracking(); if (panelEl) panelEl.remove(); }
+      }, 450);
+    }
+
+    // VK's volume (0..1, 0 = muted) drives the overlay, whoever changed it
+    function followVkVolume() {
+      if (!overlay) return;
+      const ap = window.ap;
+      if (!ap || typeof ap.getVolume !== 'function') return;
+      let v;
+      try { v = ap.getVolume(); } catch { return; }
+      if (typeof v !== 'number' || !isFinite(v)) return;
+      v = Math.min(1, Math.max(0, v));
+      const a = overlay.audioEl;
+      if (Math.abs(a.volume - v) > 0.002) { try { a.volume = v; } catch {} }
+      if (a.muted) a.muted = false;
+    }
+
+    function updatePanel() {
+      if (!panelCtl || !overlay) return;
+      followVkVolume();
+      const a = overlay.audioEl;
+      const cur = a.currentTime;
+      const dur = a.duration;
+      if (panelCtl.progressBar && isFinite(dur) && dur > 0) {
+        const fills = panelCtl.progressBar.querySelectorAll('div[style*="width"]');
+        if (fills[1]) fills[1].style.width = (cur / dur * 100) + '%';
+      }
+      if (panelCtl.progressTime) {
+        // a click on the timer switches elapsed ↔ remaining (VK keeps the choice in ap)
+        let remaining = false;
+        try { remaining = !!(window.ap && window.ap.constructor._lsGet(window.ap.constructor.LS_DURATION_TYPE)); } catch {}
+        const txt = remaining && isFinite(dur) && dur > 0 ? '-' + fmtTime(Math.max(0, dur - cur)) : fmtTime(cur);
+        if (panelCtl.progressTime.textContent !== txt) panelCtl.progressTime.textContent = txt;
+      }
+      if (panelCtl.volumeBar) {
+        const fill = panelCtl.volumeBar.querySelector('div[style*="width"]');
+        // the same logarithmic position as VK's slider shows
+        if (fill) fill.style.width = (a.muted ? 0 : Math.log(1 + 34 * a.volume) / Math.log(35) * 100) + '%';
+      }
+      updatePanelPlayIcon(!a.paused);
+    }
+
+    // --- original <-> community version -------------------------------------
+    // «original» hands the (still muted, still paused) native element back to
+    // VK for real and slides the copy away, so VK's own panel is fully in
+    // charge; the same toggle button is injected into VK's panel to come back.
+    let nativeSwapTimer = null;
+    function ensureNativeSwapButton() {
+      const native = getVisibleNativePanel();
+      const share = native && native.querySelector(SEL_SHARE);
+      if (!share || !share.parentNode) return;
+      if (share.parentNode.querySelector('[data-vmu-swap-native]')) return;
+      const b = makeSwapButton(native, 'Включить версию сообщества', 'data-vmu-swap-native', true);
+      b.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); switchToCommunity(); }, true);
+      share.parentNode.insertBefore(b, share);
+    }
+    function startNativeSwapButton() {
+      if (nativeSwapTimer) clearInterval(nativeSwapTimer);
+      ensureNativeSwapButton();
+      nativeSwapTimer = setInterval(ensureNativeSwapButton, 300);
+    }
+    function removeNativeSwapButton() {
+      if (nativeSwapTimer) { clearInterval(nativeSwapTimer); nativeSwapTimer = null; }
+      document.querySelectorAll('[data-vmu-swap-native]').forEach(n => n.remove());
+    }
+
+    function switchToOriginal() {
+      if (!overlay || overlay.mode === 'original') return;
+      const nat = overlay.nativeEl;
+      overlay.mode = 'original';
+      if (overlay.keepAlive) { clearInterval(overlay.keepAlive); overlay.keepAlive = null; }
+      try { overlay.audioEl.pause(); } catch {}
+      hidePanel();
+      applyMediaSession(false);
+      restoreTopPlayer();
+      startNativeSwapButton();
+      // The native element cannot simply be resumed: while the community
+      // version covered the track VK's player was kept in a «playing» state it
+      // was never really in (and for a blocked original its stream had already
+      // failed), so play() on the old element produced silence. VK is asked to
+      // start the current track afresh instead — with the controller flagged as
+      // not playing, its own «play the current audio» path loads it from
+      // scratch, exactly as a click on the row does.
+      overlay.originalSince = Date.now();
+      overlay.origPlayedAt = 0;
+      overlay.originalTries = 0;
+      overlay.retrying = false;
+      // never leave the user in silence: if after a few seconds the original has
+      // not moved (and was not paused on purpose), the community version returns
+      const ovAtSwitch = overlay;
+      setTimeout(() => {
+        if (overlay !== ovAtSwitch || ovAtSwitch.mode !== 'original') return;
+        let progress = 0, playing = false;
+        try { progress = window.ap.getCurrentProgress(); playing = window.ap.isPlaying(); } catch {}
+        if (playing && !(progress > 0.001)) {
+          console.info('[vmu] preview-swap: the original did not start — back to the community version');
+          switchToCommunity();
+        }
+      }, 7000);
+      const viaVk = restartOriginalThroughVk();
+      if (!viaVk && nat) {
+        try { nat.muted = false; } catch {}
+        try { nat.play(); } catch {}
+      }
+      console.info('[vmu] preview-swap: switched to the original' + (viaVk ? ' (restarted through VK)' : ' (resumed the old element)'));
+    }
+
+    function restartOriginalThroughVk(full) {
+      const ap = window.ap;
+      if (!ap || typeof ap.playAudioItem !== 'function' || typeof ap.getCurrentAudio !== 'function') return false;
+      try {
+        const cur = ap.getCurrentAudio();
+        if (!cur) return false;
+        // VK's player core believes it is playing (it was told so by hand while
+        // the community version covered the track, and its real element was
+        // paused behind its back), so a plain «play» is a no-op for it: a real
+        // pause first brings its state back in line with the element.
+        const tm = ap.implTaskManager;
+        if (!full && tm && typeof tm.pause === 'function' && typeof tm.play === 'function') {
+          // first attempt: the loaded original is simply started for real
+          Promise.resolve(tm.pause()).catch(() => {})
+            .then(() => (overlay && overlay.mode === 'original') ? tm.play() : null)
+            .then(() => {
+              const ov = overlay;
+              if (!ov || ov.mode !== 'original') return;
+              syncVkPlayState(true);
+              // if the core had no live element to start (its provider was torn
+              // down by the failure the community version covered), nothing
+              // reaches an element — load the track from scratch instead
+              setTimeout(() => {
+                if (overlay === ov && ov.mode === 'original' && !ov.origPlayedAt) restartOriginalThroughVk(true);
+              }, 700);
+            })
+            .catch(err => console.warn('[vmu] preview-swap: start of the original failed', err));
+        } else {
+          // later attempts: VK loads the current track from scratch (after a real
+          // pause, so the core's idea of «playing» is cleared, and a short wait so
+          // that the element's own pause event has been handled)
+          Promise.resolve(tm && tm.pause ? tm.pause() : null).catch(() => {})
+            .then(() => new Promise(r => setTimeout(r, 200)))
+            .then(() => {
+              if (!overlay || overlay.mode !== 'original') return;
+              ap.setIsPlaying(false);
+              return ap.playAudioItem({ audio: cur, playlist: ap.getCurrentPlaylist() });
+            })
+            .catch(err => console.warn('[vmu] preview-swap: restart of the original failed', err));
+        }
+        return true;
+      } catch (err) {
+        console.warn('[vmu] preview-swap: could not restart the original through VK', err);
+        return false;
+      }
+    }
+
+    // A blocked original is refused by the CDN about half the time (the same
+    // track plays natively on the next attempt), and VK answers a refusal by
+    // jumping to the next track. While the original is starting, a failure is
+    // not passed on: the start is retried a few times, and if it keeps being
+    // refused the community version takes over again instead of a skip.
+    function scheduleOriginalRetry() {
+      const ov = overlay;
+      if (!ov || ov.mode !== 'original' || ov.retrying) return;
+      ov.retrying = true;
+      setTimeout(() => {
+        if (overlay !== ov || ov.mode !== 'original') return;
+        ov.retrying = false;
+        if (ov.originalTries >= 3) {
+          console.info('[vmu] preview-swap: the original keeps failing — back to the community version');
+          switchToCommunity();
+          return;
+        }
+        ov.originalTries++;
+        ov.originalSince = Date.now();
+        console.info('[vmu] preview-swap: the original failed to start — retry ' + ov.originalTries);
+        restartOriginalThroughVk(true);
+      }, 500);
+    }
+
+    function switchToCommunity() {
+      if (!overlay || overlay.mode !== 'original') return;
+      const nat = overlay.nativeEl;
+      // native first: the pause hook mirrors a native pause onto the overlay
+      if (nat) {
+        try { nat.pause(); } catch {}
+        try { nat.muted = true; } catch {}
+      }
+      overlay.mode = 'community';
+      applyMediaSession(true);
+      removeNativeSwapButton();
+      overlay.audioEl.play().catch(() => {});
+      startNativeKeepAlive(overlay);
+      showPanel(overlay.match);
+      console.info('[vmu] preview-swap: switched to the community version');
+    }
+
+    // --- Media session: media keys and the browser's media panel ------------
+    // VK registers play / pause / previous / next handlers that drive ITS
+    // player — which is silent (and, after a failure, out of step) while the
+    // community version plays through the overlay. While the overlay is the
+    // sound source, play / pause go to it directly and the panel gets the
+    // community title and a working timeline (seek); previous / next stay
+    // VK's. Everything is handed back to VK when the overlay goes away.
+    const vkMediaHandlers = {};
+    let origSetActionHandler = null;
+    let savedMediaMetadata = null;
+    let ourMediaMetadata = null;
+    function overlayIsSource() { return !!(overlay && overlay.mode === 'community'); }
+    function mediaDispatcher(action) {
+      return details => {
+        if (overlayIsSource()) {
+          const a = overlay.audioEl;
+          if (action === 'play') a.play().catch(() => {}); else a.pause();
+          updatePanel();
+          return;
+        }
+        const h = vkMediaHandlers[action];
+        if (typeof h === 'function') return h.call(navigator.mediaSession, details);
+        const native = getVisibleNativePanel();
+        const btn = native && native.querySelector(SEL_PLAY);
+        if (btn) btn.click();
+      };
+    }
+    function syncMediaPosition() {
+      if (!overlayIsSource()) return;
+      const a = overlay.audioEl;
+      try {
+        if (isFinite(a.duration) && a.duration > 0) {
+          navigator.mediaSession.setPositionState({ duration: a.duration, position: Math.min(a.currentTime, a.duration), playbackRate: a.playbackRate || 1 });
+        }
+      } catch {}
+    }
+    function applyMediaSession(active) {
+      const ms = navigator.mediaSession;
+      if (!ms || !origSetActionHandler) return;
+      try {
+        for (const act of ['play', 'pause']) {
+          origSetActionHandler.call(ms, act, active ? mediaDispatcher(act) : (vkMediaHandlers[act] || mediaDispatcher(act)));
+        }
+        origSetActionHandler.call(ms, 'seekto', active ? details => {
+          if (!overlayIsSource() || !isFinite(overlay.audioEl.duration)) return;
+          overlay.audioEl.currentTime = Math.max(0, Math.min(details && details.seekTime || 0, overlay.audioEl.duration));
+          syncMediaPosition();
+          updatePanel();
+        } : null);
+        if (active) {
+          const md = ms.metadata;
+          if (!savedMediaMetadata) savedMediaMetadata = md || null;
+          const m = overlay && overlay.match;
+          if (m && window.MediaMetadata) {
+            ourMediaMetadata = new MediaMetadata({
+              title: decodeEntities(m.title || ''),
+              artist: decodeEntities(m.artist || ''),
+              album: md ? md.album : '',
+              artwork: md ? md.artwork : [],
+            });
+            ms.metadata = ourMediaMetadata;
+          }
+          syncMediaPosition();
+        } else {
+          // only undo what is still ours — VK may already have set the next track's
+          if (savedMediaMetadata && ourMediaMetadata && ms.metadata === ourMediaMetadata) ms.metadata = savedMediaMetadata;
+          savedMediaMetadata = null;
+          ourMediaMetadata = null;
+          try { ms.setPositionState(); } catch {}
+        }
+      } catch (err) {
+        console.warn('[vmu] preview-swap: media session not updated', err);
+      }
+    }
+    try {
+      if (window.MediaSession && navigator.mediaSession) {
+        origSetActionHandler = MediaSession.prototype.setActionHandler;
+        MediaSession.prototype.setActionHandler = function (action, handler) {
+          if (action === 'play' || action === 'pause') {
+            vkMediaHandlers[action] = handler || null;
+            if (overlayIsSource()) return; // keep ours while the overlay is the source
+          }
+          return origSetActionHandler.apply(this, arguments);
+        };
+      }
+    } catch {}
+
+    try {
+      const origMediaPlay = HTMLMediaElement.prototype.play;
+      const origMediaPause = HTMLMediaElement.prototype.pause;
+
+      HTMLMediaElement.prototype.play = function (...args) {
+        // Our own overlay element — always pass through unmodified
+        if (overlay && overlay.audioEl === this) {
+          return origMediaPlay.apply(this, args);
+        }
+
+        nativeAudioEl = this;
+
+        // Active overlay for the current VK slot — redirect play to overlay
+        // (unless the user switched to the original: then VK's element plays
+        // for real and nothing is swallowed)
+        if (overlay) {
+          const ca = window.ap && window.ap._currentAudio;
+          const curSlot = Array.isArray(ca) ? (ca[1] + '_' + ca[0]) : null;
+          if (curSlot === overlay.forSlotKey && overlay.mode === 'original') {
+            overlay.nativeEl = this;
+            overlay.origPlayedAt = Date.now();
+            try { this.muted = false; } catch {}
+            return origMediaPlay.apply(this, args);
+          }
+          if (curSlot === overlay.forSlotKey) {
+            overlay.nativeEl = this;
+            try { overlay.audioEl.play().catch(() => {}); } catch {}
+            signalNativePlaying(this);
+            return Promise.resolve();
+          }
+        }
+
+        // Swap pending (async URL fetch in progress) — keep native quiet
+        if (pendingSwapSlot) {
+          const ca = window.ap && window.ap._currentAudio;
+          const curSlot = Array.isArray(ca) ? (ca[1] + '_' + ca[0]) : null;
+          if (curSlot === pendingSwapSlot) return Promise.resolve();
+        }
+
+        // No overlay in effect — unmute and check if we should start one
+        try { this.muted = false; } catch {}
+        if (maybeSwap()) {
+          return Promise.resolve();
+        }
+        return origMediaPlay.apply(this, args);
+      };
+
+      // Forward VK UI pause to overlay so pause button actually silences it
+      HTMLMediaElement.prototype.pause = function (...args) {
+        if (overlay && overlay.nativeEl === this) {
+          try { overlay.audioEl.pause(); } catch {}
+        }
+        return origMediaPause.apply(this, args);
+      };
+    } catch (err) {
+      console.warn('[vmu] preview-swap: could not hook HTMLMediaElement.play/pause', err);
+    }
+
+    // VK's own player skips a track the moment its original stream fails —
+    // and a blocked original often does fail (the CDN answers 503 for it), ~0.35 s
+    // after the track starts. That is a race against our own stream lookup:
+    // when VK's failure wins it jumps to the next track, which the user sees
+    // as the swapped track "randomly skipping". Verified live with the swap
+    // switched off: the same track skips natively whenever the CDN refuses it.
+    // The failure reaches the audio controller as onFail → this._sendPlayerErrorStats(err)
+    // → handler(err), and the handler's first statement is
+    // «if (!this.isStateInitialized) return». So while a swap is running for the
+    // current track, the stats call is replaced by one that makes the handler
+    // return at once (isStateInitialized reads false for exactly that call).
+    let failSwallowedSlot = null;
+    function currentSlotKey() {
+      const ca = window.ap && window.ap._currentAudio;
+      return Array.isArray(ca) ? (ca[1] + '_' + ca[0]) : null;
+    }
+    // forceSwap: only from the real failure hooks. A failed original with a
+    // counterpart in the community is swapped even when VK drew no restriction
+    // icon for it (the icon is not always there for a track the CDN refuses),
+    // which the normal, icon-driven path would never have picked up.
+    function shouldSwallowNativeFailure(forceSwap) {
+      if (!enabled) return false;
+      maybeSwap(!!forceSwap); // the 400 ms backstop may not have noticed the new track yet
+      const cur = currentSlotKey();
+      if (!cur) return false;
+      if (pendingSwapSlot === cur) return true;
+      if (overlay && overlay.forSlotKey === cur) {
+        if (overlay.mode === 'community') return true;
+        // the original was asked for a moment ago and is still starting
+        if (overlay.mode === 'original' && Date.now() - (overlay.originalSince || 0) < 9000) return true;
+      }
+      return false;
+    }
+    // The same failure also arrives a second way: when the start of playback
+    // (implTaskManager.play()) rejects, the «play» routine catches it and calls
+    // the same «next track» path. A rejection for a swapped track is turned
+    // into a normal resolution.
+    function noteSwallowedFailure() {
+      if (overlay && overlay.mode === 'original') { scheduleOriginalRetry(); return; }
+      failSwallowedSlot = currentSlotKey();
+      if (overlay) overlay.failSwallowed = true;
+      console.info('[vmu] preview-swap: VK player failure on the original ignored — the community version is covering it');
+    }
+    function installFailGuard() {
+      const ap = window.ap;
+      if (!ap || ap.__vmuFailGuard || typeof ap._sendPlayerErrorStats !== 'function') return;
+      const tm = ap.implTaskManager;
+      if (!tm || typeof tm.play !== 'function') return;
+      ap.__vmuFailGuard = true;
+      const orig = ap._sendPlayerErrorStats;
+      ap._sendPlayerErrorStats = function (...args) {
+        let swallow = false;
+        try { swallow = shouldSwallowNativeFailure(true); } catch {}
+        if (!swallow) return orig.apply(this, args);
+        noteSwallowedFailure();
+        try {
+          Object.defineProperty(ap, 'isStateInitialized', { configurable: true, get: () => false });
+          Promise.resolve().then(() => { try { delete ap.isStateInitialized; } catch {} });
+        } catch {}
+      };
+      const origPlay = tm.play;
+      tm.play = function (...args) {
+        return Promise.resolve(origPlay.apply(this, args)).catch(err => {
+          let swallow = false;
+          try { swallow = shouldSwallowNativeFailure(true); } catch {}
+          if (!swallow) throw err;
+          noteSwallowedFailure();
+        });
+      };
+      // VK's pause button and the media keys. With no live native element
+      // (restored state, a provider torn down by a failure) VK's pause reaches
+      // nothing, and the overlay would play on — so the overlay is paused here.
+      // Only these two USER entry points: VK's own internals call the generic
+      // pause too (failure handling, switching tracks) and those must not stop us.
+      for (const name of ['pauseByButton', 'pauseByMediaSession']) {
+        const origPause = ap[name];
+        if (typeof origPause !== 'function') continue;
+        ap[name] = function (...a) {
+          try { if (overlayIsSource()) { overlay.audioEl.pause(); updatePanel(); } } catch {}
+          return origPause.apply(this, a);
+        };
+      }
+      // The play button resumes a paused overlay.
+      const origPlayByButton = ap.playByButton;
+      if (typeof origPlayByButton === 'function') {
+        ap.playByButton = function (...a) {
+          try { if (overlayIsSource() && overlay.audioEl.paused) { overlay.audioEl.play().catch(() => {}); updatePanel(); } } catch {}
+          return origPlayByButton.apply(this, a);
+        };
+      }
+      // Whatever route the failure took, it ends in an automatic «next»
+      // (auto: true — a press of the button is not automatic). While the swap
+      // covers the track that call is dropped. The failure counter that stops
+      // the whole player after a few failures in a row is not fed either.
+      const origNext = ap._playNextMarked;
+      if (typeof origNext === 'function') {
+        ap._playNextMarked = function (opts, ...rest) {
+          if (opts && opts.auto) {
+            let swallow = false;
+            try { swallow = shouldSwallowNativeFailure(); } catch {}
+            if (swallow) { noteSwallowedFailure(); return; }
+          }
+          return origNext.call(this, opts, ...rest);
+        };
+      }
+      for (const k of Object.getOwnPropertyNames(ap)) {
+        let policy;
+        try { policy = ap[k]; } catch { continue; }
+        if (!policy || typeof policy !== 'object' || typeof policy.emitFailure !== 'function') continue;
+        const origEmit = policy.emitFailure;
+        policy.emitFailure = function (...args) {
+          let swallow = false;
+          try { swallow = shouldSwallowNativeFailure(true); } catch {}
+          return swallow ? 'recover' : origEmit.apply(this, args);
+        };
+        break;
+      }
+    }
+    setInterval(installFailGuard, 300);
+
+    // resumeNative: true when OUR overlay finished on its own (the original
+    // was paused this whole time to freeze its own preview-cutoff clock —
+    // resuming, still muted, lets that clock run out and fire VK's normal
+    // auto-advance silently). false when the slot already moved on without
+    // us (user hit next/prev) — nativeEl is stale by then, VK is already
+    // playing whatever's next through a fresh element the .play() hook will
+    // unmute on its own.
+    // VK arms a ~20 s start watchdog on every play() and, when no 'playing'
+    // follows, resets the element (abort → emptied) and skips to the next
+    // track. The overlay swallows VK's play(), so the native element is told
+    // by hand that playback started. Verified live: without these events VK
+    // jumped to the next track exactly 20 s into every substituted one; with
+    // them it stays on the track (no further play() calls come back).
+    function signalNativePlaying(el) {
+      if (!el) return;
+      try {
+        el.dispatchEvent(new Event('play'));
+        el.dispatchEvent(new Event('playing'));
+      } catch {}
+    }
+    // VK's own idea of «playing» (top bar, row indicators, the pinned block)
+    // has to follow the overlay, or they show a play button while sound is
+    // coming out. After a swallowed failure the synthetic events above reach
+    // nothing, so the state is set on the controller itself, the way its own
+    // play / pause handlers do (flags + the «start» / «pause» notification).
+    function syncVkPlayState(playing) {
+      const ap = window.ap;
+      if (!ap || typeof ap.isPlaying !== 'function' || typeof ap.notify !== 'function') return;
+      try {
+        if (playing && !ap.isPlaying()) {
+          ap.setIsPaused(false); ap.setIsPlaying(true); ap.notify('start');
+        } else if (!playing && ap.isPlaying()) {
+          ap.setIsPlaying(false); ap.setIsPaused(true); ap.notify('pause');
+        }
+      } catch {}
+    }
+    function startNativeKeepAlive(ov) {
+      signalNativePlaying(ov.nativeEl);
+      ov.keepAlive = setInterval(() => {
+        if (overlay !== ov) return;
+        try { ov.nativeEl && ov.nativeEl.dispatchEvent(new Event('timeupdate')); } catch {}
+        if (ov.mode === 'community' && !ov.audioEl.paused) syncVkPlayState(true);
+      }, 500);
+    }
+
+    // mode: 'next'   — overlay finished naturally: unmute the native element and
+    //                  press VK's own «next» right away, instead of letting the
+    //                  muted preview run out its clock.
+    //       'native' — overlay failed: hand the original preview back.
+    //       falsy    — the slot already moved on without us.
+    function teardownOverlay(mode, reason) {
+      if (!overlay) return;
+      const oAudio = overlay.audioEl;
+      const oNative = overlay.nativeEl;
+      // the original already failed (VK's reaction was held back) — handing
+      // it back would play nothing, so move on instead
+      if (mode === 'native' && overlay.failSwallowed) mode = 'next';
+      if (overlay.keepAlive) clearInterval(overlay.keepAlive);
+      removeNativeSwapButton();
+      overlay = null; // clear BEFORE calling play to avoid re-entrant hook swallowing it
+      applyMediaSession(false);
+      // slot change / natural end: the next track may be swapped as well — keep
+      // the panel and the header text for a moment instead of flashing them away
+      const keepPanel = !mode || mode === 'next';
+      if (!keepPanel) restoreTopPlayer();
+      console.info('[vmu] preview-swap: overlay closed —', reason || (mode ? String(mode) : 'slot changed'));
+      hidePanel(keepPanel ? 1300 : 0);
+      try { oAudio.pause(); oAudio.removeAttribute('src'); oAudio.load(); } catch {}
+      if (mode === 'next') {
+        if (oNative) { try { oNative.muted = false; } catch {} }
+        try { clickNativeNavButton('next'); } catch {}
+      } else if (mode === 'native') {
+        if (oNative) { try { oNative.muted = false; oNative.play(); } catch {} }
+      }
+    }
+
+    // Returns true the moment it kicks off a cover-up for the CURRENT slot
+    // (synchronously, before startOverlay's first await) — the .play() hook
+    // uses that to decide whether to let this exact play() call through.
+    const forcedTried = new Set(); // slots already swapped after a failure, once each
+    function maybeSwap(force) {
+      if (!enabled || !ownerId) return false;
+      const ca = window.ap && window.ap._currentAudio;
+      if (!Array.isArray(ca)) return false;
+      const curId = ca[0], curOwner = ca[1];
+      if (typeof curId !== 'number' || typeof curOwner !== 'number') return false;
+      const slotKey = curOwner + '_' + curId;
+      if (overlay && overlay.forSlotKey !== slotKey) teardownOverlay(false);
+      if (pendingSwapSlot && pendingSwapSlot !== slotKey) pendingSwapSlot = null;
+      if (curOwner === ownerId) { lastSlotKey = slotKey; return false; }
+      if (overlay) return overlay.forSlotKey === slotKey;
+      if (pendingSwapSlot === slotKey) return true; // async URL fetch in progress
+      // A page reload restores the last track as the current one, PAUSED. The
+      // 400 ms backstop used to swap it and start the sound by itself — a track
+      // nobody asked for, that VK's own pause button could not stop. A swap
+      // only ever follows VK actually playing.
+      // (also for a failure-triggered swap: on a reload VK may pre-load the
+      // restored, paused track, and a refused stream must not start sound either)
+      {
+        let vkPlaying = false;
+        try { vkPlaying = !!(window.ap && window.ap.isPlaying()); } catch {}
+        if (!vkPlaying) return false;
+      }
+      if (!force && slotKey === lastSlotKey) return false;
+      if (force && forcedTried.has(slotKey)) return false;
+      const title = ca[3], artist = ca[4];
+      if (typeof title !== 'string' || typeof artist !== 'string') return false;
+      const match = findMatch(artist, title);
+      lastSlotKey = slotKey;
+      if (!match) {
+        console.info('[vmu] preview-swap: no match in index for', artist, '-', title);
+        // a restricted track with no counterpart is most often a fresh upload
+        // the index has not seen yet — content.js decides whether to refresh it
+        // (only for restricted tracks — most tracks are simply not in the community)
+        if ((force || getNoticeIcon()) && Date.now() - lastIndexMissPost > 60 * 1000) {
+          lastIndexMissPost = Date.now();
+          window.postMessage({ type: 'VKD_PREVIEW_INDEX_MISS' }, '*');
+        }
+        return false;
+      }
+      if (force) { forcedTried.add(slotKey); if (forcedTried.size > 50) forcedTried.clear(); console.info('[vmu] preview-swap: the original failed — swapping'); }
+      pendingSwapSlot = slotKey;
+      failSwallowedSlot = null;
+      startOverlay(match, slotKey, { artist, title });
+      return true;
+    }
+
+    async function startOverlay(match, slotKey, original) {
+      // This can start from the 400 ms backstop BEFORE VK has called play()
+      // on the new track's element (VK makes a fresh <audio> per track), in
+      // which case nativeAudioEl is still the previous track's element. The
+      // element has to be re-read after the await: the keep-alive events must
+      // reach the element VK is actually waiting on (verified live — they went
+      // to the stale one and VK skipped the track 20 s in).
+      const firstNative = nativeAudioEl;
+      try { firstNative && firstNative.pause(); } catch {}
+      try { if (firstNative) firstNative.muted = true; } catch {}
+      const url = await resolveStreamUrl(match);
+      const nativeEl = nativeAudioEl || firstNative;
+      if (nativeEl && nativeEl !== firstNative) {
+        try { nativeEl.pause(); } catch {}
+        try { nativeEl.muted = true; } catch {}
+      }
+      if (pendingSwapSlot === slotKey) pendingSwapSlot = null;
+      const stillCurrent = window.ap && Array.isArray(window.ap._currentAudio)
+        && (window.ap._currentAudio[1] + '_' + window.ap._currentAudio[0]) === slotKey;
+      if (!stillCurrent) return;
+      // paused while the stream URL was being fetched — nothing is started
+      try {
+        if (url && window.ap && !window.ap.isPlaying()) {
+          lastSlotKey = null; // judged again the next time VK plays this track
+          if (nativeEl) { try { nativeEl.muted = false; } catch {} }
+          return;
+        }
+      } catch {}
+      if (!url) {
+        if (failSwallowedSlot === slotKey) {
+          // VK's failure on the original was held back for this swap, and the
+          // swap has nothing to play — let VK move on the way it wanted to.
+          failSwallowedSlot = null;
+          try { clickNativeNavButton('next'); } catch {}
+        } else if (nativeEl) { try { nativeEl.muted = false; nativeEl.play(); } catch {} }
+        return;
+      }
+      console.info('[vmu] preview-swap: covering', original.artist, '-', original.title, 'with', match.ownerId + '_' + match.id, '—', match.artist, '-', match.title);
+      // crossOrigin so the audio-FX graph (limiter/EQ) can read this element;
+      // without CORS approval a MediaElementSource would output silence a
+      // moment after playback starts. If the CDN refuses CORS the element is
+      // reloaded plain and kept out of the FX graph instead.
+      const audioEl = new Audio();
+      audioEl.crossOrigin = 'anonymous';
+      audioEl.src = url;
+      if (nativeEl) {
+        try {
+          const v = window.ap && typeof window.ap.getVolume === 'function' ? window.ap.getVolume() : NaN;
+          audioEl.volume = isFinite(v) ? Math.min(1, Math.max(0, v)) : nativeEl.volume;
+        } catch {}
+      }
+      let plainRetry = false;
+      audioEl.addEventListener('error', () => {
+        if (!overlay || overlay.audioEl !== audioEl) return;
+        if (!plainRetry && audioEl.crossOrigin) {
+          plainRetry = true;
+          audioEl.__vmuSkipFx = true;
+          audioEl.removeAttribute('crossorigin');
+          audioEl.src = url;
+          audioEl.play().catch(() => {});
+          return;
+        }
+        const code = audioEl.error && audioEl.error.code;
+        console.warn('[vmu] preview-swap: overlay stream failed (media error ' + code + ')');
+        teardownOverlay('native', 'stream error ' + code);
+      });
+      audioEl.addEventListener('ended', () => {
+        if (overlay && overlay.audioEl === audioEl) teardownOverlay('next', 'track ended');
+      });
+      // Panel updates driven by overlay audio events
+      audioEl.addEventListener('timeupdate', updatePanel);
+      audioEl.addEventListener('play', updatePanel);
+      audioEl.addEventListener('pause', updatePanel);
+      audioEl.addEventListener('loadedmetadata', updatePanel);
+      audioEl.addEventListener('durationchange', updatePanel);
+      // Set overlay BEFORE play so the hook recognizes our element
+      overlay = { audioEl, nativeEl, forSlotKey: slotKey, mode: 'community', match };
+      audioEl.addEventListener('play', () => { if (overlay && overlay.audioEl === audioEl && overlayIsSource()) syncVkPlayState(true); });
+      audioEl.addEventListener('pause', () => { if (overlay && overlay.audioEl === audioEl && overlayIsSource() && !audioEl.ended) syncVkPlayState(false); });
+      audioEl.addEventListener('timeupdate', syncMediaPosition);
+      audioEl.addEventListener('durationchange', syncMediaPosition);
+      applyMediaSession(true);
+      startNativeKeepAlive(overlay);
+      showPanel(match);
+      audioEl.play().catch(err => console.warn('[vmu] preview-swap: overlay play failed:', err));
+      window.postMessage({ type: 'VKD_PREVIEW_SWAP_DONE', artist: match.artist, title: match.title }, '*');
+    }
+
+    // Remember both play/pause icon states of the native block as it shows
+    // them, so the copy can render either one at any moment.
+    setInterval(cacheNativeIcon, 500);
+
+    // Backstop for whatever the .play() hook misses (autoplay that never
+    // calls .play() directly, or _currentAudio updating after it) — cheap
+    // enough to run often without a real cost.
+    setInterval(maybeSwap, 400);
   })();
 })();
