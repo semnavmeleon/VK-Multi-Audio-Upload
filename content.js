@@ -1,4 +1,90 @@
-﻿(function () {
+﻿// ── opt-in CPU profiler (diagnostics) ───────────────────────────────────────
+// Off unless localStorage.vmu_prof === '1' (one localStorage read otherwise).
+// Wraps timers, rAF, MutationObserver callbacks, hot event listeners and
+// layout-forcing reads in THIS script world and writes the per-call-site CPU
+// time to localStorage ('vmu_prof_content') every 3 s, so both worlds can be
+// read from the page console: JSON.parse(localStorage.vmu_prof_content).
+(function () {
+  let on = false;
+  try { on = localStorage.getItem('vmu_prof') === '1'; } catch {}
+  if (!on) return;
+  const WORLD = 'content';
+  const stats = new Map();
+  const rec = (k, d) => {
+    let s = stats.get(k);
+    if (!s) { s = { n: 0, ms: 0, max: 0 }; stats.set(k, s); }
+    s.n++; s.ms += d; if (d > s.max) s.max = d;
+  };
+  function __vmuProbeSite() {
+    const st = (new Error().stack || '').split('\n');
+    for (let i = 1; i < st.length; i++) {
+      const l = st[i];
+      if (l.includes('__vmuProbe')) continue;
+      const m = l.match(/([^\/\s(]+\.js):(\d+):\d+/);
+      if (m) return (/chrome-extension/.test(l) ? 'EXT ' : '') + m[1] + ':' + m[2];
+    }
+    return '?';
+  }
+  function __vmuProbeWrap(kind, fn) {
+    if (typeof fn !== 'function') return fn;
+    const key = kind + ' ' + __vmuProbeSite();
+    return function __vmuProbeCall(...a) {
+      const t = performance.now();
+      try { return fn.apply(this, a); } finally { rec(key, performance.now() - t); }
+    };
+  }
+  const _st = window.setTimeout, _si = window.setInterval, _raf = window.requestAnimationFrame;
+  window.setTimeout = function __vmuProbeST(f, d, ...r) { return _st.call(this, __vmuProbeWrap('timeout', f), d, ...r); };
+  window.setInterval = function __vmuProbeSI(f, d, ...r) { return _si.call(this, __vmuProbeWrap('interval', f), d, ...r); };
+  window.requestAnimationFrame = function __vmuProbeRAF(f) { return _raf.call(this, __vmuProbeWrap('raf', f)); };
+  const _MO = window.MutationObserver;
+  window.MutationObserver = class __vmuProbeMO extends _MO {
+    constructor(cb) { super(__vmuProbeWrap('mutobs', cb)); }
+  };
+  const HOT = new Set(['scroll', 'resize', 'mousemove', 'mouseover', 'mouseout', 'pointermove', 'pointerover', 'pointerout', 'message', 'keydown', 'wheel', 'visibilitychange', 'focusin', 'focusout', 'transitionend']);
+  const lmap = new WeakMap();
+  const _add = EventTarget.prototype.addEventListener, _rem = EventTarget.prototype.removeEventListener;
+  EventTarget.prototype.addEventListener = function __vmuProbeAdd(type, fn, opts) {
+    if (typeof fn === 'function' && HOT.has(type)) {
+      let w = lmap.get(fn);
+      if (!w) { w = __vmuProbeWrap('on:' + type, fn); lmap.set(fn, w); }
+      return _add.call(this, type, w, opts);
+    }
+    return _add.call(this, type, fn, opts);
+  };
+  EventTarget.prototype.removeEventListener = function __vmuProbeRem(type, fn, opts) {
+    return _rem.call(this, type, (typeof fn === 'function' && lmap.get(fn)) || fn, opts);
+  };
+  // Forced layout / style reads: only slow ones (> 0.4 ms) are attributed.
+  const _gbr = Element.prototype.getBoundingClientRect;
+  Element.prototype.getBoundingClientRect = function __vmuProbeGBR() {
+    const t = performance.now(); const r = _gbr.call(this); const d = performance.now() - t;
+    if (d > 0.4) rec('layout:getBoundingClientRect ' + __vmuProbeSite(), d);
+    return r;
+  };
+  const _gcs = window.getComputedStyle;
+  window.getComputedStyle = function __vmuProbeGCS(...a) {
+    const t = performance.now(); const r = _gcs.apply(this, a); const d = performance.now() - t;
+    if (d > 0.4) rec('layout:getComputedStyle ' + __vmuProbeSite(), d);
+    return r;
+  };
+  // Network chatter (counts only).
+  const _fetch = window.fetch;
+  window.fetch = function __vmuProbeFetch(input, init) {
+    try { const u = String(input && input.url || input).replace(/^https?:\/\//, '').split('?')[0].slice(0, 300); rec('fetch ' + u, 0); } catch {}
+    return _fetch.apply(this, arguments);
+  };
+  const t0 = performance.now();
+  const flush = () => {
+    try {
+      const top = [...stats.entries()].sort((a, b) => b[1].ms - a[1].ms).slice(0, 300)
+        .map(([k, s]) => ({ k, n: s.n, ms: +s.ms.toFixed(1), max: +s.max.toFixed(1) }));
+      localStorage.setItem('vmu_prof_' + WORLD, JSON.stringify({ at: Date.now(), up: +((performance.now() - t0) / 1000).toFixed(1), total: +[...stats.values()].reduce((a, s) => a + s.ms, 0).toFixed(1), top }));
+    } catch {}
+  };
+  _si.call(window, flush, 3000);
+})();
+(function () {
   'use strict';
 
   // ─── inject page-context script ──────────────────────────────────────────────
@@ -171,6 +257,7 @@
       type: 'VKD_PREVIEW_SWAP_CONFIG',
       enabled: !!settings.previewSwapEnabled,
       ownerId: settings.previewSwapOwnerId || null,
+      lightVisualizer: settings.lightVisualizer !== false,
     }, '*');
   }
   function readPreviewIndexMeta() {
@@ -327,7 +414,8 @@
     slimBitrate: 320, slimVolume: 100,
     slimPreserveMeta: true, slimPreserveCover: true,
     slimCommunityTag: false, slimCommunityTagText: '',
-    previewSwapEnabled: false, previewSwapOwnerId: '', previewSwapExcludePlaylists: '' };
+    previewSwapEnabled: false, previewSwapOwnerId: '', previewSwapExcludePlaylists: '',
+    lightVisualizer: true };
   const AUDIOFX_STYLE_NAMES = ['Transparent', 'Dynamic', 'Punchy', 'Allround', 'Modern', 'Bus', 'Safe'];
   // Mirrors limiter-worklet.js STYLE_PRESETS' kneeShape column exactly — the
   // transfer-curve visualization runs in this (page) realm and can't import
@@ -439,6 +527,7 @@
         slimCommunityTag: settings.slimCommunityTag, slimCommunityTagText: settings.slimCommunityTagText,
         previewSwapEnabled: settings.previewSwapEnabled, previewSwapOwnerId: settings.previewSwapOwnerId,
         previewSwapExcludePlaylists: settings.previewSwapExcludePlaylists,
+        lightVisualizer: settings.lightVisualizer,
       };
       for (const key of AUDIOFX_FIELD_KEYS) out[key] = settings[key];
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(out));
@@ -1195,7 +1284,7 @@
       // Pin the sidebar BELOW VK's fixed top bar — otherwise the first nav
       // item (Профиль) gets hidden behind it once stuck. Measure the top bar
       // at apply time so we're robust to VK UI changes (compact vs full).
-      const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
+      const topBar = pinQuery('top', '[class*="vkuiFixedLayout"]', false);
       const topBarH = topBar ? Math.round(topBar.getBoundingClientRect().height) : 48;
       // align-self: flex-start prevents the parent flex from stretching the
       // sidebar to its row's height so sticky has a finite anchor.
@@ -2460,8 +2549,22 @@
   // permanently glued to the top, leaving a dead gap where it used to sit)
   // and the space it vacates reserved (padding-top on the section) only
   // while engaged, so content doesn't jump.
+  // applyTabsBarPin runs on every scroll event, and its three document-wide
+  // attribute queries (one of them a substring match over every element's
+  // class) were a large part of its ~1.5 ms. The page structure it looks up
+  // does not change while scrolling, so the results are reused for 1 s (and
+  // dropped at once if an element left the page).
+  function pinQuery(key, selector, all) {
+    const _pinQ = pinQuery._s || (pinQuery._s = {}); // lazily: may run before this point of the script
+    const now = performance.now();
+    const hit = _pinQ[key];
+    if (hit && now - hit.t < 1000 && (all ? hit.v.every(e => e.isConnected) : (!hit.v || hit.v.isConnected))) return hit.v;
+    const v = all ? [...document.querySelectorAll(selector)] : document.querySelector(selector);
+    _pinQ[key] = { t: now, v };
+    return v;
+  }
   function applyTabsBarPin() {
-    const sections = document.querySelectorAll('[data-testid="AudioCatalog_Header"]');
+    const sections = pinQuery('hdr', '[data-testid="AudioCatalog_Header"]', true);
     // This runs on every throttled page mutation (see onPageMutated), on
     // EVERY vk.com page — feed, messenger, everywhere — and the rects/computed
     // style read below each force a synchronous reflow in the middle of
@@ -2486,7 +2589,7 @@
       // all matches always lands on whichever is actually visible.
       let playerBottom = 0;
       let visiblePlayerBlock = null;
-      for (const pb of document.querySelectorAll('[data-testid="AudioPage_PlayerBlock"]')) {
+      for (const pb of pinQuery('pb', '[data-testid="AudioPage_PlayerBlock"]', true)) {
         const b = pb.getBoundingClientRect().bottom;
         if (b > playerBottom) { playerBottom = b; visiblePlayerBlock = pb; }
       }
@@ -2503,9 +2606,13 @@
       // theme VK is currently rendering.
       mmCard = visiblePlayerBlock ? visiblePlayerBlock.closest('section') : null;
       if (mmCard) {
-        const mmBorder = getComputedStyle(mmCard, '::before').boxShadow;
-        const m = mmBorder.match(/rgba?\([^)]+\)/);
-        if (m) document.documentElement.style.setProperty('--vmu-pin-border', m[0]);
+        const nowMs = performance.now();
+        if (mmCard !== _pinBorderEl || nowMs - _pinBorderAt > 2000) {
+          _pinBorderEl = mmCard; _pinBorderAt = nowMs;
+          const mmBorder = getComputedStyle(mmCard, '::before').boxShadow;
+          const m = mmBorder.match(/rgba?\([^)]+\)/);
+          if (m) document.documentElement.style.setProperty('--vmu-pin-border', m[0]);
+        }
       }
     }
     let anyEngaged = false;
@@ -2542,7 +2649,12 @@
       if (naturalTabsViewportTop > anchor) { unpin(); continue; }
 
       const basePad = Number(section.dataset.vmuBasePadTop) || 0;
-      const bg = getComputedStyle(section).backgroundColor;
+      const nowBg = performance.now();
+      if (!section.__vmuBgAt || nowBg - section.__vmuBgAt > 2000) {
+        section.__vmuBgAt = nowBg;
+        section.__vmuBg = getComputedStyle(section).backgroundColor;
+      }
+      const bg = section.__vmuBg;
       const sRect = section.getBoundingClientRect(); // already reflects any active content-offset shift
 
       anyEngaged = true;
@@ -2576,6 +2688,7 @@
     else if (!needLayout) document.querySelector('.vmu-multimedia-flat')?.classList.remove('vmu-multimedia-flat');
   }
 
+  var _pinBorderEl = null, _pinBorderAt = 0; // var: applyTabsBarPin can run before this line is reached
   function applyAudioCatalogLayout() {
     applyAudioHeaderSplit();
     applyTabsBarPin();
@@ -5819,6 +5932,7 @@
       `)}
       ${card('Производительность', `
         ${row('Оптимизация больших плейлистов', 'Пропускать отрисовку строк за пределами экрана — меньше лагов при прокрутке длинных списков', tgl('vmu-optimize-toggle', settings.optimizeBigPlaylists))}
+        ${row('Лёгкая анимация эквалайзера', 'Полоски у играющего трека обновляются 10 раз в секунду вместо 60 — заметно меньше нагрузка на процессор при воспроизведении', tgl('vmu-lightviz-toggle', settings.lightVisualizer !== false))}
       `)}`;
 
     const paneDownload = `
@@ -5994,6 +6108,15 @@
         settings.optimizeBigPlaylists = optimizeToggle.checked;
         saveSettings();
         applyLayoutCustomizations();
+      });
+    }
+
+    const lightVizToggle = document.getElementById('vmu-lightviz-toggle');
+    if (lightVizToggle) {
+      lightVizToggle.addEventListener('change', () => {
+        settings.lightVisualizer = lightVizToggle.checked;
+        saveSettings();
+        sendPreviewSwapConfig();
       });
     }
 
@@ -11846,17 +11969,43 @@
   // the page world), then inject buttons once attributes are in place. We do
   // three passes — virtualized lists sometimes finish mounting after the first
   // mark; the cheap re-scans catch any rows that landed late.
-  function markAndInjectAll() {
+  //
+  // Profiled on the live page (scrolling a 500-row list): this was ~70 % of all
+  // the extension's script time. Each mutation burst (up to 8 a second while
+  // scrolling) ran three sweeps, and every sweep walked EVERY row — parsing its
+  // JSON and running several selector queries — although on the new VK nearly
+  // every row has nothing to inject until it is hovered (the hover observer
+  // above handles that). So: (1) a row that was swept recently and has not
+  // changed is skipped, (2) bursts are coalesced — one series of sweeps at a
+  // time, with one trailing series if more mutations arrived meanwhile.
+  var _sweepGateUntil = 0, _sweepTrailing = false;
+  function markAndInjectAll(force) {
+    const t0 = performance.now();
+    if (!force && t0 < _sweepGateUntil) { _sweepTrailing = true; return; }
+    _sweepGateUntil = t0 + 700;
     const sweep = () => {
       window.postMessage({ type: 'VKD_MARK_ROWS' }, '*');
       setTimeout(() => {
+        const now = performance.now();
         const rows = document.querySelectorAll('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, .audio_row, [data-full-id]');
-        for (const row of rows) injectSingleDlBtn(row);
+        for (const row of rows) {
+          const sig = (row.dataset && (row.dataset.vmuTrack || row.dataset.fullId)) || '';
+          const seen = row.__vmuSwept;
+          if (seen && seen.sig === sig && now - seen.t < 4000) continue;
+          injectSingleDlBtn(row);
+          row.__vmuSwept = { sig, t: now };
+        }
       }, 50);
     };
     sweep();
     setTimeout(sweep, 200);
     setTimeout(sweep, 600);
+    setTimeout(() => {
+      if (!_sweepTrailing) return;
+      _sweepTrailing = false;
+      _sweepGateUntil = 0;
+      markAndInjectAll();
+    }, 720);
   }
 
   let _dlBtnTimer = null;
@@ -11880,7 +12029,7 @@
           if (node.nodeType !== 1) continue;
           if (node.matches?.('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]') || node.querySelector?.('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]')) {
             clearTimeout(t);
-            t = setTimeout(markAndInjectAll, 60);
+            t = setTimeout(() => markAndInjectAll(true), 60);
             return;
           }
         }
@@ -11898,8 +12047,8 @@
           : node.querySelector?.('[class*="vkitInternalModalBox"]');
         if (!modalNode) continue;
         clearTimeout(_modalDlTimer1); clearTimeout(_modalDlTimer2);
-        _modalDlTimer1 = setTimeout(markAndInjectAll, 400);
-        _modalDlTimer2 = setTimeout(() => { markAndInjectAll(); attachModalInnerObserver(modalNode); }, 900);
+        _modalDlTimer1 = setTimeout(() => markAndInjectAll(true), 400);
+        _modalDlTimer2 = setTimeout(() => { markAndInjectAll(true); attachModalInnerObserver(modalNode); }, 900);
       }
     }
   }).observe(document.body, { childList: true, subtree: true });
@@ -12854,9 +13003,11 @@
     }
     if (!relevant) return;
     _mutScheduled = true;
+    // 250 ms (was 120): while scrolling a long list this runs for the whole
+    // scroll, and every run walks the toolbar / dialog / layout injectors
     setTimeout(() => {
       _mutScheduled = false;
       onPageMutated();
-    }, 120);
+    }, 250);
   }).observe(document.body, { childList: true, subtree: true });
 })();

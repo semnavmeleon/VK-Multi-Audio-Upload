@@ -1,4 +1,90 @@
-﻿// Runs in page context — intercepts XHR/fetch and handles file/UI injection from content script
+﻿// ── opt-in CPU profiler (diagnostics) ───────────────────────────────────────
+// Off unless localStorage.vmu_prof === '1' (one localStorage read otherwise).
+// Wraps timers, rAF, MutationObserver callbacks, hot event listeners and
+// layout-forcing reads in THIS script world and writes the per-call-site CPU
+// time to localStorage ('vmu_prof_page') every 3 s, so both worlds can be
+// read from the page console: JSON.parse(localStorage.vmu_prof_page).
+(function () {
+  let on = false;
+  try { on = localStorage.getItem('vmu_prof') === '1'; } catch {}
+  if (!on) return;
+  const WORLD = 'page';
+  const stats = new Map();
+  const rec = (k, d) => {
+    let s = stats.get(k);
+    if (!s) { s = { n: 0, ms: 0, max: 0 }; stats.set(k, s); }
+    s.n++; s.ms += d; if (d > s.max) s.max = d;
+  };
+  function __vmuProbeSite() {
+    const st = (new Error().stack || '').split('\n');
+    for (let i = 1; i < st.length; i++) {
+      const l = st[i];
+      if (l.includes('__vmuProbe')) continue;
+      const m = l.match(/([^\/\s(]+\.js):(\d+):\d+/);
+      if (m) return (/chrome-extension/.test(l) ? 'EXT ' : '') + m[1] + ':' + m[2];
+    }
+    return '?';
+  }
+  function __vmuProbeWrap(kind, fn) {
+    if (typeof fn !== 'function') return fn;
+    const key = kind + ' ' + __vmuProbeSite();
+    return function __vmuProbeCall(...a) {
+      const t = performance.now();
+      try { return fn.apply(this, a); } finally { rec(key, performance.now() - t); }
+    };
+  }
+  const _st = window.setTimeout, _si = window.setInterval, _raf = window.requestAnimationFrame;
+  window.setTimeout = function __vmuProbeST(f, d, ...r) { return _st.call(this, __vmuProbeWrap('timeout', f), d, ...r); };
+  window.setInterval = function __vmuProbeSI(f, d, ...r) { return _si.call(this, __vmuProbeWrap('interval', f), d, ...r); };
+  window.requestAnimationFrame = function __vmuProbeRAF(f) { return _raf.call(this, __vmuProbeWrap('raf', f)); };
+  const _MO = window.MutationObserver;
+  window.MutationObserver = class __vmuProbeMO extends _MO {
+    constructor(cb) { super(__vmuProbeWrap('mutobs', cb)); }
+  };
+  const HOT = new Set(['scroll', 'resize', 'mousemove', 'mouseover', 'mouseout', 'pointermove', 'pointerover', 'pointerout', 'message', 'keydown', 'wheel', 'visibilitychange', 'focusin', 'focusout', 'transitionend']);
+  const lmap = new WeakMap();
+  const _add = EventTarget.prototype.addEventListener, _rem = EventTarget.prototype.removeEventListener;
+  EventTarget.prototype.addEventListener = function __vmuProbeAdd(type, fn, opts) {
+    if (typeof fn === 'function' && HOT.has(type)) {
+      let w = lmap.get(fn);
+      if (!w) { w = __vmuProbeWrap('on:' + type, fn); lmap.set(fn, w); }
+      return _add.call(this, type, w, opts);
+    }
+    return _add.call(this, type, fn, opts);
+  };
+  EventTarget.prototype.removeEventListener = function __vmuProbeRem(type, fn, opts) {
+    return _rem.call(this, type, (typeof fn === 'function' && lmap.get(fn)) || fn, opts);
+  };
+  // Forced layout / style reads: only slow ones (> 0.4 ms) are attributed.
+  const _gbr = Element.prototype.getBoundingClientRect;
+  Element.prototype.getBoundingClientRect = function __vmuProbeGBR() {
+    const t = performance.now(); const r = _gbr.call(this); const d = performance.now() - t;
+    if (d > 0.4) rec('layout:getBoundingClientRect ' + __vmuProbeSite(), d);
+    return r;
+  };
+  const _gcs = window.getComputedStyle;
+  window.getComputedStyle = function __vmuProbeGCS(...a) {
+    const t = performance.now(); const r = _gcs.apply(this, a); const d = performance.now() - t;
+    if (d > 0.4) rec('layout:getComputedStyle ' + __vmuProbeSite(), d);
+    return r;
+  };
+  // Network chatter (counts only).
+  const _fetch = window.fetch;
+  window.fetch = function __vmuProbeFetch(input, init) {
+    try { const u = String(input && input.url || input).replace(/^https?:\/\//, '').split('?')[0].slice(0, 300); rec('fetch ' + u, 0); } catch {}
+    return _fetch.apply(this, arguments);
+  };
+  const t0 = performance.now();
+  const flush = () => {
+    try {
+      const top = [...stats.entries()].sort((a, b) => b[1].ms - a[1].ms).slice(0, 300)
+        .map(([k, s]) => ({ k, n: s.n, ms: +s.ms.toFixed(1), max: +s.max.toFixed(1) }));
+      localStorage.setItem('vmu_prof_' + WORLD, JSON.stringify({ at: Date.now(), up: +((performance.now() - t0) / 1000).toFixed(1), total: +[...stats.values()].reduce((a, s) => a + s.ms, 0).toFixed(1), top }));
+    } catch {}
+  };
+  _si.call(window, flush, 3000);
+})();
+// Runs in page context — intercepts XHR/fetch and handles file/UI injection from content script
 (function () {
   if (window.__vkMultiUploadInjected) return;
   window.__vkMultiUploadInjected = true;
@@ -3813,6 +3899,7 @@
     const INDEX_META_KEY = 'vmu_preview_swap_index_meta_v1';
 
     let enabled = false;
+    let lightVisualizer = true; // throttle VK's equaliser-bars notifications (see installFailGuard)
     let ownerId = null;
     let indexMap = null;
     let indexForOwner = null;
@@ -3824,6 +3911,7 @@
       const s = JSON.parse(localStorage.getItem('vmu_settings_v2') || 'null');
       if (s) {
         enabled = !!s.previewSwapEnabled;
+        lightVisualizer = s.lightVisualizer !== false;
         ownerId = s.previewSwapOwnerId ? Number(s.previewSwapOwnerId) : null;
       }
     } catch {}
@@ -3832,6 +3920,7 @@
       if (e.source !== window || !e.data) return;
       if (e.data.type === 'VKD_PREVIEW_SWAP_CONFIG') {
         enabled = !!e.data.enabled;
+        lightVisualizer = e.data.lightVisualizer !== false;
         const newOwnerId = e.data.ownerId ? Number(e.data.ownerId) : null;
         if (newOwnerId !== ownerId) { indexMap = null; indexForOwner = null; }
         ownerId = newOwnerId;
@@ -4295,21 +4384,39 @@
     // When two copies are on screen at once (scrolling hands the block over
     // from one to the other) the one the user actually SEES is the one that is
     // topmost at its own centre; the copy the panel must cover is that one.
+    // Called from many places (button forwarding, the panel tracker, the media
+    // session...), and each call reads layout. In profiling it was the biggest
+    // single cost of the extension (a forced reflow of the whole VK page, up
+    // to 20 ms each). So the answer is cached for 1 s (dropped on scroll /
+    // resize), and the hit-test is only done when two copies are on screen.
+    let _gvn = null, _gvnAt = 0;
     function getVisibleNativePanel() {
-      let best = null, bestBottom = -Infinity;
-      let seen = null, seenBottom = -Infinity;
+      const now = performance.now();
+      if (_gvn && _gvn.isConnected && now - _gvnAt < 1000) return _gvn;
+      const cands = [];
       for (const el of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
         const r = el.getBoundingClientRect();
         if (r.width <= 0 || r.height <= 0 || r.bottom <= 0 || r.top >= window.innerHeight) continue;
-        if (r.bottom > bestBottom) { best = el; bestBottom = r.bottom; }
-        try {
-          const cx = Math.min(Math.max(r.left + r.width / 2, 0), window.innerWidth - 1);
-          const cy = Math.min(Math.max(r.top + r.height / 2, 0), window.innerHeight - 1);
-          const top = document.elementsFromPoint(cx, cy).find(e => !(panelEl && panelEl.contains(e)));
-          if (top && el.contains(top) && r.bottom > seenBottom) { seen = el; seenBottom = r.bottom; }
-        } catch {}
+        cands.push({ el, r });
       }
-      return seen || best || document.querySelector(NATIVE_PANEL_SELECTOR);
+      let pick = null;
+      if (cands.length === 1) pick = cands[0].el;
+      else if (cands.length > 1) {
+        let best = null, bestBottom = -Infinity, seen = null, seenBottom = -Infinity;
+        for (const { el, r } of cands) {
+          if (r.bottom > bestBottom) { best = el; bestBottom = r.bottom; }
+          try {
+            const cx = Math.min(Math.max(r.left + r.width / 2, 0), window.innerWidth - 1);
+            const cy = Math.min(Math.max(r.top + r.height / 2, 0), window.innerHeight - 1);
+            const top = document.elementsFromPoint(cx, cy).find(e => !(panelEl && panelEl.contains(e)));
+            if (top && el.contains(top) && r.bottom > seenBottom) { seen = el; seenBottom = r.bottom; }
+          } catch {}
+        }
+        pick = seen || best;
+      }
+      pick = pick || document.querySelector(NATIVE_PANEL_SELECTOR);
+      _gvn = pick; _gvnAt = now;
+      return pick;
     }
 
     function nativeButtons(native) {
@@ -4345,14 +4452,19 @@
     // Both states of the play button are remembered from the native block as
     // it shows them, so the copy can show the right icon at any moment.
     function cacheNativeIcon() {
+      if (!enabled) return;
       cacheNativeBar();
-      const native = getVisibleNativePanel();
-      const btn = native && native.querySelector(SEL_PLAY);
-      const svg = btn && btn.querySelector('svg');
-      if (!svg) return;
-      const cls = svg.getAttribute('class') || '';
-      if (cls.includes('play_circle')) iconCache.play = btn.innerHTML;
-      else if (cls.includes('pause_circle')) iconCache.pause = btn.innerHTML;
+      // both copies of the block show the same state, so there is no need to
+      // work out which one is on screen (that costs a layout read)
+      for (const native of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
+        const btn = native.querySelector(SEL_PLAY);
+        const svg = btn && btn.querySelector('svg');
+        if (!svg) continue;
+        const cls = svg.getAttribute('class') || '';
+        if (cls.includes('play_circle')) iconCache.play = btn.innerHTML;
+        else if (cls.includes('pause_circle')) iconCache.pause = btn.innerHTML;
+        break;
+      }
     }
 
     // The native progress bar has two looks: a «loading» skeleton (one full
@@ -4551,7 +4663,11 @@
         }
         const native = getVisibleNativePanel();
         const real = native && nativeButtonFor(btn, native);
-        if (real) real.click();
+        if (real) {
+          real.click();
+          // the heartbeat is slow now: show the new state of the clicked toggle at once
+          setTimeout(() => { try { syncFromNative(); } catch {} }, 150);
+        }
       }, true);
     }
 
@@ -4704,19 +4820,25 @@
     // shifted by the extension's «Смещение контента» slider with a left
     // transition, and the pinned copy moves while scrolling — so this is
     // re-read continuously instead of on a few events).
-    let _lastRect = null;
+    let _lastRect = null, _lastNative = null, _styledAt = 0;
     function positionOverNative() {
       if (!panelEl) return null;
       const native = getVisibleNativePanel();
       if (!native) return _lastRect;
       const r = native.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) return _lastRect;
+      const sameSpot = _lastRect && native === _lastNative && r.left === _lastRect.left && r.top === _lastRect.top
+        && r.width === _lastRect.width && r.height === _lastRect.height;
       _lastRect = r;
       if (panelEl.previousElementSibling !== native) {
         native.after(panelEl);
         const nz = parseInt(getComputedStyle(native).zIndex, 10);
         panelEl.style.zIndex = String(isFinite(nz) ? nz + 1 : 2);
       }
+      // nothing moved and the look was read less than a second ago: done
+      const nowT = performance.now();
+      if (sameSpot && nowT - _styledAt < 1000) return r;
+      _lastNative = native; _styledAt = nowT;
       // the corner radius comes from the native block's context, not from its
       // classes, so the copy would be square — and the pinned copy rounds
       // differently from the in-flow one, hence read on every move
@@ -4764,13 +4886,49 @@
     }
     let _trackTimer = null;
     let _trackTick = 0;
+    // The copy has to stay glued to the native block while that moves (page
+    // scroll handing the block from one copy to the other, the content-offset
+    // transition, a window resize). That used to be a 40 ms poll: ~5 % of a CPU
+    // core for as long as the panel was up. Now: a burst of animation frames
+    // right after any of those events, and a calm heartbeat for anything
+    // else (content loading and shifting the layout), every 500 ms.
+    let _burstRaf = 0, _burstUntil = 0;
+    function burstFrame() {
+      _burstRaf = 0;
+      positionOverNative();
+      if (performance.now() < _burstUntil) _burstRaf = requestAnimationFrame(burstFrame);
+    }
+    function kickTracking(ms) {
+      _gvnAt = 0; // the on-screen copy may have changed
+      _burstUntil = Math.max(_burstUntil, performance.now() + (ms || 700));
+      if (!_burstRaf) _burstRaf = requestAnimationFrame(burstFrame);
+    }
+    // Only movements that can actually move the native block: a scroll of the
+    // PAGE (not of some inner list or chat), a resize, a transition on an
+    // ancestor of the block (the content-offset shift). Transitions of the copy
+    // itself (its progress fill animates on every update) must not retrigger
+    // the tracking, or it would feed itself.
+    const _kickListener = e => {
+      const t = e && e.target;
+      if (e && e.type === 'scroll') {
+        if (t !== document && t !== document.documentElement && t !== document.body && t !== window) return;
+      } else if (e && (e.type === 'transitionrun' || e.type === 'transitionend')) {
+        if (!(t instanceof Element) || (panelEl && panelEl.contains(t)) || !_gvn || !t.contains(_gvn)) return;
+      }
+      kickTracking(700);
+    };
     function startPositionTracking() {
       if (_trackTimer) return;
+      window.addEventListener('scroll', _kickListener, { passive: true, capture: true });
+      window.addEventListener('resize', _kickListener, { passive: true });
+      document.addEventListener('transitionrun', _kickListener, { passive: true, capture: true });
+      document.addEventListener('transitionend', _kickListener, { passive: true, capture: true });
+      kickTracking(900);
       _trackTimer = setInterval(() => {
         positionOverNative();
         // after the slide-in has finished
         if (overlay && overlay.mode === 'community' && panelShownAt && Date.now() - panelShownAt > 450) setNativesHidden(true);
-        if (++_trackTick % 5 === 0) {
+        {
           syncFromNative();
           updatePanel(); // the play/pause icon and the timer must not wait for the next timeupdate
           // VK sets its own media metadata a moment after a track starts (page-load
@@ -4782,10 +4940,14 @@
           if (overlay && overlay.mode === 'community') applyTopPlayer(overlay.match);
           else if (topSaved && !panelGrace) restoreTopPlayer();
         }
-      }, 40);
+      }, 500);
     }
     function stopPositionTracking() {
       if (_trackTimer) { clearInterval(_trackTimer); _trackTimer = null; }
+      window.removeEventListener('scroll', _kickListener, true);
+      window.removeEventListener('resize', _kickListener);
+      document.removeEventListener('transitionrun', _kickListener, true);
+      document.removeEventListener('transitionend', _kickListener, true);
     }
 
     let _hideTimer = null;
@@ -5285,6 +5447,25 @@
           noteSwallowedFailure();
         });
       };
+      // VK redraws the equaliser bars of the playing track from an analyser
+      // 'freq' notification on every animation frame, and fans each one out to its
+      // subscribers through a setTimeout apiece — measured on the live page that
+      // was more than half of ALL of VK's script time while music plays (the
+      // same page with the notifications dropped: 1208 ms -> 470 ms of callbacks
+      // per 20 s). 10 updates a second is still a moving bar and costs a sixth.
+      if (typeof ap.notify === 'function' && !ap.__vmuFreqThrottle) {
+        ap.__vmuFreqThrottle = true;
+        const origNotify = ap.notify;
+        let lastFreq = 0;
+        ap.notify = function (ev, ...a) {
+          if (ev === 'freq' && lightVisualizer) {
+            const now = performance.now();
+            if (now - lastFreq < 100) return;
+            lastFreq = now;
+          }
+          return origNotify.call(this, ev, ...a);
+        };
+      }
       // VK's pause button and the media keys. With no live native element
       // (restored state, a provider torn down by a failure) VK's pause reaches
       // nothing, and the overlay would play on — so the overlay is paused here.
@@ -5334,7 +5515,10 @@
         break;
       }
     }
-    setInterval(installFailGuard, 300);
+    const _failGuardTimer = setInterval(() => {
+      installFailGuard();
+      if (window.ap && window.ap.__vmuFailGuard) clearInterval(_failGuardTimer);
+    }, 300);
 
     // resumeNative: true when OUR overlay finished on its own (the original
     // was paused this whole time to freeze its own preview-cutoff clock —
@@ -5553,7 +5737,7 @@
 
     // Remember both play/pause icon states of the native block as it shows
     // them, so the copy can render either one at any moment.
-    setInterval(cacheNativeIcon, 500);
+    setInterval(cacheNativeIcon, 1000);
 
     // Backstop for whatever the .play() hook misses (autoplay that never
     // calls .play() directly, or _currentAudio updating after it) — cheap
