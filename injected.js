@@ -4389,7 +4389,7 @@
     // single cost of the extension (a forced reflow of the whole VK page, up
     // to 20 ms each). So the answer is cached for 1 s (dropped on scroll /
     // resize), and the hit-test is only done when two copies are on screen.
-    let _gvn = null, _gvnAt = 0;
+    let _gvn = null, _gvnAt = 0, _gvnCount = -1;
     function getVisibleNativePanel() {
       const now = performance.now();
       if (_gvn && _gvn.isConnected && now - _gvnAt < 1000) return _gvn;
@@ -4856,10 +4856,17 @@
     let _lastRect = null, _lastNative = null, _styledAt = 0;
     function positionOverNative() {
       if (!panelEl) return null;
+      // VK adds / removes its second copy of the block some frames after the scroll that
+      // caused it (measured: 45–60 ms) — after the last scroll event had already dropped
+      // the cached answer and a new one had been cached for a second. The panel then sat
+      // on the copy that was no longer the visible one for up to a second. A change in
+      // the number of copies drops the cache at once.
+      const cnt = document.querySelectorAll(NATIVE_PANEL_SELECTOR).length;
+      if (cnt !== _gvnCount) { _gvnCount = cnt; _gvnAt = 0; }
       const native = getVisibleNativePanel();
       if (!native) return _lastRect;
       const r = native.getBoundingClientRect();
-      if (r.width <= 0 || r.height <= 0) return _lastRect;
+      if (r.width <= 0 || r.height <= 0) { _gvnAt = 0; return _lastRect; } // not displayed: pick again next time
       const sameSpot = _lastRect && native === _lastNative && r.left === _lastRect.left && r.top === _lastRect.top
         && r.width === _lastRect.width && r.height === _lastRect.height;
       _lastRect = r;
@@ -4872,6 +4879,24 @@
       const nowT = performance.now();
       if (sameSpot && nowT - _styledAt < 1000) return r;
       _lastNative = native; _styledAt = nowT;
+      // On the music catalog with the pinned tabs bar (html.vmu-pinmode, set by content.js)
+      // the copy's place, corners and outline come from the stylesheet: it covers the
+      // sticky in-flow block as an absolutely positioned sibling and takes its look from
+      // html.vmu-merged — in the same frame as everything else. Copying the look from the
+      // native block here (at most once a second) was what left it with square corners
+      // or a stale outline after scrolling. The inline values are only cleared.
+      if (document.documentElement.classList.contains('vmu-pinmode')) {
+        if (panelEl.__vmuRing !== 'css') {
+          panelEl.__vmuRing = 'css';
+          panelEl.style.removeProperty('box-shadow');
+          panelEl.style.borderRadius = '';
+        }
+        panelEl.style.left = r.left + 'px';
+        panelEl.style.top = r.top + 'px';
+        panelEl.style.width = r.width + 'px';
+        panelEl.style.height = r.height + 'px';
+        return r;
+      }
       // the corner radius comes from the native block's context, not from its
       // classes, so the copy would be square — and the pinned copy rounds
       // differently from the in-flow one, hence read on every move

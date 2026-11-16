@@ -1284,31 +1284,72 @@ html.vmu-theme-light {
   z-index: 2;
 }
 
-/* The multimedia player card (AudioPage_PlayerBlock's card wrapper) draws its
-   border via a uniform 4-side inset box-shadow on ::before, not a real
-   border. While our tabs/search bar is merged under it, that shadow is
-   swapped for a top+left+right-only version (own box-shadow on the real
-   element, so it doesn't affect layout) — keeps the border on the outer
-   edges but drops the bottom line where it now touches our panel, so the two
-   read as one continuous outlined shape instead of two boxes glued together
-   (toggled in applyTabsBarPin). */
-.vmu-multimedia-flat::before {
-  box-shadow: none !important;
+/* ── Player block while the tabs bar can be pinned (html.vmu-pinmode, content.js
+   applyTabsBarPin — the note above that function has the measurements) ─────────────
+   VK shows the player twice: a copy in the flow and, once that reaches the top bar, a
+   second position:fixed copy — switched by VK's own asynchronous scroll handling,
+   several frames after the scroll itself, with the corners restyled on the same late
+   schedule. Anything synchronised «to VK's switch» was therefore late by design.
+   Here the in-flow copy does the job on its own: position:sticky keeps it under the
+   top bar in the very frame the page scrolls (the browser does it, no script), and VK's
+   fixed copy is never displayed. The look is then a function of ONE class,
+   html.vmu-merged, set in the same pass that pins the tabs. */
+/* the in-flow copy's wrapper: the one that has the catalog's cards as later siblings */
+html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ section) {
+  position: sticky !important;
+  top: var(--vmu-topbar-h, 48px) !important;
+  z-index: 3 !important;              /* what VK gives its own fixed copy */
+  visibility: visible !important;     /* VK hides this copy while it shows the fixed one */
+  /* the wrapper is 16px taller than the card (a transparent spacer) and would cover
+     the top of the pinned tabs' buttons: it lets the pointer through, the card does not */
+  pointer-events: none !important;
 }
-.vmu-multimedia-flat,
-.vmu-multimedia-flat::before {
-  border-radius: 0 !important;
+html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ section) > section[data-testid="AudioPage_PlayerBlock"] {
+  pointer-events: auto !important;
 }
-/* just after the release: rounded at once, VK's own switch follows later */
-.vmu-multimedia-round,
-.vmu-multimedia-round::before {
+/* VK's own fixed copy (its wrapper has no cards after it) */
+html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):not(:has(~ section)) {
+  display: none !important;
+}
+/* corners and outline: released … */
+html.vmu-pinmode section[data-testid="AudioPage_PlayerBlock"],
+html.vmu-pinmode section[data-testid="AudioPage_PlayerBlock"]::before {
   border-radius: 12px !important;
 }
-.vmu-multimedia-flat {
+/* … and merged: flat, and the outline (an inset ring on ::before) loses its bottom
+   side, where the card now touches the tabs bar — top + left + right only, drawn on
+   the element itself */
+html.vmu-pinmode.vmu-merged section[data-testid="AudioPage_PlayerBlock"],
+html.vmu-pinmode.vmu-merged section[data-testid="AudioPage_PlayerBlock"]::before {
+  border-radius: 0 !important;
+}
+html.vmu-pinmode.vmu-merged section[data-testid="AudioPage_PlayerBlock"]::before {
+  box-shadow: none !important;
+}
+html.vmu-pinmode.vmu-merged section[data-testid="AudioPage_PlayerBlock"] {
   box-shadow:
-    inset 0 1px 0 0 var(--vmu-pin-border, rgba(255, 255, 255, 0.08)),
-    inset 1px 0 0 0 var(--vmu-pin-border, rgba(255, 255, 255, 0.08)),
-    inset -1px 0 0 0 var(--vmu-pin-border, rgba(255, 255, 255, 0.08));
+    inset 0 1px 0 0 var(--vmu-pin-border, rgb(54, 55, 56)),
+    inset 1px 0 0 0 var(--vmu-pin-border, rgb(54, 55, 56)),
+    inset -1px 0 0 0 var(--vmu-pin-border, rgb(54, 55, 56)) !important;
+}
+/* The swapped-track panel (injected.js, #vmu-overlay-panel) is put right after the
+   player block inside the same wrapper. In this mode it simply covers the block from
+   there — it moves with the sticky wrapper for free instead of being re-positioned by
+   script — and takes the same two looks from the same class. */
+html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ section) > #vmu-overlay-panel {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  border-radius: 12px !important;
+  box-shadow: inset 0 0 0 1px var(--vmu-pin-border, rgb(54, 55, 56)) !important;
+}
+html.vmu-pinmode.vmu-merged div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ section) > #vmu-overlay-panel {
+  border-radius: 0 !important;
+  box-shadow:
+    inset 0 1px 0 0 var(--vmu-pin-border, rgb(54, 55, 56)),
+    inset 1px 0 0 0 var(--vmu-pin-border, rgb(54, 55, 56)),
+    inset -1px 0 0 0 var(--vmu-pin-border, rgb(54, 55, 56)) !important;
 }
 
 /* Our pinned tabs+search bar gets the border back on its own outer edges,

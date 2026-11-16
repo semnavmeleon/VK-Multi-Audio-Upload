@@ -2563,19 +2563,31 @@
     _pinQ[key] = { t: now, v };
     return v;
   }
-  // The section's padding-top changes by a known amount when the bar is pinned /
-  // released, and everything below the header (and so the page-background notch
-  // faking the second card) moves with it. Moving the notch by the same amount
-  // right here keeps it in step in the same frame; waiting for the next full
-  // applyAudioHeaderSplit (a throttled mutation pass) left it a few hundred ms
-  // behind — one of the visible stages of the transition.
-  function shiftSplitMasks(section, d) {
-    if (!d) return;
-    for (const m of section.querySelectorAll(':scope > .vmu-split-mask')) {
-      const t = parseFloat(m.style.top);
-      if (!isNaN(t)) m.style.top = (t + d) + 'px';
-    }
-  }
+  // (The page-background notch of applyAudioHeaderSplit must NOT be moved when the bar is
+  // pinned / released: the padding takes exactly the bar's place, the content below does
+  // not move. Shifting it by the padding difference put it ~92 px off, over the tabs.)
+  // Writes that change nothing are skipped: classList.add / a style assignment produce a
+  // mutation record even when the value is the same, and this function runs from the
+  // mutation watcher — so it kept waking itself (and every other observer on the page).
+  function pinAddCls(el, ...cs) { for (const k of cs) if (!el.classList.contains(k)) el.classList.add(k); }
+  function pinSetStyle(el, k, v) { if (el.style[k] !== v) el.style[k] = v; }
+
+  // HOW THE MERGE WORKS (and why): VK renders the player block twice — one copy in the
+  // flow and, once that has scrolled up to the top bar, a second position:fixed copy,
+  // hiding the first. It makes that switch from its own asynchronous scroll handling:
+  // measured live, 45–60 ms (several frames) AFTER the scroll position crossed the
+  // point, and it flattens / rounds the card's corners on the same late schedule.
+  // Everything the extension did was in step with the scroll, so for those frames the
+  // two disagreed: a hole above the pinned tabs on the way down, the player jumping
+  // from 48 to 64 px on the way up, square corners on a released player, and the
+  // swapped-track panel (which follows «the visible copy») trailing by up to a second.
+  // Chasing VK's switch with timers could not fix a race.
+  // So VK's switch is taken out of the picture: while this feature is on
+  // (html.vmu-pinmode, CSS in style.css) the IN-FLOW copy is simply position:sticky
+  // under the top bar — the browser keeps it there in the very frame it scrolls, no
+  // script involved — VK's fixed copy is not displayed at all, and the corners and
+  // the outline depend on one thing only: html.vmu-merged, set below in the same
+  // pass that pins the tabs.
   function applyTabsBarPin() {
     const sections = pinQuery('hdr', '[data-testid="AudioCatalog_Header"]', true);
     // This runs on every throttled page mutation (see onPageMutated), on
@@ -2594,6 +2606,10 @@
     if (needLayout) {
       const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
       const topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
+      if (applyTabsBarPin._tbh !== topBarBottom) {
+        applyTabsBarPin._tbh = topBarBottom;
+        document.documentElement.style.setProperty('--vmu-topbar-h', topBarBottom + 'px'); // where the sticky player stops
+      }
       // AudioPage_PlayerBlock (album art / transport controls under the nav
       // bar) is VK's persistent mini-player — confirmed live it stays fixed at
       // the same viewport position no matter how far you scroll. VK actually
@@ -2624,11 +2640,19 @@
       // top bar), not later when the tabs happen to scroll up to the anchor — that
       // delay was what made the player's corners flatten first and the tabs and
       // the search box follow one after another a bit further down the scroll.
-      mergeNow = playerBlocks.length >= 2 || (playerBlocks.length > 0 && minTop <= topBarBottom + 0.5);
+      // Decided by where the in-flow copy (the first one in the document) is, and
+      // by nothing else. The presence of VK's second, pinned copy used to count as
+      // well — but VK adds it a little after the merge point on the way down and
+      // removes it a little after on the way up, so on the way up the bar stayed
+      // pinned until VK had finished (and if scrolling stopped just there, until
+      // some later mutation): the player was back to rounded corners while the tabs
+      // were still merged to it.
+      // (no player block at all — nothing has been played yet: null, the tabs' own rule)
+      mergeNow = playerBlocks.length > 0 ? playerBlocks[0].getBoundingClientRect().top <= topBarBottom + 0.5 : null;
 
       // The multimedia card (AudioPage_PlayerBlock's own vkitInternalGroupCard
       // wrapper) draws its "border" via a uniform inset box-shadow on ::before,
-      // not a real border property. While merged, .vmu-multimedia-flat (CSS)
+      // not a real border property. While merged, the stylesheet (html.vmu-merged)
       // disables that and substitutes a top+left+right-only version — keeps
       // the outer edges bordered but drops the bottom line where it now
       // touches our panel, so the two read as one continuous outline instead
@@ -2640,8 +2664,11 @@
         const nowMs = performance.now();
         if (mmCard !== _pinBorderEl || nowMs - _pinBorderAt > 2000) {
           _pinBorderEl = mmCard; _pinBorderAt = nowMs;
+          // while merged the player's own ring is switched off — the catalog header is
+          // the same kind of card and keeps its ring, so it serves as the second source
           const mmBorder = getComputedStyle(mmCard, '::before').boxShadow;
-          const m = mmBorder.match(/rgba?\([^)]+\)/);
+          const m = mmBorder.match(/rgba?\([^)]+\)/)
+            || (sections[0] ? getComputedStyle(sections[0], '::before').boxShadow.match(/rgba?\([^)]+\)/) : null);
           if (m) document.documentElement.style.setProperty('--vmu-pin-border', m[0]);
         }
       }
@@ -2656,15 +2683,11 @@
 
       const unpin = () => {
         for (const el of [tabs, isSearchWrap ? search : null]) {
-          if (!el) continue;
+          if (!el || !el.classList.contains('vmu-tabs-pinned')) continue;
           el.classList.remove('vmu-tabs-pinned', 'vmu-pin-top', 'vmu-pin-bottom');
           el.style.top = el.style.left = el.style.width = el.style.background = '';
         }
-        const curPad = parseFloat(section.style.paddingTop);
-        if (!isNaN(curPad) && section.dataset.vmuBasePadTop !== undefined) {
-          shiftSplitMasks(section, (Number(section.dataset.vmuBasePadTop) || 0) - curPad);
-        }
-        section.style.paddingTop = '';
+        if (section.style.paddingTop) section.style.paddingTop = '';
       };
 
       if (!settings.pinTabsBar) { unpin(); continue; }
@@ -2713,24 +2736,24 @@
       const measured = tabsH !== undefined;
 
       anyEngaged = true;
-      tabs.classList.add('vmu-tabs-pinned', 'vmu-pin-top');
-      tabs.style.left = sRect.left + 'px';
-      tabs.style.width = sRect.width + 'px';
-      tabs.style.top = anchor + 'px';
-      tabs.style.background = bg;
+      pinAddCls(tabs, 'vmu-tabs-pinned', 'vmu-pin-top');
+      pinSetStyle(tabs, 'left', sRect.left + 'px');
+      pinSetStyle(tabs, 'width', sRect.width + 'px');
+      pinSetStyle(tabs, 'top', anchor + 'px');
+      pinSetStyle(tabs, 'background', bg);
       if (!measured) tabsH = tabs.getBoundingClientRect().height; // first time ever: no cached height yet
 
       if (isSearchWrap) {
-        search.classList.add('vmu-tabs-pinned', 'vmu-pin-bottom');
-        search.style.left = sRect.left + 'px';
-        search.style.width = sRect.width + 'px';
-        search.style.top = (anchor + tabsH) + 'px';
-        search.style.background = bg;
+        pinAddCls(search, 'vmu-tabs-pinned', 'vmu-pin-bottom');
+        pinSetStyle(search, 'left', sRect.left + 'px');
+        pinSetStyle(search, 'width', sRect.width + 'px');
+        pinSetStyle(search, 'top', (anchor + tabsH) + 'px');
+        pinSetStyle(search, 'background', bg);
         if (!measured) searchH = search.getBoundingClientRect().height;
       } else {
         // No separate search wrapper on this tab — tabs is the last piece,
         // so it needs the bottom rounding+border itself.
-        tabs.classList.add('vmu-pin-bottom');
+        pinAddCls(tabs, 'vmu-pin-bottom');
       }
       // (heights read while already pinned include the border — not cached; the next unpinned pass measures the natural ones)
 
@@ -2739,34 +2762,18 @@
       // 1 px taller — its bottom border — which just overlaps the notch gap below it; heights
       // read while already pinned include that pixel, hence the -1 in that rare path.)
       const newPad = basePad + tabsH + searchH - (measured ? 0 : 1);
-      const oldPad = parseFloat(section.style.paddingTop);
-      shiftSplitMasks(section, newPad - (isNaN(oldPad) ? basePad : oldPad));
-      section.style.paddingTop = newPad + 'px';
+      pinSetStyle(section, 'paddingTop', newPad + 'px');
     }
 
-    const wasEngaged = _pinEngagedState;
     _pinEngagedState = anyEngaged;
-    if (mmCard) {
-      for (const pb of playerBlocks) {
-        const card = pb.closest('section');
-        if (!card) continue;
-        card.classList.toggle('vmu-multimedia-flat', anyEngaged);
-        // The player card's corners are switched by VK itself (flat on its pinned
-        // copy, rounded on the in-flow one), from its own scroll handling — which
-        // runs later than ours and left the corners changing a good while after
-        // everything else. The merge therefore sets the corners itself, in the same
-        // pass: flat while merged, and for a moment after the release rounded again,
-        // until VK has caught up.
-        if (anyEngaged) card.classList.remove('vmu-multimedia-round');
-        else if (wasEngaged) {
-          card.classList.add('vmu-multimedia-round');
-          setTimeout(() => card.classList.remove('vmu-multimedia-round'), 700);
-        }
-      }
-    }
-    // Layout reads were skipped: nothing can be engaged, so just make sure a
-    // flat-card class left over from an earlier pinned state is cleared.
-    else if (!needLayout) document.querySelector('.vmu-multimedia-flat')?.classList.remove('vmu-multimedia-flat');
+    // The only two pieces of state the look depends on (see the note above the function):
+    //   vmu-pinmode — the feature is on and this page has the catalog header: the in-flow
+    //                 player is sticky, VK's fixed copy is not displayed;
+    //   vmu-merged  — the tabs are pinned under the player right now: flat corners, no
+    //                 outline between the two. Same pass, same frame as the pin itself.
+    const root = document.documentElement;
+    if (root.classList.contains('vmu-pinmode') !== needLayout) root.classList.toggle('vmu-pinmode', needLayout);
+    if (root.classList.contains('vmu-merged') !== anyEngaged) root.classList.toggle('vmu-merged', anyEngaged);
   }
 
   var _pinBorderEl = null, _pinBorderAt = 0; // var: applyTabsBarPin can run before this line is reached
@@ -2776,8 +2783,20 @@
   }
   window.addEventListener('resize', applyAudioCatalogLayout);
   var _pinEngagedState = false;
+  var _pinSettleTimer = null;
   window.addEventListener('scroll', () => {
     if (!settings.pinTabsBar) return;
+    // The merge can only change while the in-flow player is near the top bar: far
+    // down while merged, or at the very top while not, a scroll event changes
+    // nothing here (a resize or a mutation re-runs the full pass), so the layout
+    // reads are skipped — this handler runs on every scroll event.
+    const sy = window.scrollY;
+    if ((_pinEngagedState && sy > 160) || (!_pinEngagedState && sy < 2)) return;
+    // and one more pass shortly after the last event, so that however VK's own
+    // switch of the player copy lands relative to the final scroll event, the
+    // state this settles in is the right one
+    clearTimeout(_pinSettleTimer);
+    _pinSettleTimer = setTimeout(() => { applyTabsBarPin(); applyAudioHeaderSplit(); }, 140);
     const before = _pinEngagedState;
     applyTabsBarPin();
     // VK swaps its player copies in its own handler, possibly a frame after ours:
@@ -8164,11 +8183,38 @@
     if (inlineStyle) btn.setAttribute('style', inlineStyle);
   }
 
+  // Where the extension's toolbar buttons go: the button group of VK's upload
+  // action. Two things made the buttons «sometimes not appear»:
+  //  1. every injector skipped itself when an element with its id existed ANYWHERE
+  //     on the page — but VK can keep a second, hidden copy of the toolbar (another
+  //     tab, a page it navigated away from), where the button had landed; the
+  //     visible toolbar then never got one. Now a button only counts when it sits
+  //     in the group that is actually on screen, a stray one elsewhere is dropped.
+  //  2. the settings and the SoundCloud buttons were created together behind a
+  //     check for the first one only, so a lost SoundCloud button never came back.
+  function getToolbarAnchor() {
+    const all = document.querySelectorAll('[data-testid="AudioCatalogUploadAudioAction"]');
+    if (!all.length) return null;
+    let uploadBtn = all[0];
+    if (all.length > 1) {
+      for (const b of all) { if (b.getClientRects().length) { uploadBtn = b; break; } }
+    }
+    const group = uploadBtn.parentElement;
+    return group ? { uploadBtn, group } : null;
+  }
+  function toolbarBtnPresent(group, id) {
+    const el = document.getElementById(id);
+    if (!el) return false;
+    if (el.parentElement === group) return true;
+    el.remove(); // a leftover in a stale / hidden copy of the toolbar
+    return false;
+  }
+
   function injectBulkOpsButton() {
-    if (document.getElementById('vmu-bulkops-btn')) return;
-    const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
-    const group = uploadBtn?.parentElement;
-    if (!group) return;
+    const anchor = getToolbarAnchor();
+    if (!anchor) return;
+    const { uploadBtn, group } = anchor;
+    if (toolbarBtnPresent(group, 'vmu-bulkops-btn')) return;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.id = 'vmu-bulkops-btn';
@@ -8198,11 +8244,15 @@
   // click away, and open their own standalone draggable modals (toggleSettings
   // / toggleSoundCloud) — no upload dialog involved at all anymore.
   function injectToolbarSettingsButtons() {
-    if (document.getElementById('vmu-toolbar-settings-btn')) return;
-    const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
-    const group = uploadBtn?.parentElement;
-    if (!group) return;
-    const gearBtn = document.createElement('button');
+    const anchor = getToolbarAnchor();
+    if (!anchor) return;
+    const { uploadBtn, group } = anchor;
+    const haveGear = toolbarBtnPresent(group, 'vmu-toolbar-settings-btn');
+    const haveSc = toolbarBtnPresent(group, 'vmu-toolbar-sc-btn');
+    if (haveGear && haveSc) return;
+    let gearBtn = haveGear ? document.getElementById('vmu-toolbar-settings-btn') : null;
+    if (!haveGear) gearBtn = document.createElement('button');
+    if (!haveGear) {
     gearBtn.type = 'button';
     gearBtn.id = 'vmu-toolbar-settings-btn';
     gearBtn.className = uploadBtn.className;
@@ -8214,7 +8264,9 @@
     gearBtn.addEventListener('mouseleave', hideDlTooltip);
     gearBtn.addEventListener('click', () => { hideDlTooltip(); toggleSettings(); });
     group.insertBefore(gearBtn, uploadBtn);
+    }
 
+    if (haveSc) return;
     const scBtn = document.createElement('button');
     scBtn.type = 'button';
     scBtn.id = 'vmu-toolbar-sc-btn';
@@ -8324,10 +8376,10 @@
   }
 
   function injectPlaylistMakerButton() {
-    if (document.getElementById('vmu-plmake-btn')) return;
-    const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
-    const group = uploadBtn?.parentElement;
-    if (!group) return;
+    const anchor = getToolbarAnchor();
+    if (!anchor) return;
+    const { uploadBtn, group } = anchor;
+    if (toolbarBtnPresent(group, 'vmu-plmake-btn')) return;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.id = 'vmu-plmake-btn';
@@ -8859,10 +8911,10 @@
   }
 
   function injectPlaylistOrderButton() {
-    if (document.getElementById('vmu-plorder-btn')) return;
-    const uploadBtn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
-    const group = uploadBtn?.parentElement;
-    if (!group) return;
+    const anchor = getToolbarAnchor();
+    if (!anchor) return;
+    const { uploadBtn, group } = anchor;
+    if (toolbarBtnPresent(group, 'vmu-plorder-btn')) return;
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.id = 'vmu-plorder-btn';
@@ -9561,11 +9613,16 @@
   }
 
   function injectCatalogToolbarButtons() {
-    injectPlaylistOrderButton();
-    injectPlaylistMakerButton();
-    injectBulkOpsButton();
-    injectToolbarSettingsButtons();
+    // each one on its own: a failure in one must not skip the ones after it
+    for (const fn of [injectPlaylistOrderButton, injectPlaylistMakerButton, injectBulkOpsButton, injectToolbarSettingsButtons]) {
+      try { fn(); } catch (err) { console.warn('[VK Multi Upload] toolbar button failed:', fn.name, err); }
+    }
   }
+  // Safety net: the mutation watcher re-injects after VK re-renders the toolbar,
+  // but a re-render it does not report (or one that lands between two passes)
+  // would leave the toolbar short until the next unrelated mutation. A check is a
+  // handful of cheap lookups, so it also runs on a slow timer.
+  setInterval(() => { if (!document.hidden) injectCatalogToolbarButtons(); }, 1500);
   // Re-injection after VK re-renders the toolbar is driven from the throttled
   // page-mutation watcher (onPageMutated, ≤~8 runs/sec) instead of a
   // dedicated body-subtree observer of its own: that one ran these lookups
