@@ -4332,6 +4332,7 @@
     let lastSlotKey = null;
     let overlay = null; // { audioEl, nativeEl, forSlotKey }
     let pendingSwapSlot = null; // slotKey while startOverlay is fetching the stream URL
+    let pauseRequestedSlot = null; // the user pressed pause while that slot was still being fetched
     let lastIndexMissPost = 0;
     // another VK tab rebuilt the index (it lives in the shared localStorage):
     // drop the in-memory copy so the fresh one is read
@@ -4353,6 +4354,12 @@
     let hidePanelTip = null;
     let currentMatch = null;
     const iconCache = { play: null, pause: null };
+    // «elapsed / remaining», for the panel and for VK's drop-down separately —
+    // VK keeps the choice per player now, so ours follows each of them. The
+    // panel's is seeded from the copy it takes of VK's block, the drop-down's
+    // from whatever VK last wrote into its own clock.
+    let clockRemaining = true;
+    let popRemaining = true, popClockWritten = null;
 
     const NATIVE_PANEL_SELECTOR = 'section[data-testid="AudioPage_PlayerBlock"]';
     const SEL_PREV = '[data-testid="audio-player-controls-backward-button"]';
@@ -4366,6 +4373,16 @@
     const SEL_PROGRESSTIME = '[data-testid="audioplayerplaybackbody-progresstime"]';
     const SEL_COVER = '[data-testid="audioplayerplaybackbody-cover"]';
     const SEL_SHARE = '[data-testid="MusicAudio_Share"]';
+    // VK's second player: the drop-down under the mini player in the top bar
+    const SEL_POP_BLOCK = '[data-testid="TopPlayerPopup_Block"]';
+    const SEL_POP_PLAY = '[data-testid="TopPlayerPopup_StateButton"]';
+    const SEL_POP_PROGRESS = '[data-testid="TopPlayerPopup_ProgressBar"]';
+    const SEL_POP_TIME = '[data-testid="TopPlayerPopup_ProgressTime"]';
+    const SEL_POP_TITLE = '[data-testid="TopPlayerPopup_Title"]';
+    const SEL_POP_EXTRA = '[data-testid="TopPlayerPopup_Extra"]';
+    const SEL_POP_NOTICE = '[data-testid="TopPlayerPopup_NoticeIcon"]';
+    // the timeline the playing track's own row carries (queue and track list)
+    const SEL_ROW_PROGRESS = '[data-testid="MusicTrackRow_ProgressBar"]';
     const SWAP_ICON = '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 8h13"/><path d="M15 5l3 3-3 3"/><path d="M19 16H6"/><path d="M9 13l-3 3 3 3"/></svg>';
     const SWAP_ACCENT = '#71aaeb';
 
@@ -4641,7 +4658,8 @@
             (panelCtl.volumeBar && panelCtl.volumeBar.contains(e.target))) { stop(e); return; }
         if (panelCtl.progressTime && panelCtl.progressTime.contains(e.target)) {
           stop(e);
-          try { window.ap.toggleDurationType(); } catch {}
+          clockRemaining = !clockRemaining;
+          try { window.ap.toggleDurationType(); } catch {} // keeps VK's stored value in step
           updatePanel();
           return;
         }
@@ -4690,6 +4708,12 @@
         cover: q(SEL_COVER),
         volButton: null,
       };
+      // the copy was taken from VK's block as it stands: its clock shows which
+      // of the two the user last chose there
+      if (panelCtl.progressTime) {
+        const t0 = panelCtl.progressTime.textContent.trim();
+        if (/^-?\d+:\d\d/.test(t0)) clockRemaining = t0.charAt(0) === '-';
+      }
       // the button right before the volume slider is VK's mute toggle
       if (panelCtl.volumeBar) {
         for (const b of panelEl.querySelectorAll('button')) {
@@ -4829,11 +4853,177 @@
       if (icon) icon.style.display = 'none';
     }
     function restoreTopPlayer() {
+      restoreTopPopup(); // the two always belong to the same track
       const s = topSaved;
       topSaved = null;
       if (!s) return;
       for (const r of s.recs) if (r.n.data === r.ours) r.n.data = r.orig;
       if (s.icon) s.icon.style.display = s.iconDisplay;
+    }
+
+    // --- VK's second player: the drop-down under the top-bar mini player ----
+    // It is a player in its own right — transport, timeline, clock, title —
+    // and during a swap VK went on showing the original in it: the restricted
+    // name, its badge, a clock standing still where the muted original
+    // stopped, a timeline that never moved. Unlike the block at the bottom of
+    // the page this one is NOT covered with a copy: VK mounts, re-renders and
+    // throws the popup away whenever it likes, and a copy would have to live
+    // inside it. It is corrected in place instead — the data of existing text
+    // nodes, the widths of the fills it already has — and its own play/pause
+    // button and timeline are routed to the community version.
+    let popSaved = null; // { recs: [{ n, orig, ours }], icon, iconDisplay, match }
+    let _pop = null, _popAt = 0;
+    function topPopup() {
+      const now = performance.now();
+      if (_pop && _pop.isConnected && now - _popAt < 400) return _pop;
+      _popAt = now;
+      _pop = document.querySelector(SEL_POP_BLOCK);
+      return _pop;
+    }
+    // EVERY text node, the blank ones included. Counting only the ones with
+    // text in them meant the list changed shape the moment our own text was in
+    // (we empty all but one), the record never matched, and it was rebuilt —
+    // original back in, ours back over it — on every pass. At tick speed that
+    // was the artist flickering; once the observer below answered each write
+    // in a microtask it became a loop the page never got out of.
+    function popTextNodes(root) {
+      const out = [];
+      if (!root) return out;
+      const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      while (w.nextNode()) out.push(w.currentNode);
+      return out;
+    }
+    // all of the text goes into the first node that carries any and the rest
+    // are emptied: VK splits «Artist feat. Someone» across links and separators
+    function popRecs(nodes, text, origOf) {
+      let first = nodes.findIndex(n => n.data.trim());
+      if (first < 0) first = 0;
+      return nodes.map((n, i) => ({ n, orig: origOf(n), ours: i === first ? text : '' }));
+    }
+    function writePop(recs, icon) {
+      for (const r of recs) if (r.n.data !== r.ours) r.n.data = r.ours;
+      if (icon && icon.style.display !== 'none') icon.style.display = 'none';
+      // our own writes must not come back to us through the observer
+      if (popObs) popObs.takeRecords();
+    }
+    function applyTopPopup(match) {
+      const box = topPopup();
+      if (!box || !match) return;
+      const titleEl = box.querySelector(SEL_POP_TITLE);
+      const extraEl = box.querySelector(SEL_POP_EXTRA);
+      const tNodes = popTextNodes(titleEl), eNodes = popTextNodes(extraEl);
+      if (!tNodes.length) return;
+      const icon = box.querySelector(SEL_POP_NOTICE);
+      const nodes = tNodes.concat(eNodes);
+      // the same track in the same nodes: only re-assert what VK has rewritten
+      if (popSaved && popSaved.match === match && popSaved.recs.length === nodes.length
+        && popSaved.recs.every((r, i) => r.n === nodes[i])) {
+        writePop(popSaved.recs, icon);
+        return;
+      }
+      // A new record. VK may not have re-rendered since we last wrote, so a
+      // node still holding our own text keeps the original it had — our text
+      // must never be recorded as «the original» and handed back later.
+      const prev = popSaved;
+      const origOf = n => {
+        if (prev) { const r = prev.recs.find(p => p.n === n); if (r && n.data === r.ours) return r.orig; }
+        return n.data;
+      };
+      if (prev && prev.icon && prev.icon !== icon) prev.icon.style.display = prev.iconDisplay;
+      const recs = popRecs(tNodes, decodeEntities(match.title || ''), origOf)
+        .concat(popRecs(eNodes, decodeEntities(match.artist || ''), origOf));
+      const iconDisplay = prev && prev.icon === icon ? prev.iconDisplay : (icon ? icon.style.display : '');
+      popSaved = { recs, icon, iconDisplay, match };
+      watchPopup(box);
+      writePop(recs, icon);
+    }
+    // VK re-renders the drop-down while it plays (its own clock alone brings a
+    // render a second) and every render puts the original's name back. Waiting
+    // for the next tick to answer is a quarter of a second of VK's text on
+    // screen — plainly visible. The observer answers before the next frame is
+    // painted instead, and never inside its own callback: a write answered
+    // synchronously there can chain through microtasks without the page ever
+    // getting a frame in between, which is a hang, not a flicker.
+    let popObs = null, popRaf = 0;
+    function watchPopup(box) {
+      if (popObs) popObs.disconnect();
+      popObs = new MutationObserver(() => {
+        if (popRaf) return;
+        popRaf = requestAnimationFrame(() => {
+          popRaf = 0;
+          if (!overlay || overlay.mode !== 'community' || !popSaved) return;
+          updateTopPopup();
+        });
+      });
+      const opt = { characterData: true, childList: true, subtree: true };
+      for (const sel of [SEL_POP_TITLE, SEL_POP_EXTRA, SEL_POP_TIME]) {
+        const el = box.querySelector(sel);
+        if (el) popObs.observe(el, opt);
+      }
+    }
+    function restoreTopPopup() {
+      if (popObs) { popObs.disconnect(); popObs = null; }
+      if (popRaf) { cancelAnimationFrame(popRaf); popRaf = 0; }
+      popClockWritten = null;
+      const s = popSaved;
+      popSaved = null;
+      if (!s) return;
+      for (const r of s.recs) if (r.n.data === r.ours) r.n.data = r.orig;
+      if (s.icon) s.icon.style.display = s.iconDisplay;
+    }
+    // the name, the timeline and the clock of the drop-down, from the overlay
+    function updateTopPopup() {
+      if (!overlay || overlay.mode !== 'community') return;
+      const box = topPopup();
+      if (!box) return;
+      applyTopPopup(overlay.match);
+      const a = overlay.audioEl, cur = a.currentTime, dur = a.duration;
+      const bar = box.querySelector(SEL_POP_PROGRESS);
+      if (bar && isFinite(dur) && dur > 0) {
+        const fills = bar.querySelectorAll('div[style*="width"]');
+        if (fills[0] && fills[0].style.width !== '100%') fills[0].style.width = '100%'; // buffered
+        if (fills[1]) fills[1].style.width = (cur / dur * 100) + '%';                   // played
+      }
+      const t = box.querySelector(SEL_POP_TIME);
+      const n = t && popTextNodes(t).find(x => x.data.trim());
+      if (n) {
+        // Anything in there that is not what we wrote came from VK — that is
+        // the user having clicked the clock, and its sign says which of the
+        // two VK switched to. (It no longer tells ap about the choice at all.)
+        const shown = n.data.trim();
+        if (shown !== popClockWritten && /^-?\d+:\d\d/.test(shown)) popRemaining = shown.charAt(0) === '-';
+        const txt = popRemaining && isFinite(dur) && dur > 0 ? '-' + fmtTime(Math.max(0, dur - cur)) : fmtTime(cur);
+        if (n.data !== txt) { n.data = txt; if (popObs) popObs.takeRecords(); }
+        popClockWritten = txt;
+      }
+    }
+
+    // The row of the track that is playing draws a timeline of its own, in the
+    // queue and in the track list alike, and it was left showing the muted
+    // original: standing still at nought while the community version played.
+    function updateRowBars() {
+      if (!overlay || overlay.mode !== 'community') return;
+      const a = overlay.audioEl, dur = a.duration;
+      if (!isFinite(dur) || dur <= 0) return;
+      const slot = currentSlotKey();
+      const pct = (a.currentTime / dur * 100) + '%';
+      for (const bar of document.querySelectorAll(SEL_ROW_PROGRESS)) {
+        const row = bar.closest('[data-audio-id]');
+        if (!row || row.getAttribute('data-audio-id') !== slot) continue;
+        const fills = bar.querySelectorAll('div[style*="width"]');
+        if (fills[0] && fills[0].style.width !== '100%') fills[0].style.width = '100%'; // buffered
+        if (fills[1] && fills[1].style.width !== pct) fills[1].style.width = pct;       // played
+      }
+    }
+    // the bar under the pointer, if it is one the swap is in charge of
+    function swapSeekBar(t) {
+      if (!t || !t.closest) return null;
+      const pop = t.closest(SEL_POP_PROGRESS);
+      if (pop) return pop;
+      const bar = t.closest(SEL_ROW_PROGRESS);
+      if (!bar) return null;
+      const row = bar.closest('[data-audio-id]');
+      return row && row.getAttribute('data-audio-id') === currentSlotKey() ? bar : null;
     }
 
     function updatePanelPlayIcon(isPlaying) {
@@ -4854,7 +5044,38 @@
     // transition, and the pinned copy moves while scrolling — so this is
     // re-read continuously instead of on a few events).
     let _lastRect = null, _lastNative = null, _styledAt = 0;
-    function positionOverNative() {
+    // In pinmode the copy's height is the only thing the stylesheet does not
+    // give it, and a ResizeObserver reports the block's height without the
+    // browser having to lay the page out on the spot — which a rect read here
+    // did, at about 4 ms a time on a long music page (profiled: 100 ms of the
+    // 563 ms the swap spent over 39 s, with a 28.8 ms worst case).
+    let _nativeRO = null, _nativeROEl = null, _nativeH = null;
+    function watchNativeSize(el) {
+      if (_nativeROEl === el && _nativeRO) return;
+      if (_nativeRO) _nativeRO.disconnect();
+      _nativeROEl = el;
+      _nativeH = null;
+      try {
+        _nativeRO = new ResizeObserver(entries => {
+          const e = entries[entries.length - 1];
+          const box = e.borderBoxSize && e.borderBoxSize[0];
+          const h = box ? box.blockSize : e.contentRect.height;
+          if (!(h > 0)) return;
+          _nativeH = h;
+          if (!panelEl || !document.documentElement.classList.contains('vmu-pinmode')) return;
+          const px = h + 'px';
+          if (panelEl.style.height !== px) panelEl.style.height = px;
+        });
+        _nativeRO.observe(el);
+      } catch { _nativeRO = null; _nativeROEl = null; }
+    }
+    function stopWatchingNativeSize() {
+      if (_nativeRO) _nativeRO.disconnect();
+      _nativeRO = null; _nativeROEl = null; _nativeH = null;
+    }
+    // force: read the geometry for real even in pinmode — the slide in and out
+    // is measured from it, and it is read once per show and once per hide.
+    function positionOverNative(force) {
       if (!panelEl) return null;
       // VK adds / removes its second copy of the block some frames after the scroll that
       // caused it (measured: 45–60 ms) — after the last scroll event had already dropped
@@ -4865,16 +5086,37 @@
       if (cnt !== _gvnCount) { _gvnCount = cnt; _gvnAt = 0; }
       const native = getVisibleNativePanel();
       if (!native) return _lastRect;
+      const place = () => {
+        if (panelEl.previousElementSibling === native) return;
+        native.after(panelEl);
+        const nz = parseInt(getComputedStyle(native).zIndex, 10);
+        panelEl.style.zIndex = String(isFinite(nz) ? nz + 1 : 2);
+      };
+      // The stylesheet covers the block with the copy in pinmode (position,
+      // left, top, width and the whole look, all !important — the values
+      // written below are overridden there), so nothing has to be measured on
+      // a heartbeat: the copy rides the sticky wrapper and only its height
+      // comes from the observer above.
+      if (!force && document.documentElement.classList.contains('vmu-pinmode')) {
+        place();
+        watchNativeSize(native);
+        if (panelEl.__vmuRing !== 'css') {
+          panelEl.__vmuRing = 'css';
+          panelEl.style.removeProperty('box-shadow');
+          panelEl.style.borderRadius = '';
+        }
+        if (_nativeH != null) {
+          const px = _nativeH + 'px';
+          if (panelEl.style.height !== px) panelEl.style.height = px;
+        }
+        return _lastRect;
+      }
       const r = native.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) { _gvnAt = 0; return _lastRect; } // not displayed: pick again next time
       const sameSpot = _lastRect && native === _lastNative && r.left === _lastRect.left && r.top === _lastRect.top
         && r.width === _lastRect.width && r.height === _lastRect.height;
       _lastRect = r;
-      if (panelEl.previousElementSibling !== native) {
-        native.after(panelEl);
-        const nz = parseInt(getComputedStyle(native).zIndex, 10);
-        panelEl.style.zIndex = String(isFinite(nz) ? nz + 1 : 2);
-      }
+      place();
       // nothing moved and the look was read less than a second ago: done
       const nowT = performance.now();
       if (sameSpot && nowT - _styledAt < 1000) return r;
@@ -4982,10 +5224,14 @@
       document.addEventListener('transitionrun', _kickListener, { passive: true, capture: true });
       document.addEventListener('transitionend', _kickListener, { passive: true, capture: true });
       kickTracking(900);
+      document.addEventListener('visibilitychange', _kickListener);
       _trackTimer = setInterval(() => {
-        positionOverNative();
+        // a hidden tab paints nothing: the copy is re-glued (and measured) on
+        // the burst that visibilitychange kicks off, before the first frame
+        // the user gets to see
+        if (!document.hidden) positionOverNative();
         // after the slide-in has finished
-        if (overlay && overlay.mode === 'community' && panelShownAt && Date.now() - panelShownAt > 450) setNativesHidden(true);
+        if (overlay && overlay.mode === 'community' && panelShownAt && Date.now() - panelShownAt > 220) setNativesHidden(true);
         {
           syncFromNative();
           updatePanel(); // the play/pause icon and the timer must not wait for the next timeupdate
@@ -4995,13 +5241,15 @@
             if (overlay && overlay.mode === 'community' && ourMediaMetadata && navigator.mediaSession
               && navigator.mediaSession.metadata !== ourMediaMetadata) navigator.mediaSession.metadata = ourMediaMetadata;
           } catch {}
-          if (overlay && overlay.mode === 'community') applyTopPlayer(overlay.match);
-          else if (topSaved && !panelGrace) restoreTopPlayer();
+          if (overlay && overlay.mode === 'community') { applyTopPlayer(overlay.match); updateTopPopup(); }
+          else if ((topSaved || popSaved) && !panelGrace) restoreTopPlayer();
         }
       }, 500);
     }
     function stopPositionTracking() {
       if (_trackTimer) { clearInterval(_trackTimer); _trackTimer = null; }
+      document.removeEventListener('visibilitychange', _kickListener);
+      stopWatchingNativeSize();
       window.removeEventListener('scroll', _kickListener, true);
       window.removeEventListener('resize', _kickListener);
       document.removeEventListener('transitionrun', _kickListener, true);
@@ -5033,7 +5281,7 @@
       if (panelVisible && panelEl && panelEl.isConnected) {
         ensurePanelShell();
         rebuildPanelContent(native);
-        positionOverNative();
+        positionOverNative(true);
         applyOverrides(match);
         applyTopPlayer(match);
         startPositionTracking();
@@ -5043,7 +5291,7 @@
       panelShownAt = Date.now();
       ensurePanelShell();
       rebuildPanelContent(native);
-      const r = positionOverNative();
+      const r = positionOverNative(true);
       applyOverrides(match);
       applyTopPlayer(match);
       startPositionTracking();
@@ -5059,7 +5307,7 @@
       panelEl.style.transform = 'translateY(' + hiddenY + 'px)';
       panelEl.style.pointerEvents = 'auto';
       void panelEl.offsetHeight;
-      panelEl.style.transition = 'transform 0.42s cubic-bezier(0.2, 0.9, 0.3, 1), opacity 0.25s ease-out';
+      panelEl.style.transition = 'transform 0.16s cubic-bezier(0.2, 0.9, 0.3, 1), opacity 0.1s ease-out';
       panelEl.style.opacity = '1';
       panelEl.style.transform = 'translateY(0)';
       panelVisible = true;
@@ -5083,20 +5331,31 @@
       if (_graceTimer) { clearTimeout(_graceTimer); _graceTimer = null; }
       panelGrace = false;
       panelVisible = false;
-      const r = _lastRect;
+      // the slide out is measured from where the block is NOW (the heartbeat
+      // no longer measures in pinmode): one read per hide
+      const r = positionOverNative(true) || _lastRect;
       const hiddenY = r ? -(r.top + r.height + 24) : -160;
       if (hidePanelTip) hidePanelTip();
       panelShownAt = 0;
       setNativesHidden(false);
       panelEl.style.pointerEvents = 'none';
-      panelEl.style.transition = 'transform 0.3s cubic-bezier(0.5, 0, 0.8, 0.4), opacity 0.25s ease-in';
+      panelEl.style.transition = 'transform 0.14s cubic-bezier(0.5, 0, 0.8, 0.4), opacity 0.1s ease-in';
       panelEl.style.opacity = '0';
       panelEl.style.transform = 'translateY(' + hiddenY + 'px)';
       if (_hideTimer) clearTimeout(_hideTimer);
       _hideTimer = setTimeout(() => {
         _hideTimer = null;
         if (!overlay || overlay.mode === 'original') { stopPositionTracking(); if (panelEl) panelEl.remove(); }
-      }, 450);
+      }, 220);
+    }
+
+    // The hold started by hidePanel(graceMs) is over before its timer: it is
+    // now known that the new track is not swapped, so the panel and the
+    // renamed top player must not sit over a track that is already playing.
+    function endPanelGrace() {
+      if (!panelGrace) return;
+      restoreTopPlayer();
+      hidePanel();
     }
 
     // VK's volume (0..1, 0 = muted) drives the overlay, whoever changed it
@@ -5124,10 +5383,8 @@
         if (fills[1]) fills[1].style.width = (cur / dur * 100) + '%';
       }
       if (panelCtl.progressTime) {
-        // a click on the timer switches elapsed ↔ remaining (VK keeps the choice in ap)
-        let remaining = false;
-        try { remaining = !!(window.ap && window.ap.constructor._lsGet(window.ap.constructor.LS_DURATION_TYPE)); } catch {}
-        const txt = remaining && isFinite(dur) && dur > 0 ? '-' + fmtTime(Math.max(0, dur - cur)) : fmtTime(cur);
+        // a click on the timer switches elapsed ↔ remaining
+        const txt = clockRemaining && isFinite(dur) && dur > 0 ? '-' + fmtTime(Math.max(0, dur - cur)) : fmtTime(cur);
         if (panelCtl.progressTime.textContent !== txt) panelCtl.progressTime.textContent = txt;
       }
       if (panelCtl.volumeBar) {
@@ -5136,6 +5393,8 @@
         if (fill) fill.style.width = (a.muted ? 0 : Math.log(1 + 34 * a.volume) / Math.log(35) * 100) + '%';
       }
       updatePanelPlayIcon(!a.paused);
+      updateTopPopup();
+      updateRowBars();
     }
 
     // --- original <-> community version -------------------------------------
@@ -5537,6 +5796,69 @@
           return origPause.apply(this, a);
         };
       }
+      // VK's own play/pause button. Up to the build of 2026-11-16 it went
+      // through pauseByButton / playByButton, which the two hooks above cover.
+      // The build of the 17th calls the generic ap.pause() / ap.play() instead
+      // — confirmed live: pressing the button logs «pause» and never
+      // «pauseByButton», both with and without a swap running. Those two are
+      // what VK's own internals use as well (failure handling, switching
+      // tracks), so hooking them by name would break the swap. The press
+      // itself is unambiguous, so it is read from the DOM instead.
+      if (!document.__vmuStateBtnHook) {
+        document.__vmuStateBtnHook = true;
+        document.addEventListener('pointerdown', ev => {
+          const t = ev.target;
+          if (!t || !t.closest) return;
+          const btn = t.closest(SEL_PLAY + ',' + SEL_POP_PLAY);
+          if (!btn) return;
+          // the swap panel is a copy of the player block with its own handlers
+          if (panelEl && panelEl.contains(btn)) return;
+          if (!overlayIsSource()) {
+            // the swap is still fetching its stream URL and there is nothing to
+            // pause yet — remember the press so startOverlay does not start
+            // playing a moment later
+            if (pendingSwapSlot) pauseRequestedSlot = pendingSwapSlot;
+            return;
+          }
+          try {
+            if (overlay.audioEl.paused) overlay.audioEl.play().catch(() => {});
+            else overlay.audioEl.pause();
+            updatePanel();
+          } catch {}
+        }, true);
+      }
+
+      // The drop-down's timeline: VK would seek the muted original standing
+      // still behind the swap, so the community version is seeked instead.
+      // (the panel over the bottom block does the same with its own copy)
+      if (!document.__vmuPopSeekHook) {
+        document.__vmuPopSeekHook = true;
+        let popDrag = null;
+        const popSeek = (clientX, bar) => {
+          if (!overlay || overlay.mode !== 'community' || !bar || !bar.isConnected) return;
+          const rect = bar.getBoundingClientRect();
+          const dur = overlay.audioEl.duration;
+          if (!(rect.width > 0) || !isFinite(dur) || dur <= 0) return;
+          const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+          try { overlay.audioEl.currentTime = ratio * dur; } catch {}
+          updatePanel();
+        };
+        document.addEventListener('pointerdown', ev => {
+          if (!overlay || overlay.mode !== 'community') return;
+          const bar = swapSeekBar(ev.target);
+          if (!bar) return;
+          // VK's own handler is on pointerdown and takes the pointer capture
+          // with it — it must not reach React, or it would seek the muted
+          // original standing still behind the swap
+          ev.stopPropagation(); ev.preventDefault();
+          popDrag = bar;
+          popSeek(ev.clientX, bar);
+        }, true);
+        window.addEventListener('pointermove', ev => { if (popDrag) popSeek(ev.clientX, popDrag); });
+        window.addEventListener('pointerup', () => { popDrag = null; });
+        window.addEventListener('pointercancel', () => { popDrag = null; });
+      }
+
       // The play button resumes a paused overlay.
       const origPlayByButton = ap.playByButton;
       if (typeof origPlayByButton === 'function') {
@@ -5667,6 +5989,18 @@
       const slotKey = curOwner + '_' + curId;
       if (overlay && overlay.forSlotKey !== slotKey) teardownOverlay(false);
       if (pendingSwapSlot && pendingSwapSlot !== slotKey) pendingSwapSlot = null;
+      if (pauseRequestedSlot && pauseRequestedSlot !== slotKey) pauseRequestedSlot = null;
+      // The panel is kept for a moment after a slot change in case the next
+      // track is swapped as well. The moment it is clear that it is not, the
+      // hold ends — measured live: without this the panel and the renamed top
+      // player stayed ~1.3 s over the next track, which was already playing.
+      // The match is looked up before the «VK is playing» guard below on
+      // purpose: knowing there is no counterpart starts nothing by itself.
+      if (panelGrace && !overlay && pendingSwapSlot !== slotKey) {
+        const gTitle = ca[3], gArtist = ca[4];
+        if (curOwner === ownerId || typeof gTitle !== 'string' || typeof gArtist !== 'string'
+          || !findMatch(gArtist, gTitle)) endPanelGrace();
+      }
       if (curOwner === ownerId) { lastSlotKey = slotKey; return false; }
       if (overlay) return overlay.forSlotKey === slotKey;
       if (pendingSwapSlot === slotKey) return true; // async URL fetch in progress
@@ -5722,6 +6056,14 @@
         try { nativeEl.muted = true; } catch {}
       }
       if (pendingSwapSlot === slotKey) pendingSwapSlot = null;
+      // pause was pressed while this was being fetched: VK's button no longer
+      // reaches isPlaying() reliably, so the press is honoured here
+      if (pauseRequestedSlot === slotKey) {
+        pauseRequestedSlot = null;
+        lastSlotKey = null; // judged again the next time VK plays this track
+        if (nativeEl) { try { nativeEl.muted = false; } catch {} }
+        return;
+      }
       const stillCurrent = window.ap && Array.isArray(window.ap._currentAudio)
         && (window.ap._currentAudio[1] + '_' + window.ap._currentAudio[0]) === slotKey;
       if (!stillCurrent) return;

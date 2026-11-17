@@ -2669,7 +2669,13 @@
           const mmBorder = getComputedStyle(mmCard, '::before').boxShadow;
           const m = mmBorder.match(/rgba?\([^)]+\)/)
             || (sections[0] ? getComputedStyle(sections[0], '::before').boxShadow.match(/rgba?\([^)]+\)/) : null);
-          if (m) document.documentElement.style.setProperty('--vmu-pin-border', m[0]);
+          // writing a custom property on the root invalidates the style of
+          // every node in the document — 22 ms on a feed-sized page, measured.
+          // This one is re-read every two seconds and is almost always the
+          // same colour, so it is only written when it actually changes.
+          if (m && document.documentElement.style.getPropertyValue('--vmu-pin-border') !== m[0]) {
+            document.documentElement.style.setProperty('--vmu-pin-border', m[0]);
+          }
         }
       }
     }
@@ -9622,7 +9628,7 @@
   // but a re-render it does not report (or one that lands between two passes)
   // would leave the toolbar short until the next unrelated mutation. A check is a
   // handful of cheap lookups, so it also runs on a slow timer.
-  setInterval(() => { if (!document.hidden) injectCatalogToolbarButtons(); }, 1500);
+  setInterval(() => { if (!document.hidden && vmuPageHasAudio()) injectCatalogToolbarButtons(); }, 1500);
   // Re-injection after VK re-renders the toolbar is driven from the throttled
   // page-mutation watcher (onPageMutated, ≤~8 runs/sec) instead of a
   // dedicated body-subtree observer of its own: that one ran these lookups
@@ -12111,6 +12117,12 @@
         const groups = node.matches?.(NEW_ROW_ACTIONS_SEL) ? [node]
           : node.querySelectorAll ? [...node.querySelectorAll(NEW_ROW_ACTIONS_SEL)] : [];
         if (node.parentElement?.matches?.('[data-testid="audiorow-actions"]')) groups.push(node.parentElement);
+        // VK's build of 2026-11-17 marks neither the slot nor its class — the
+        // node that mounts inside a row and brings the icons with it IS the slot
+        if (!groups.length) {
+          const stampedRow = vmuStampRowActions(node);
+          if (stampedRow) injectSingleDlBtn(stampedRow);
+        }
         for (const group of groups) {
           const row = group.closest('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"]');
           if (!row) continue;
@@ -12133,8 +12145,31 @@
   // above handles that). So: (1) a row that was swept recently and has not
   // changed is skipped, (2) bursts are coalesced — one series of sweeps at a
   // time, with one trailing series if more mutations arrived meanwhile.
+  // Is there anything on this page the music machinery can work on at all?
+  // On the feed, in messages, in photos there is not, and the sweeps that go
+  // looking cost 138 ms a minute there (profiled) for nothing. VK's own
+  // data-audio-id on every track row is the honest signal: the top-bar player
+  // and an (empty) role="dialog" are in the DOM of EVERY page — measured — so
+  // neither of those can gate anything. Asking costs 0.12 ms, and the answer
+  // is kept for a quarter of a second; every caller that reacts to a DOM
+  // change asks for a fresh one.
+  var _vmuAudioAt = 0, _vmuAudioSeen = false;
+  function vmuPageHasAudio(fresh) {
+    const now = performance.now();
+    if (!fresh && now - _vmuAudioAt < 250) return _vmuAudioSeen;
+    _vmuAudioAt = now;
+    _vmuAudioSeen = !!(document.querySelector('[data-audio-id]')
+      || document.querySelector('[data-full-id]')
+      || document.querySelector('.AudioRow')
+      || document.querySelector('.audio_row'));
+    return _vmuAudioSeen;
+  }
+
   var _sweepGateUntil = 0, _sweepTrailing = false;
   function markAndInjectAll(force) {
+    // three passes, each with a document-wide scan and a round trip to the
+    // page world, over a page that has no track rows on it
+    if (!vmuPageHasAudio(force)) return;
     const t0 = performance.now();
     if (!force && t0 < _sweepGateUntil) { _sweepTrailing = true; return; }
     _sweepGateUntil = t0 + 700;
@@ -13081,7 +13116,350 @@
   // ─── SPA watcher + dialog watcher ────────────────────────────────────────────
   let lastHref = location.href;
 
+
+  // ── VK's data-testid attributes, put back ────────────────────────────────
+  // Until the VK build of 2026-11-16 every part of the music UI carried a
+  // data-testid, and about 110 selectors here and in injected.js are built on
+  // it. The build shipped on the 17th compiles those ids out: checked live on
+  // the page, all 1646 host elements whose React props still have a
+  // data-testid key carry the value undefined, and VKUI's own bundle ships a
+  // literal «"data-testid": void 0» — there is nothing left on the page to
+  // switch back on. Without the ids the extension loses the player block, the
+  // track rows, the toolbar and the catalog header all at once.
+  // So they are stamped back on here, from what the new build still gives:
+  // VK's own data-audio-id, ARIA roles, the tab links' hrefs and the
+  // accessible names of the controls (the extension is Russian-only anyway).
+  // Everything downstream keeps working unchanged, and on a build that still
+  // marks its own UI this does nothing at all.
+  const VMU_STAMPED = 'data-vmu-stamped';
+  function vmuStamp(el, id) {
+    if (!el) return null;
+    if (el.getAttribute('data-testid') !== id) {
+      el.setAttribute('data-testid', id);
+      el.setAttribute(VMU_STAMPED, '1');
+    }
+    return el;
+  }
+  function vmuLabel(el) {
+    return (el.getAttribute('aria-label') || el.textContent || '').trim();
+  }
+  // the swap panel (injected.js) is a COPY of the player block living in the
+  // page — stamping it would make it look like a second native player
+  function vmuInOverlay(el) { return !!el.closest('#vmu-overlay-panel'); }
+
+  function vmuStampPlayerBlocks() {
+    for (const sec of document.querySelectorAll('section')) {
+      if (sec.getAttribute('data-testid') === 'AudioPage_PlayerBlock'
+        && sec.querySelector('[data-testid="audio-player-controls-state-button"]')
+        && sec.querySelector('[data-testid="audioplayerplaybackbody-progressbar"]')) continue;
+      if (vmuInOverlay(sec)) continue;
+      const btns = sec.querySelectorAll('button');
+      if (btns.length < 5) continue;
+      // the transport: «предыдущая», the play/pause button, «следующая» — three
+      // buttons in a row, which no other block on the page has
+      let prev = -1, next = -1;
+      for (let i = 0; i < btns.length && next < 0; i++) {
+        const l = vmuLabel(btns[i]);
+        if (prev < 0) { if (/^Предыдущая/i.test(l)) prev = i; }
+        else if (/^Следующая/i.test(l)) next = i;
+      }
+      if (prev < 0 || next !== prev + 2) continue;
+      vmuStamp(sec, 'AudioPage_PlayerBlock');
+      vmuStamp(btns[prev], 'audio-player-controls-backward-button');
+      vmuStamp(btns[prev + 1], 'audio-player-controls-state-button');
+      vmuStamp(btns[next], 'audio-player-controls-forward-button');
+      let mute = null;
+      for (const b of btns) {
+        const l = vmuLabel(b);
+        if (/^Поделиться/i.test(l)) vmuStamp(b, 'MusicAudio_Share');
+        else if (/звук$/i.test(l)) mute = b;
+      }
+      // the volume bar sits next to the mute button; the progress bars are the
+      // only sliders that carry a label of their own
+      if (mute && mute.parentElement) {
+        vmuStamp(mute.parentElement.querySelector('[role="slider"]:not([aria-label])')
+          || mute.parentElement.querySelector('[role="slider"]'), 'audioplayervolumeslider-bar');
+      }
+      // Each of the stacked fills (buffered / played / hover) is a slider of
+      // its own, one inline-styled bar inside each; the box that holds all
+      // three is the one the panel copies, measures and seeks in.
+      const fill = sec.querySelector('[role="slider"][aria-label]');
+      if (fill) {
+        let barBox = fill;
+        while (barBox && barBox.parentElement && barBox.parentElement !== sec
+          && barBox.querySelectorAll('[role="slider"]').length < 2) barBox = barBox.parentElement;
+        if (barBox && barBox.querySelectorAll('[role="slider"]').length >= 2) vmuStamp(barBox, 'audioplayerplaybackbody-progressbar');
+      }
+      // the clock, which VK makes clickable (it toggles elapsed / remaining)
+      for (const t of sec.querySelectorAll('[role="button"]')) {
+        if (/^-?\d+:\d\d$/.test(t.textContent.trim())) { vmuStamp(t, 'audioplayerplaybackbody-progresstime'); break; }
+      }
+      // the title is a link to the track; its own box is the one the overlay
+      // panel rewrites, the box around it also holds the restriction badge
+      const link = sec.querySelector('a[href*="/audio"]');
+      if (link && link.parentElement && link.parentElement.parentElement) {
+        const titleBox = link.parentElement;
+        const titleRow = titleBox.parentElement;
+        vmuStamp(titleBox, 'audioplayeraudioinfo-title');
+        for (const n of titleRow.children) {
+          if (n !== titleBox && n.querySelector('svg')) { vmuStamp(n, 'audioplayeraudioinfo-titleNoticeIcon'); break; }
+        }
+        if (titleRow.nextElementSibling) vmuStamp(titleRow.nextElementSibling, 'audioplayeraudioinfo-extra');
+      }
+      const img = sec.querySelector('img');
+      if (img) {
+        let cov = img.parentElement;
+        while (cov && cov !== sec && cov.parentElement !== sec
+          && cov.parentElement && cov.parentElement.getBoundingClientRect().width <= 48) cov = cov.parentElement;
+        vmuStamp(cov, 'audioplayerplaybackbody-cover');
+      }
+    }
+  }
+
+  // VK's top-bar mini player opens a drop-down that carries a SECOND full
+  // player — the same transport, timeline, clock and title as the block at the
+  // bottom of the page, but it lives in a role="dialog" portal instead of a
+  // <section>, so vmuStampPlayerBlocks never sees it. It is given ids of its
+  // own on purpose: everything that looks for «the page's player block»
+  // (getVisibleNativePanel, the panel the swap copies and hides) must keep
+  // finding that one and never this one.
+  function vmuStampTopPopup() {
+    for (const dlg of document.querySelectorAll('[role="dialog"]')) {
+      if (vmuInOverlay(dlg)) continue;
+      if (dlg.querySelector('[data-testid="TopPlayerPopup_StateButton"]')
+        && dlg.querySelector('[data-testid="TopPlayerPopup_ProgressBar"]')) continue;
+      const btns = [...dlg.querySelectorAll('button')];
+      if (btns.length < 5) continue;
+      // the same signature as the player block: «предыдущая», play/pause,
+      // «следующая», three buttons in a row
+      let prev = -1, next = -1;
+      for (let i = 0; i < btns.length && next < 0; i++) {
+        const l = vmuLabel(btns[i]);
+        if (prev < 0) { if (/^Предыдущая/i.test(l)) prev = i; }
+        else if (/^Следующая/i.test(l)) next = i;
+      }
+      if (prev < 0 || next !== prev + 2) continue;
+      vmuStamp(btns[prev], 'TopPlayerPopup_PrevButton');
+      vmuStamp(btns[prev + 1], 'TopPlayerPopup_StateButton');
+      vmuStamp(btns[next], 'TopPlayerPopup_NextButton');
+      // the title is a link to the track, on the same line as the transport —
+      // the drop-down holds the whole queue below, and those are links too
+      const bt = btns[prev + 1].getBoundingClientRect();
+      const link = [...dlg.querySelectorAll('a[href*="/audio"]')]
+        .find(a => Math.abs(a.getBoundingClientRect().top - bt.top) < 40);
+      let strip = btns[prev + 1];
+      while (strip && strip !== dlg && !(link ? strip.contains(link)
+        : strip.querySelector('[role="slider"]'))) strip = strip.parentElement;
+      if (!strip || strip === dlg) continue;
+      vmuStamp(strip, 'TopPlayerPopup_Block');
+      if (link && link.parentElement && link.parentElement.parentElement) {
+        const titleBox = link.parentElement;
+        const titleRow = titleBox.parentElement;
+        vmuStamp(titleBox, 'TopPlayerPopup_Title');
+        for (const n of titleRow.children) {
+          if (n !== titleBox && n.querySelector('svg')) { vmuStamp(n, 'TopPlayerPopup_NoticeIcon'); break; }
+        }
+        if (titleRow.nextElementSibling) vmuStamp(titleRow.nextElementSibling, 'TopPlayerPopup_Extra');
+      }
+      // the buffered fill is the only slider here with a label of its own; the
+      // box that holds all the stacked fills is the timeline
+      const fill = strip.querySelector('[role="slider"][aria-label]');
+      if (fill) {
+        let barBox = fill;
+        while (barBox && barBox.parentElement && barBox.parentElement !== strip
+          && barBox.querySelectorAll('[role="slider"]').length < 2) barBox = barBox.parentElement;
+        if (barBox && barBox.querySelectorAll('[role="slider"]').length >= 2) vmuStamp(barBox, 'TopPlayerPopup_ProgressBar');
+      }
+      for (const t of strip.querySelectorAll('[role="button"]')) {
+        if (/^-?\d+:\d\d$/.test(t.textContent.trim())) { vmuStamp(t, 'TopPlayerPopup_ProgressTime'); break; }
+      }
+    }
+  }
+
+  // the small player in VK's top bar: the extension reads the restriction
+  // badge from it and writes the community title into it
+  function vmuStampTopPlayer() {
+    const tp = document.querySelector('[class*="TopNavigation__player"]');
+    if (!tp) return;
+    const media = tp.querySelector('[role="button"]');
+    if (!media) return;
+    vmuStamp(media, 'AudioPlayerBlock_AudioMedia');
+    // «Artist — Title»: the player's own text. The transport buttons carry
+    // text too («Предыдущая аудиозапись» and so on, for screen readers), and
+    // they sit inside this same tappable — so anything within a button is not
+    // the title.
+    const texts = [];
+    const walker = document.createTreeWalker(media, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const n = walker.currentNode;
+      if (!n.data.trim() || !n.parentElement || n.parentElement.closest('button')) continue;
+      texts.push(n);
+    }
+    if (!texts.length) return;
+    let box = texts[0].parentElement;
+    while (box && box !== media && !texts.every(n => box.contains(n))) box = box.parentElement;
+    if (!box || box === media) return;
+    // the restriction badge («!» in a grey circle) rides beside the title, in a
+    // box of its own; injected.js hides it while the community copy plays, so
+    // the stamped title must hold it
+    const icon = media.querySelector('svg[class*="error_circle"], svg[class*="warning"]');
+    if (icon && !box.contains(icon)) {
+      let up = box;
+      while (up && up !== media && !up.contains(icon)) up = up.parentElement;
+      if (up && up !== media && !up.querySelector('button')) box = up;
+    }
+    vmuStamp(box, 'TopAudioPlayer_Title');
+    if (icon) {
+      vmuStamp(icon.parentElement && icon.parentElement !== box ? icon.parentElement : icon,
+        'audioplayeraudioinfo-titleNoticeIcon');
+    }
+  }
+
+  function vmuStampCatalog() {
+    // The header card the extension pins and hangs its toolbar on:
+    // [the row of tabs or the «Музыка <community>» title, VK's search field,
+    // whatever follows]. The second child being VK's own search is what marks
+    // it — it holds on /audio, where the first row is the tabs, and on a
+    // community's audios page, where it is the title and the upload / new
+    // playlist buttons (confirmed live on both).
+    let sec = null;
+    for (const s of document.querySelectorAll('section')) {
+      if (vmuInOverlay(s)) continue;
+      const head = s.children[0], search = s.children[1];
+      if (!head || !search || !search.querySelector('[class*="vkuiSearch"]')) continue;
+      // a music page, not some other part of VK that happens to have a search
+      if (!head.querySelector('a[href*="section="]') && !/Загрузить/i.test(head.textContent)
+        && !s.querySelector('[data-audio-id]')) continue;
+      sec = s;
+      break;
+    }
+    if (sec) {
+      vmuStamp(sec, 'AudioCatalog_Header');
+      vmuStamp(sec.children[0], 'headerlayout');
+      // applyAudioHeaderSplit pushes «the rest» down and paints the notch over
+      // the gap — meant for the «недавно прослушанные» strip only. The other
+      // things VK puts in that slot (the «Слушать VK Микс» banner, a
+      // community's track/playlist counts) must stay where they are, and the
+      // strip is the only one of them that carries track rows.
+      // its own heading and its carousel are two children of the header now,
+      // and the margin put on the heading carries the carousel with it
+      const rest = sec.children[2];
+      if (rest && (/^Недавно прослушанные/i.test(rest.textContent.trim())
+        || rest.querySelector('[data-audio-id]'))) vmuStamp(rest, 'AudioCatalog_BlockHeaderRecentlyPlayed');
+      for (const b of sec.querySelectorAll('button')) {
+        if (/^Загрузить/i.test(vmuLabel(b))) { vmuStamp(b, 'AudioCatalogUploadAudioAction'); break; }
+      }
+    }
+    // the track list: the one block that holds the bulk of the rows. On a
+    // community's page VK keeps the rows in the very section the header is in,
+    // so this is not scoped away from it — only the section-level id is, since
+    // an element cannot carry both.
+    let best = null, bestN = 4;
+    for (const s of document.querySelectorAll('section')) {
+      if (vmuInOverlay(s)) continue;
+      const n = s.querySelectorAll('[data-audio-id]').length;
+      if (n > bestN) { best = s; bestN = n; }
+    }
+    if (best) {
+      if (best !== sec) vmuStamp(best, 'AudioCatalog_SectionTracks');
+      // the list itself: the innermost box that still holds most of the rows
+      // (each row sits in a wrapper of its own)
+      let box = best.querySelector('[data-audio-id]');
+      while (box && box.parentElement && box.parentElement !== best
+        && box.querySelectorAll('[data-audio-id]').length < 5) box = box.parentElement;
+      if (box && box.querySelectorAll('[data-audio-id]').length >= 5) vmuStamp(box, 'AudioCatalog_BlockMusicAudiosList');
+    }
+  }
+
+  function vmuStampRows() {
+    for (const row of document.querySelectorAll('[data-audio-id]:not([data-testid])')) {
+      if (vmuInOverlay(row)) continue;
+      vmuStamp(row, 'MusicTrackRow');
+      const tap = row.querySelector('[role="button"]');
+      if (tap) vmuStamp(tap, 'audiorow-tappable');
+    }
+  }
+
+  // The row of the track that is playing grows a timeline of its own — the
+  // same component as the players', stacked fills inside a role="presentation"
+  // that listens on pointerdown. Only that one row has one, so this looks for
+  // the sliders directly instead of walking every row.
+  function vmuStampRowProgress() {
+    for (const s of document.querySelectorAll('[data-audio-id] [role="slider"]')) {
+      if (vmuInOverlay(s)) continue;
+      let box = s.parentElement;
+      while (box && !box.hasAttribute('data-audio-id')
+        && box.querySelectorAll('[role="slider"]').length < 2) box = box.parentElement;
+      if (!box || box.hasAttribute('data-audio-id')) continue;
+      // the timeline, not the row around it
+      if (box.getAttribute('role') !== 'presentation') {
+        box = [...box.querySelectorAll('[role="presentation"]')]
+          .find(p => p.querySelectorAll('[role="slider"]').length >= 2);
+        if (!box) continue;
+      }
+      vmuStamp(box, 'MusicTrackRow_ProgressBar');
+    }
+  }
+
+  // the action icons mount only while the row is hovered, so this is called
+  // from the observer that watches for them (below), not from the sweep
+  function vmuStampRowActions(node) {
+    if (!node || node.nodeType !== 1 || !node.parentElement || !node.closest) return null;
+    const row = node.closest('[data-audio-id], [data-testid$="MusicTrackRow"]');
+    if (!row || row.querySelector('[data-testid="audiorow-actions"]')) return null;
+    const n = node.querySelectorAll('button').length;
+    if (!n) return null;
+    // the cover's own play overlay mounts on hover too: the icon row is the
+    // last cell of the row, and it brings more than one button
+    if (n < 2 && node.parentElement.lastElementChild !== node) return null;
+    vmuStamp(node, 'audiorow-actions');
+    return row;
+  }
+
+  let _vmuStampAt = 0, _vmuNativeAt = -1e9, _vmuNative = false;
+  function restoreVkTestIds(force) {
+    const now = performance.now();
+    if (!force && now - _vmuStampAt < 60) return;
+    _vmuStampAt = now;
+    // A build that still marks its own music UI: leave the page alone (asking
+    // for VK's own ids, not just any — another extension's data-testid must not
+    // look like VK's). Which build this is cannot change while the page is
+    // open, so it is settled at most once every ten seconds, and with plain
+    // lookups: the «:not(stamped)» form of the same question walked the tree.
+    if (now - _vmuNativeAt > 10000) {
+      _vmuNativeAt = now;
+      _vmuNative = false;
+      for (const id of ['MusicTrackRow', 'AudioPage_PlayerBlock', 'audiorow-tappable']) {
+        const el = document.querySelector('[data-testid="' + id + '"]');
+        if (el && !el.hasAttribute(VMU_STAMPED)) { _vmuNative = true; break; }
+      }
+    }
+    if (_vmuNative) return;
+    // the catalog, the rows and their timelines only exist where rows do; the
+    // player block comes with them (and is re-stamped as long as it is there,
+    // whatever the page). The two cheap ones are left alone: the top-bar
+    // player is a single lookup and the swap renames it on any page, and the
+    // drop-down stamper walks a dialog's buttons only when one is open.
+    const hasRows = vmuPageHasAudio(force);
+    if (hasRows || document.querySelector('[data-testid="AudioPage_PlayerBlock"]')) {
+      try { vmuStampPlayerBlocks(); } catch (err) { console.warn('[VK Multi Upload] testid player:', err); }
+    }
+    try { vmuStampTopPlayer(); } catch (err) { console.warn('[VK Multi Upload] testid top player:', err); }
+    try { vmuStampTopPopup(); } catch (err) { console.warn('[VK Multi Upload] testid top popup:', err); }
+    if (hasRows) {
+      try { vmuStampCatalog(); } catch (err) { console.warn('[VK Multi Upload] testid catalog:', err); }
+      try { vmuStampRows(); } catch (err) { console.warn('[VK Multi Upload] testid rows:', err); }
+      try { vmuStampRowProgress(); } catch (err) { console.warn('[VK Multi Upload] testid row progress:', err); }
+    }
+  }
+  setInterval(() => { if (!document.hidden) restoreVkTestIds(); }, 1000);
+  restoreVkTestIds(true);
+  // a stamp of which build of this file the browser actually loaded, so a
+  // page check can tell a reloaded extension from a stale one
+  document.documentElement.setAttribute('data-vmu-build', '2026-11-17-perf4');
+
   function onPageMutated() {
+    restoreVkTestIds(true);
     // SPA navigation: reset state
     if (location.href !== lastHref) {
       lastHref = location.href;
@@ -13101,10 +13479,18 @@
       if (!document.getElementById('vmu-plorder-panel')?.dataset.vmuBusy) closePlaylistOrderPanel();
     }
 
+    // Everything below that works on the catalog, the rows or the player has
+    // nothing to find on a page without track rows. The upload dialog is the
+    // exception: it is driven by a modal appearing, and that can happen from
+    // anywhere, so its block stays outside this.
+    const hasAudio = vmuPageHasAudio(true);
+
     // Own try/catch: this used to be its own observer, so a failure here
     // (or in any step below) must not be able to skip or be skipped by the
     // others.
-    try { injectCatalogToolbarButtons(); } catch (err) { console.warn('[VK Multi Upload] toolbar inject failed:', err); }
+    if (hasAudio) {
+      try { injectCatalogToolbarButtons(); } catch (err) { console.warn('[VK Multi Upload] toolbar inject failed:', err); }
+    }
 
     // Inject into VK's upload dialog whenever it appears;
     // also re-inject if VK replaced the body content (success screen after upload) —
@@ -13128,17 +13514,25 @@
     clearTimeout(_dupesDialogTimer);
     _dupesDialogTimer = setTimeout(tryInjectDupesIntoEditDialog, 300);
 
-    // Inject single-track download buttons
-    scanAndInjectDlBtns();
+    if (hasAudio) {
+      // Inject single-track download buttons
+      scanAndInjectDlBtns();
 
-    // Keep the audio catalog header split/pin in sync with VK's re-renders
-    applyAudioCatalogLayout();
+      // Keep the audio catalog header split/pin in sync with VK's re-renders
+      applyAudioCatalogLayout();
 
-    injectPlaylistCollectButton();
+      injectPlaylistCollectButton();
 
-    // Restore the audio FX button/panel if VK re-rendered over them
-    ensureAudioFxUI();
+      // Restore the audio FX button/panel if VK re-rendered over them
+      ensureAudioFxUI();
+    } else if (_vmuWasAudio) {
+      // just left the music pages: one last pass, so the pinned bar, the
+      // header split and the state classes are taken back off
+      try { applyAudioCatalogLayout(); } catch (err) { console.warn('[VK Multi Upload] layout reset failed:', err); }
+    }
+    _vmuWasAudio = hasAudio;
   }
+  var _vmuWasAudio = false;
 
   // Coalesce mutation storms (scrolling a 1000-row playlist fires hundreds of
   // childList batches per second) into at most ~8 handler runs/sec, and skip
@@ -13151,6 +13545,8 @@
     return false;
   };
   new MutationObserver(muts => {
+    // before the throttle: every selector below depends on the ids being there
+    restoreVkTestIds();
     if (_mutScheduled) return;
     let relevant = false;
     for (const m of muts) {
