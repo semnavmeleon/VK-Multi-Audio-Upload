@@ -601,6 +601,60 @@
   }
   ensureBaseAudioFxPreset();
 
+  // A handful of ready-made EQ curves, gains per band in AUDIOFX_FREQS order
+  // (31/62/125/250/500/1k/2k/4k/8k/16k). There's no single published
+  // "standard" preset table — every car stereo, phone and headphone app bakes
+  // in its own numbers — so these are common shapes (bass/treble shelf, the
+  // car-stereo "loudness" smiley curve, vocal presence, a mid scoop for
+  // rock/dance, the gentle near-flat lift classical/jazz guides describe)
+  // re-fit to this EQ's own 10 ISO bands.
+  // "Yamaha HS4 (бас)" is specific: those (and other small studio monitors)
+  // are deliberately flat and light below ~100 Hz, so this just leans hard on
+  // the bottom two bands to compensate.
+  // Every preset below ships with the limiter ON (ceiling from AUDIOFX_DEFAULTS,
+  // -0.3dB) — the limiter stage is an explicit opt-in that's a no-op while
+  // disabled (limiter-worklet.js's limStage forces `desired = 0` whenever
+  // !limEnabled), so a boost-only EQ preset with the limiter off has nothing
+  // stopping it from clipping: adjacent bands' peaking curves overlap heavily
+  // at this Q, so the SUMMED boost between two bands' center frequencies runs
+  // well past either band's own dB number, and most streamed/mastered audio
+  // has near-zero headroom left to begin with. Found live: the first cut of
+  // these presets (no limiter) clipped hard on real tracks.
+  const AUDIOFX_BUILTIN_PRESETS = {
+    'Больше низов':        { gains: [6, 5, 3, 1, 0, 0, 0, 0, 0, 0],      category: 'Утилиты', tags: ['bass', 'бас'] },
+    'Больше верхов':       { gains: [0, 0, 0, 0, 0, 0, 1, 3, 5, 6],      category: 'Утилиты', tags: ['treble', 'верха'] },
+    'Для авто':            { gains: [5, 4, 2, 0, -1, -1, -1, 1, 2, 3],   category: 'Утилиты', tags: ['car', 'авто', 'loudness'] },
+    'Вокал':               { gains: [-3, -2, -1, 0, 1, 2, 3, 2, 1, 0],   category: 'Утилиты', tags: ['vocal', 'вокал'] },
+    'Подкасты и речь':     { gains: [-6, -4, -2, 0, 1, 2, 3, 1, 0, -2],  category: 'Утилиты', tags: ['podcast', 'speech', 'речь'] },
+    'Yamaha HS4 (бас)':    { gains: [8, 7, 5, 2, 1, 0, 0, 0, 0, 0],      category: 'Утилиты', tags: ['hs4', 'yamaha', 'мониторы', 'bass'] },
+    'Рок':                 { gains: [4, 3, 1, 0, -1, -1, 1, 2, 3, 2],    category: 'Жанры', tags: ['rock', 'рок'] },
+    'Поп':                 { gains: [-1, 0, 1, 2, 2, 2, 2, 1, 0, -1],    category: 'Жанры', tags: ['pop', 'поп'] },
+    'Джаз и классика':     { gains: [1, 1, 1, 0, 0, 0, 1, 1, 1, 1],      category: 'Жанры', tags: ['jazz', 'classical', 'джаз', 'классика'] },
+    'Электроника и танцы': { gains: [5, 4, 1, -1, -1, -1, 0, 1, 3, 4],   category: 'Жанры', tags: ['dance', 'edm', 'электроника'] },
+  };
+  // Seeded once each, same as "Базовый" above: never overwritten once it
+  // exists, so renaming, editing or deleting one of these is permanent even
+  // across an update that revises this list.
+  function ensureBuiltinAudioFxPresets() {
+    const presets = loadAudioFxPresets();
+    let changed = false;
+    for (const name in AUDIOFX_BUILTIN_PRESETS) {
+      if (presets[name]) continue;
+      const { gains, category, tags } = AUDIOFX_BUILTIN_PRESETS[name];
+      presets[name] = {
+        settings: Object.assign({}, AUDIOFX_DEFAULTS, {
+          audioFxEqEnabled: true,
+          audioFxLimiterEnabled: true,
+          audioFxBands: AUDIOFX_FREQS.map((f, i) => ({ freq: f, gain: gains[i], q: EQ_DEFAULT_Q })),
+        }),
+        category, tags,
+      };
+      changed = true;
+    }
+    if (changed) saveAudioFxPresets(presets);
+  }
+  ensureBuiltinAudioFxPresets();
+
   // ─── VK theme detection (light/dark) ───────────────────────────────────────
   // VK's light theme is signalled by a `vkui--vkBase--light` class on its own
   // React root div (a child of <body>, not <html>, confirmed live) — there's
@@ -1978,12 +2032,24 @@
     panel.style.right = right + 'px';
   }
 
+  // Set by attachAudioFxHandlers (its closure owns renderPresetList/the filter
+  // state the browser needs); toggleAudioFxPanel below lives outside that
+  // closure. var, not let: attachAudioFxHandlers can run (and assign this)
+  // before this line is ever reached in source order — same reason
+  // _pinBorderEl near applyTabsBarPin is a var — so let's temporal dead zone
+  // would throw on a plain page load, before the user ever touches the panel.
+  var closePresetBrowserFn = null;
   function toggleAudioFxPanel() {
     const panel = document.getElementById('vmu-audiofx-panel');
     if (!panel) return;
     const open = panel.classList.toggle('vmu-audiofx-panel-open');
     positionAudioFxUI();
     if (open) startMeterLoop(); else stopMeterLoop();
+    // The preset browser is its own floating window now (see attachAudioFxHandlers)
+    // with document/window-level listeners of its own — closing the whole panel out
+    // from under it (toolbar button, not its own × or outside click) must tear those
+    // down too, not just hide it, or they pile up across repeated open/close cycles.
+    if (!open) closePresetBrowserFn?.();
   }
 
   // Inserts the FX toggle button directly into VK's native player toolbar,
@@ -2105,12 +2171,57 @@
     const presetBrowser = document.getElementById('vmu-fx-preset-browser');
     const presetSaveForm = document.getElementById('vmu-fx-preset-saveform');
     if (presetToggle && presetBrowser) {
-      presetToggle.addEventListener('click', () => {
-        const opening = presetBrowser.style.display === 'none';
-        presetBrowser.style.display = opening ? '' : 'none';
+      // Its own floating window (position:fixed, anchored under the toggle
+      // button) instead of an inline section of the panel — it used to push the
+      // chain/tabs/sliders below it down the panel's own scroll area every time
+      // it opened. Same anchor-under-the-button / outside-click-closes pattern
+      // as vmuEnhanceSelect's .vmu-sel-list.
+      const searchEl = document.getElementById('vmu-fx-preset-search');
+      const catsEl = document.getElementById('vmu-fx-preset-cats');
+      const listEl = document.getElementById('vmu-fx-preset-list');
+      const positionPresetBrowser = () => {
+        const r = presetToggle.getBoundingClientRect();
+        const width = Math.min(340, window.innerWidth - 16);
+        presetBrowser.style.width = width + 'px';
+        presetBrowser.style.left = Math.max(8, Math.min(r.left, window.innerWidth - width - 8)) + 'px';
+        // Chrome = search box + category pills + the window's own padding/gaps;
+        // only the list itself (its own scroll, see renderPresetList's CSS) gives
+        // up height when the side with less room is picked.
+        const chrome = (searchEl?.offsetHeight || 0) + (catsEl?.offsetHeight || 0) + 24;
+        const below = window.innerHeight - r.bottom - 12;
+        const above = r.top - 12;
+        const openUp = below < Math.min(chrome + 180, 320) && above > below;
+        if (listEl) listEl.style.maxHeight = Math.max(80, Math.min(180, (openUp ? above : below) - chrome)) + 'px';
+        if (openUp) { presetBrowser.style.bottom = (window.innerHeight - r.top + 6) + 'px'; presetBrowser.style.top = ''; }
+        else { presetBrowser.style.top = (r.bottom + 6) + 'px'; presetBrowser.style.bottom = ''; }
+      };
+      let teardownPresetBrowser = null;
+      const closePresetBrowser = () => {
+        if (presetBrowser.style.display === 'none') return;
+        presetBrowser.style.display = 'none';
+        teardownPresetBrowser?.();
+        teardownPresetBrowser = null;
+      };
+      const openPresetBrowser = () => {
         if (presetSaveForm) presetSaveForm.style.display = 'none';
-        if (opening) renderPresetList();
+        renderPresetList();
+        presetBrowser.style.display = '';
+        positionPresetBrowser();
+        const onDown = e => { if (!presetBrowser.contains(e.target) && !presetToggle.contains(e.target)) closePresetBrowser(); };
+        const onKey = e => { if (e.key === 'Escape') closePresetBrowser(); };
+        document.addEventListener('pointerdown', onDown, true);
+        document.addEventListener('keydown', onKey, true);
+        window.addEventListener('resize', positionPresetBrowser);
+        teardownPresetBrowser = () => {
+          document.removeEventListener('pointerdown', onDown, true);
+          document.removeEventListener('keydown', onKey, true);
+          window.removeEventListener('resize', positionPresetBrowser);
+        };
+      };
+      presetToggle.addEventListener('click', () => {
+        if (presetBrowser.style.display === 'none') openPresetBrowser(); else closePresetBrowser();
       });
+      closePresetBrowserFn = closePresetBrowser;
     }
 
     const presetSearch = document.getElementById('vmu-fx-preset-search');
@@ -2583,11 +2694,15 @@
   // swapped-track panel (which follows «the visible copy») trailing by up to a second.
   // Chasing VK's switch with timers could not fix a race.
   // So VK's switch is taken out of the picture: while this feature is on
-  // (html.vmu-pinmode, CSS in style.css) the IN-FLOW copy is simply position:sticky
-  // under the top bar — the browser keeps it there in the very frame it scrolls, no
-  // script involved — VK's fixed copy is not displayed at all, and the corners and
-  // the outline depend on one thing only: html.vmu-merged, set below in the same
-  // pass that pins the tabs.
+  // (html.vmu-pinmode, CSS in style.css) the IN-FLOW copy is held position:fixed
+  // under the top bar in the same pass that pins the tabs (see markPlayerBlockWrap
+  // for how the two copies are told apart) — VK's own fixed copy is not displayed at
+  // all, and the corners and the outline depend on one thing only: html.vmu-merged,
+  // set below in that same pass. (This was position:sticky, relying on the in-flow
+  // wrapper's containing block being tall enough to stick within — VK's current
+  // markup no longer gives it one, so it's plain position:fixed now, same as the
+  // tabs: left/width still need the per-pass JS below, top comes from the
+  // --vmu-topbar-h custom property already set above.)
   function applyTabsBarPin() {
     const sections = pinQuery('hdr', '[data-testid="AudioCatalog_Header"]', true);
     // This runs on every throttled page mutation (see onPageMutated), on
@@ -2600,15 +2715,16 @@
     // state the full path reached, minus the layout thrash.
     const needLayout = !!settings.pinTabsBar && sections.length > 0;
     let anchor = 0;
+    let topBarBottom = 48;
     let mmCard = null;
     let playerBlocks = [];
     let mergeNow = null; // null: no player block on the page, fall back to the tabs' own position
     if (needLayout) {
       const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
-      const topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
+      topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
       if (applyTabsBarPin._tbh !== topBarBottom) {
         applyTabsBarPin._tbh = topBarBottom;
-        document.documentElement.style.setProperty('--vmu-topbar-h', topBarBottom + 'px'); // where the sticky player stops
+        document.documentElement.style.setProperty('--vmu-topbar-h', topBarBottom + 'px'); // where the pinned player sits
       }
       // AudioPage_PlayerBlock (album art / transport controls under the nav
       // bar) is VK's persistent mini-player — confirmed live it stays fixed at
@@ -2625,6 +2741,7 @@
       // exactly the event the merge has to catch
       playerBlocks = [...document.querySelectorAll('[data-testid="AudioPage_PlayerBlock"]')];
       for (const pb of playerBlocks) {
+        markPlayerBlockWrap(pb);
         const r = pb.getBoundingClientRect();
         if (r.bottom > playerBottom) { playerBottom = r.bottom; visiblePlayerBlock = pb; }
         if (r.top < minTop) minTop = r.top;
@@ -2680,6 +2797,7 @@
       }
     }
     let anyEngaged = false;
+    let engagedRect = null;
 
     for (const section of sections) {
       const tabs = section.querySelector(':scope > [data-testid="headerlayout"]');
@@ -2742,6 +2860,7 @@
       const measured = tabsH !== undefined;
 
       anyEngaged = true;
+      engagedRect = sRect;
       pinAddCls(tabs, 'vmu-tabs-pinned', 'vmu-pin-top');
       pinSetStyle(tabs, 'left', sRect.left + 'px');
       pinSetStyle(tabs, 'width', sRect.width + 'px');
@@ -2771,10 +2890,34 @@
       pinSetStyle(section, 'paddingTop', newPad + 'px');
     }
 
+    // The player block's own wrapper gets the same treatment, once per pass rather than
+    // per section (there's only ever one real pair of copies on the page): VK's
+    // duplicate is hidden outright whenever there's a header to pin against, and the
+    // in-flow one is held fixed directly above the tabs the moment they merge. Plain
+    // position:fixed (not sticky, as this used to be) — see markPlayerBlockWrap's note;
+    // the in-flow wrapper's own containing block is no longer tall enough to give a
+    // sticky element anywhere to stick to. --vmu-topbar-h (set above) supplies the top
+    // offset from CSS; only left/width (the catalog column's own, ever-changing rect)
+    // need setting here, exactly like the tabs just above.
+    const flowWrap = document.querySelector('div.vmu-pb-wrap-flow');
+    const fixedWrap = document.querySelector('div.vmu-pb-wrap-fixed');
+    if (fixedWrap) pinSetStyle(fixedWrap, 'display', needLayout ? 'none' : '');
+    if (flowWrap) {
+      if (anyEngaged && engagedRect) {
+        pinAddCls(flowWrap, 'vmu-pb-wrap-pinned');
+        pinSetStyle(flowWrap, 'left', engagedRect.left + 'px');
+        pinSetStyle(flowWrap, 'width', engagedRect.width + 'px');
+      } else if (flowWrap.classList.contains('vmu-pb-wrap-pinned')) {
+        flowWrap.classList.remove('vmu-pb-wrap-pinned');
+        flowWrap.style.left = flowWrap.style.width = '';
+      }
+    }
+
     _pinEngagedState = anyEngaged;
     // The only two pieces of state the look depends on (see the note above the function):
     //   vmu-pinmode — the feature is on and this page has the catalog header: the in-flow
-    //                 player is sticky, VK's fixed copy is not displayed;
+    //                 player is fixed under the top bar, VK's own duplicate copy is not
+    //                 displayed;
     //   vmu-merged  — the tabs are pinned under the player right now: flat corners, no
     //                 outline between the two. Same pass, same frame as the pin itself.
     const root = document.documentElement;
@@ -3441,7 +3584,7 @@
   // Returns however many net new tracks actually showed up — 0 if none did,
   // which callers treat as "upload didn't really go through, don't create a
   // playlist for nothing".
-  function waitForTrackCountIncrease(startCount, expected, timeoutMs) {
+  function waitForTrackCountIncrease(startCount, expected, timeoutMs, onTick) {
     timeoutMs = timeoutMs || Math.max(20000, expected * 8000);
     return new Promise(resolve => {
       const deadline = Date.now() + timeoutMs;
@@ -3449,6 +3592,10 @@
         const now = getPageTrackCount();
         const gained = now == null ? 0 : Math.max(0, now - startCount);
         if (gained >= expected || Date.now() >= deadline) { resolve(gained); return; }
+        // A batch of a dozen files buys itself a minute and a half of this
+        // wait; without a visible countdown it reads as a page that simply
+        // stopped doing anything.
+        onTick?.(gained, Math.ceil((deadline - Date.now()) / 1000));
         setTimeout(tick, 1000);
       };
       tick();
@@ -8830,6 +8977,1025 @@
     renderList();
   }
 
+  // ─── Пакетная заливка альбомов ───────────────────────────────────────────────
+  // Pick a whole folder of MP3s, let the extension split it into albums by
+  // their ID3 tags (folder name as the fallback), untick what shouldn't go,
+  // and then, album by album: upload its tracks through VK's own uploader,
+  // reload, find the freshly uploaded copies on the page by exact audio id,
+  // and build a playlist out of exactly those. Then reload again and take the
+  // next album.
+  //
+  // The loop reloads the page on purpose (VK's own list, and the picker the
+  // playlist dialog reads, both lag behind an upload until a full reload), and
+  // a reload wipes every variable in this file. So the WHOLE run lives in
+  // chrome.storage.local — the album list, which tracks were ticked, what has
+  // already been uploaded, which playlist was made, where in the loop we are —
+  // and is picked back up by bulkalbResumeOnLoad() on the next page load. The
+  // files themselves can't go in chrome.storage (10 MB quota, no Blobs), so
+  // their bytes live in an IndexedDB store on vk.ru's own origin, keyed by the
+  // same ids the state refers to.
+  //
+  // Every step is idempotent on purpose, because a reload can land anywhere:
+  //  • a batch is marked 'uploading' BEFORE the hand-off is posted, and a run
+  //    resumed in that stage never re-posts it — a track that silently failed
+  //    is reported as missing rather than risking a second copy;
+  //  • playlist creation is marked 'creating' before the call, and a run
+  //    resumed in that stage looks for a playlist with that title first and
+  //    only fills the gaps, instead of creating a second one;
+  //  • tracks are matched to the queue by exact audioId (same approach as
+  //    «Плейлист из файлов»), never by name, so re-running a step can't attach
+  //    the wrong track.
+
+  const BULKALB_STATE_KEY = 'vmu_bulkalbums_run_v1';
+  const BULKALB_SESSION_KEY = 'vmu_bulkalbums_session_v1';
+  // VK itself allows more per day (see DAILY_UPLOAD_LIMIT); this is the
+  // per-session ceiling the run holds itself to, counted per account.
+  const BULKALB_SESSION_LIMIT = 40;
+  const BULKALB_DB_NAME = 'vmu_bulkalbums_files';
+  const BULKALB_STORE = 'files';
+  const BULKALB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  const BULKALB_SIGNATURE = PLMAKE_SIGNATURE;
+
+  // Which VK account this counts against. remixsid — the real session
+  // cookie — is HttpOnly and invisible from here, but VK names its VK-ID
+  // auth cookie after the signed-in user (`ma__<uid>_nsid`, verified live),
+  // which gives the account, and remixstid changes when the session does.
+  // Only a hash of the cookie value is ever stored: the value itself is a
+  // credential and has no business sitting in extension storage.
+  function bulkalbAccountKey() {
+    const raw = document.cookie || '';
+    const uid = raw.match(/(?:^|;\s*)ma__(\d+)_nsid=/)?.[1] || '';
+    const sess = raw.match(/(?:^|;\s*)remixstid=([^;]*)/)?.[1]
+      || raw.match(/(?:^|;\s*)ma__\d+_nsid=([^;]*)/)?.[1] || '';
+    if (!uid && !sess) return 'anon';
+    let h = 0x811c9dc5;
+    for (let i = 0; i < sess.length; i++) { h ^= sess.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return (uid || 'u') + ':' + (h >>> 0).toString(36);
+  }
+
+  function bulkalbStorageGet(key) {
+    return new Promise(resolve => {
+      try { chrome.storage.local.get(key, r => resolve(chrome.runtime.lastError ? null : (r || {})[key] || null)); }
+      catch { resolve(null); }
+    });
+  }
+  function bulkalbStorageSet(key, value) {
+    return new Promise(resolve => {
+      try { chrome.storage.local.set({ [key]: value }, () => resolve(!chrome.runtime.lastError)); }
+      catch { resolve(false); }
+    });
+  }
+  function bulkalbStorageDel(key) {
+    return new Promise(resolve => {
+      try { chrome.storage.local.remove(key, () => resolve(true)); } catch { resolve(false); }
+    });
+  }
+
+  // Session counter: how many tracks this account has already had uploaded by
+  // the feature. Reset — not carried over — the moment the cookie says this is
+  // a different account or a different session.
+  async function bulkalbReadSession() {
+    const accountKey = bulkalbAccountKey();
+    const s = await bulkalbStorageGet(BULKALB_SESSION_KEY);
+    if (!s || s.accountKey !== accountKey) return { accountKey, count: 0 };
+    return { accountKey, count: Math.max(0, s.count || 0) };
+  }
+  async function bulkalbBumpSession(n) {
+    const s = await bulkalbReadSession();
+    const count = Math.max(0, s.count + n);
+    await bulkalbStorageSet(BULKALB_SESSION_KEY, { accountKey: s.accountKey, count, at: Date.now() });
+    return count;
+  }
+  async function bulkalbResetSession() {
+    await bulkalbStorageSet(BULKALB_SESSION_KEY, { accountKey: bulkalbAccountKey(), count: 0, at: Date.now() });
+  }
+
+  // ── file bytes: IndexedDB, because they must outlive the reloads ───────────
+  let _bulkalbDbP = null;
+  function bulkalbDb() {
+    if (_bulkalbDbP) return _bulkalbDbP;
+    _bulkalbDbP = new Promise((resolve, reject) => {
+      const rq = indexedDB.open(BULKALB_DB_NAME, 1);
+      rq.onupgradeneeded = () => {
+        if (!rq.result.objectStoreNames.contains(BULKALB_STORE)) rq.result.createObjectStore(BULKALB_STORE);
+      };
+      rq.onsuccess = () => resolve(rq.result);
+      rq.onerror = () => reject(rq.error || new Error('idb open failed'));
+    }).catch(err => { _bulkalbDbP = null; throw err; });
+    return _bulkalbDbP;
+  }
+  async function bulkalbPutBlob(key, blob) {
+    const db = await bulkalbDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(BULKALB_STORE, 'readwrite');
+      tx.objectStore(BULKALB_STORE).put(blob, key);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error || new Error('idb write failed'));
+      tx.onabort = () => reject(tx.error || new Error('idb write aborted'));
+    });
+  }
+  async function bulkalbGetBlob(key) {
+    const db = await bulkalbDb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(BULKALB_STORE, 'readonly');
+      const rq = tx.objectStore(BULKALB_STORE).get(key);
+      rq.onsuccess = () => resolve(rq.result || null);
+      rq.onerror = () => reject(rq.error || new Error('idb read failed'));
+    });
+  }
+  async function bulkalbDeleteBlobs(keys) {
+    if (!keys.length) return;
+    try {
+      const db = await bulkalbDb();
+      await new Promise((resolve) => {
+        const tx = db.transaction(BULKALB_STORE, 'readwrite');
+        const store = tx.objectStore(BULKALB_STORE);
+        for (const k of keys) store.delete(k);
+        tx.oncomplete = resolve;
+        tx.onerror = resolve;
+        tx.onabort = resolve;
+      });
+    } catch {}
+  }
+  async function bulkalbDropFiles() {
+    _bulkalbDbP = null;
+    try { indexedDB.deleteDatabase(BULKALB_DB_NAME); } catch {}
+  }
+
+  // ── grouping files into albums ─────────────────────────────────────────────
+  // Album identity, in order of trust: the ID3 album tag (plus its album
+  // artist, so two different artists' "Greatest Hits" don't merge), then the
+  // folder the file came from, then "every loose file is its own album".
+  function bulkalbFolderOf(file) {
+    const rel = file.webkitRelativePath || file._vmuRelPath || '';
+    if (!rel) return '';
+    const parts = rel.split('/').filter(Boolean);
+    return parts.length >= 2 ? parts[parts.length - 2] : '';
+  }
+  function bulkalbGroupKey(file, tags) {
+    const album = (tags.TALB || '').trim();
+    if (album) {
+      const artist = (tags.TPE2 || tags.TPE1 || '').trim();
+      return 'tag\u0000' + normalizeNamePart(album) + '\u0000' + normalizeNamePart(artist);
+    }
+    const folder = bulkalbFolderOf(file);
+    if (folder) return 'dir\u0000' + folder.toLowerCase();
+    return 'file\u0000' + (file.name || '').toLowerCase();
+  }
+
+  // [{ file, tags, entry }] → albums in a stable order, tracks sorted the same
+  // way «Плейлист из файлов» sorts them (ID3 track numbers when they're all
+  // there and distinct, natural filename order otherwise).
+  function bulkalbGroupItems(items) {
+    const byKey = new Map();
+    for (const it of items) {
+      const key = bulkalbGroupKey(it.file, it.tags || {});
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(it);
+    }
+    const albums = [];
+    for (const [key, list] of byKey) {
+      const sorted = plmakeSortItems(list);
+      const tagsList = sorted.map(it => it.tags || {});
+      const firstOf = pick => tagsList.map(pick).find(Boolean) || '';
+      const folder = bulkalbFolderOf(sorted[0].file);
+      const title = plmakeSuggestTitle(tagsList, folder || sorted[0].file.name);
+      albums.push({
+        key,
+        title,
+        album: firstOf(t => t.TALB),
+        artist: firstOf(t => t.TPE2) || firstOf(t => t.TPE1),
+        year: firstOf(t => t.TYER || (t.TDRC || '').substring(0, 4)),
+        folder,
+        source: key.startsWith('tag\u0000') ? 'tags' : key.startsWith('dir\u0000') ? 'folder' : 'file',
+        items: sorted,
+      });
+    }
+    albums.sort((a, b) => a.title.localeCompare(b.title, 'ru', { numeric: true, sensitivity: 'base' }));
+    return albums;
+  }
+
+  // Files out of a drop: a dropped FOLDER arrives as a directory entry, not as
+  // files, so the tree is walked (and each file remembers the path it came
+  // from, which is what the folder-name fallback above groups by).
+  async function bulkalbFilesFromDrop(dt) {
+    const out = [];
+    const items = dt?.items ? [...dt.items] : [];
+    const entries = items.map(i => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null)).filter(Boolean);
+    if (!entries.length) return [...(dt?.files || [])].filter(isMP3);
+
+    const readDir = dirReader => new Promise(resolve => {
+      const acc = [];
+      const step = () => dirReader.readEntries(batch => {
+        if (!batch.length) { resolve(acc); return; }
+        acc.push(...batch);
+        step();
+      }, () => resolve(acc));
+      step();
+    });
+    const walk = async (entry, prefix) => {
+      if (entry.isFile) {
+        const file = await new Promise(res => entry.file(res, () => res(null)));
+        if (file && isMP3(file)) {
+          try { file._vmuRelPath = prefix + file.name; } catch {}
+          out.push(file);
+        }
+        return;
+      }
+      if (!entry.isDirectory) return;
+      const children = await readDir(entry.createReader());
+      for (const child of children) await walk(child, prefix + entry.name + '/');
+    };
+    for (const e of entries) await walk(e, '');
+    return out;
+  }
+
+  // ── the run state ──────────────────────────────────────────────────────────
+  function bulkalbLoadState() { return bulkalbStorageGet(BULKALB_STATE_KEY); }
+  function bulkalbSaveState(state) { return bulkalbStorageSet(BULKALB_STATE_KEY, state); }
+  async function bulkalbDiscardRun(state) {
+    const keys = [];
+    for (const a of (state?.albums || [])) {
+      if (a.coverKey) keys.push(a.coverKey);
+      for (const t of a.tracks) keys.push(t.fileKey);
+    }
+    await bulkalbDeleteBlobs(keys);
+    await bulkalbStorageDel(BULKALB_STATE_KEY);
+  }
+
+  const BULKALB_ACTIVE = s => !!s && (s.status === 'running' || s.status === 'paused');
+  const bulkalbQueuedTracks = state => (state?.albums || []).reduce(
+    (n, a) => n + (a.stage === 'done' || a.stage === 'failed' || a.stage === 'skipped' ? 0 : a.tracks.filter(t => !t.uploaded).length), 0);
+
+  // ── toolbar button + setup panel ───────────────────────────────────────────
+  function closeBulkAlbumsPanel() { document.getElementById('vmu-bulkalb-panel')?.remove(); }
+
+  function injectBulkAlbumsButton() {
+    const anchor = getToolbarAnchor();
+    if (!anchor) return;
+    const { uploadBtn, group } = anchor;
+    if (toolbarBtnPresent(group, 'vmu-bulkalb-btn')) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'vmu-bulkalb-btn';
+    btn.className = uploadBtn.className;
+    matchNativeButtonBox(btn, uploadBtn);
+    btn.setAttribute('aria-label', 'Альбомы с диска');
+    btn.setAttribute('data-vmu-tip', 'Альбомы с диска');
+    btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5V15a1.5 1.5 0 0 0 1.5 1.5h12A1.5 1.5 0 0 0 17.5 15V7.5a1.5 1.5 0 0 0-1.5-1.5H9.5L8 4H4a1.5 1.5 0 0 0-1.5 1.5z"/><path d="M10 13.5V9M8 11l2-2 2 2"/></svg>`;
+    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
+    btn.addEventListener('mouseleave', hideDlTooltip);
+    btn.addEventListener('click', () => { hideDlTooltip(); openBulkAlbumsPanel(); });
+    group.insertBefore(btn, document.getElementById('vmu-plmake-btn') || uploadBtn);
+  }
+
+  async function openBulkAlbumsPanel() {
+    syncVmuTheme();
+    closeBulkAlbumsPanel();
+
+    // A run already going owns the screen — show its progress instead of
+    // offering to start a second one on top of it.
+    const existing = await bulkalbLoadState();
+    if (BULKALB_ACTIVE(existing)) { bulkalbRenderProgress(existing); return; }
+
+    const ownerId = location.href.match(/audios(-?\d+)/)?.[1] || null;
+
+    const panel = document.createElement('div');
+    panel.id = 'vmu-bulkalb-panel';
+    panel.className = 'vmu-bulkops-panel vmu-bulkalb-panel';
+    panel.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">Альбомы с диска</span>
+        <button type="button" class="vmu-check-close" id="vmu-bulkalb-close" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body vmu-plcollect-body">
+        <div class="vmu-plmake-hint">Выбери папку с альбомами — расширение разберёт файлы по альбомам (теги ID3, иначе имя папки), зальёт их по очереди и для каждого соберёт плейлист. Между альбомами страница перезагружается, прогон продолжится сам.</div>
+        <div id="vmu-bulkalb-dz" class="vmu-pl-sort-dz">
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v9M6.5 6.5L10 3l3.5 3.5"/><path d="M4 13.5v1.5A1.5 1.5 0 0 0 5.5 16.5h9a1.5 1.5 0 0 0 1.5-1.5v-1.5"/></svg>
+          <span class="vmu-pl-sort-dz-hint">Перетащи сюда папку или файлы</span>
+          <label class="vmu-pick-btn">
+            ${ICON_UPLOAD}
+            Папка
+            <input type="file" id="vmu-bulkalb-dir" class="vmu-pl-sort-input" webkitdirectory directory multiple>
+          </label>
+          <label class="vmu-pick-btn vmu-plc-secondary">
+            Файлы
+            <input type="file" id="vmu-bulkalb-input" class="vmu-pl-sort-input" accept=".mp3,audio/mpeg" multiple>
+          </label>
+        </div>
+        <div class="vmu-bulk-source-hint" id="vmu-bulkalb-files-hint">Ничего не выбрано</div>
+
+        <div class="vmu-plc-section vmu-plc-section-first">
+          <div class="vmu-plc-row">
+            <span class="vmu-plc-label">Лимит этой сессии</span>
+            <span class="vmu-bulk-source-hint" id="vmu-bulkalb-limit"></span>
+          </div>
+          <label class="vmu-rename-check" id="vmu-bulkalb-cover-row" style="display:none">
+            <input type="checkbox" id="vmu-bulkalb-cover"><span>Обложки плейлистов (из настроек или из тегов файлов)</span>
+          </label>
+        </div>
+
+        <div class="vmu-plc-section">
+          <div class="vmu-plc-row">
+            <span class="vmu-plc-label" id="vmu-bulkalb-summary">Альбомы</span>
+            <span class="vmu-plc-range">
+              <button type="button" id="vmu-bulkalb-all" class="vmu-plc-link">Выбрать всё</button>
+              <button type="button" id="vmu-bulkalb-none" class="vmu-plc-link">Снять всё</button>
+            </span>
+          </div>
+          <div class="vmu-bulkalb-tree" id="vmu-bulkalb-tree"></div>
+        </div>
+
+        <div class="vmu-plc-status" id="vmu-bulkalb-status"></div>
+        <div class="vmu-plc-actions">
+          <span class="vmu-plc-count" id="vmu-bulkalb-count"></span>
+          <button type="button" id="vmu-bulkalb-go" class="vmu-pick-btn" disabled>Залить</button>
+        </div>
+      </div>`;
+    document.body.appendChild(panel);
+    makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+    panel.querySelector('#vmu-bulkalb-close').addEventListener('click', closeBulkAlbumsPanel);
+
+    const $ = sel => panel.querySelector(sel);
+    const dz = $('#vmu-bulkalb-dz');
+    const dirInput = $('#vmu-bulkalb-dir');
+    const fileInput = $('#vmu-bulkalb-input');
+    const filesHint = $('#vmu-bulkalb-files-hint');
+    const limitHint = $('#vmu-bulkalb-limit');
+    const coverRow = $('#vmu-bulkalb-cover-row');
+    const coverCheck = $('#vmu-bulkalb-cover');
+    const summaryEl = $('#vmu-bulkalb-summary');
+    const treeEl = $('#vmu-bulkalb-tree');
+    const statusEl = $('#vmu-bulkalb-status');
+    const countEl = $('#vmu-bulkalb-count');
+    const goBtn = $('#vmu-bulkalb-go');
+    const actionsEl = goBtn.parentElement;
+
+    let albums = [];          // [{ ..., items, checked:Set<trackIdx>, open:bool }]
+    let busy = false;
+    let session = await bulkalbReadSession();
+
+    const setStatus = (text, isError) => {
+      statusEl.textContent = text || '';
+      statusEl.classList.toggle('vmu-plmake-status-error', !!isError);
+    };
+    const renderLimit = () => {
+      const left = Math.max(0, BULKALB_SESSION_LIMIT - session.count);
+      limitHint.textContent = `залито ${session.count} из ${BULKALB_SESSION_LIMIT}, осталось ${left}`;
+    };
+    const selectedCount = () => albums.reduce((n, a) => n + a.checked.size, 0);
+    const hasCoverSource = () => !!(settings.coverDataUrl || albums.some(a => a.items.some(it => it.tags?.APIC?.data)));
+
+    function updateControls() {
+      const n = selectedCount();
+      const picked = albums.filter(a => a.checked.size).length;
+      countEl.textContent = albums.length ? `Выбрано: ${n} ${plcPlural(n, 'трек', 'трека', 'треков')} в ${picked} ${plcPlural(picked, 'альбоме', 'альбомах', 'альбомах')}` : '';
+      summaryEl.textContent = albums.length ? `Альбомы: ${albums.length}` : 'Альбомы';
+      goBtn.disabled = busy || !n;
+      const left = Math.max(0, BULKALB_SESSION_LIMIT - session.count);
+      goBtn.textContent = n > left && left > 0 ? `Залить (${left} сейчас)` : 'Залить';
+    }
+    function setBusy(b) {
+      busy = b;
+      for (const el of [dirInput, fileInput, coverCheck, goBtn]) el.disabled = b;
+      panel.classList.toggle('vmu-plmake-busy', b);
+      updateControls();
+    }
+
+    function renderTree() {
+      const scroll = treeEl.scrollTop;
+      treeEl.innerHTML = albums.map((a, ai) => {
+        const all = a.checked.size === a.items.length;
+        const none = a.checked.size === 0;
+        const srcTag = a.source === 'tags' ? '' : a.source === 'folder' ? ' <span class="vmu-bulkalb-src">по папке</span>' : ' <span class="vmu-bulkalb-src">без альбома</span>';
+        const rows = a.items.map((it, ti) => `
+          <label class="vmu-bulkalb-track">
+            <input type="checkbox" data-a="${ai}" data-t="${ti}"${a.checked.has(ti) ? ' checked' : ''}>
+            <span class="vmu-bulk-preview-text">
+              <span class="vmu-plmake-found">${escHtml((it.entry.artist ? it.entry.artist + ' — ' : '') + (it.entry.title || it.entry.name))}</span>
+              <span class="vmu-plmake-file">${escHtml(it.entry.name)}</span>
+            </span>
+          </label>`).join('');
+        return `
+          <div class="vmu-bulkalb-album" data-a="${ai}"${a.open ? ' data-open="1"' : ''}>
+            <div class="vmu-bulkalb-albumhead">
+              <input type="checkbox" data-a="${ai}"${all ? ' checked' : ''}>
+              <button type="button" class="vmu-bulkalb-toggle" data-a="${ai}" aria-label="Развернуть">${a.open ? '▾' : '▸'}</button>
+              <span class="vmu-bulk-preview-text">
+                <span class="vmu-plmake-found">${escHtml(a.title)}${srcTag}</span>
+                <span class="vmu-plmake-file">${a.checked.size} из ${a.items.length} ${plcPlural(a.items.length, 'трека', 'треков', 'треков')}</span>
+              </span>
+            </div>
+            <div class="vmu-bulkalb-tracks">${rows}</div>
+          </div>`;
+      }).join('');
+      // Tri-state can only be set from script, never from markup.
+      for (const box of treeEl.querySelectorAll('.vmu-bulkalb-albumhead input[type="checkbox"]')) {
+        const a = albums[Number(box.dataset.a)];
+        box.indeterminate = a.checked.size > 0 && a.checked.size < a.items.length;
+      }
+      treeEl.scrollTop = scroll;
+      updateControls();
+    }
+
+    treeEl.addEventListener('change', e => {
+      const box = e.target.closest('input[type="checkbox"]');
+      if (!box || busy) return;
+      const a = albums[Number(box.dataset.a)];
+      if (!a) return;
+      if (box.dataset.t == null) {
+        a.checked = box.checked ? new Set(a.items.map((_, i) => i)) : new Set();
+      } else {
+        const ti = Number(box.dataset.t);
+        if (box.checked) a.checked.add(ti); else a.checked.delete(ti);
+      }
+      renderTree();
+    });
+    treeEl.addEventListener('click', e => {
+      const t = e.target.closest('.vmu-bulkalb-toggle');
+      if (!t) return;
+      const a = albums[Number(t.dataset.a)];
+      a.open = !a.open;
+      renderTree();
+    });
+    $('#vmu-bulkalb-all').addEventListener('click', () => {
+      if (busy) return;
+      for (const a of albums) a.checked = new Set(a.items.map((_, i) => i));
+      renderTree();
+    });
+    $('#vmu-bulkalb-none').addEventListener('click', () => {
+      if (busy) return;
+      for (const a of albums) a.checked = new Set();
+      renderTree();
+    });
+
+    async function handleFiles(fileList) {
+      if (busy) return;
+      const mp3s = [...fileList].filter(isMP3);
+      if (!mp3s.length) { setStatus('В выбранном нет MP3-файлов', true); return; }
+      setBusy(true);
+      setStatus(`Читаю теги… 0 из ${mp3s.length}`);
+      try {
+        const read = [];
+        for (const file of mp3s) {
+          const tags = await readID3(file).catch(() => ({}));
+          read.push({ file, tags, entry: await fileToCheckEntry(file, tags) });
+          if (read.length % 10 === 0 && statusEl.isConnected) setStatus(`Читаю теги… ${read.length} из ${mp3s.length}`);
+        }
+        if (!panel.isConnected) return;
+        albums = bulkalbGroupItems(read).map(a => ({ ...a, checked: new Set(a.items.map((_, i) => i)), open: false }));
+        const bytes = read.reduce((n, it) => n + it.file.size, 0);
+        filesHint.textContent = `Файлов: ${read.length} · Альбомов: ${albums.length} · ${(bytes / 1048576).toFixed(0)} МБ`;
+        const src = hasCoverSource();
+        coverRow.style.display = src ? '' : 'none';
+        coverCheck.checked = !!(settings.coverDataUrl || (settings.autoCoverFromId3 && src));
+        setStatus('');
+      } finally {
+        if (panel.isConnected) { setBusy(false); renderTree(); }
+      }
+    }
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('vmu-over'); });
+    dz.addEventListener('dragleave', e => { if (!dz.contains(e.relatedTarget)) dz.classList.remove('vmu-over'); });
+    dz.addEventListener('drop', async e => {
+      e.preventDefault();
+      dz.classList.remove('vmu-over');
+      handleFiles(await bulkalbFilesFromDrop(e.dataTransfer));
+    });
+    dirInput.addEventListener('change', () => { handleFiles(dirInput.files); dirInput.value = ''; });
+    fileInput.addEventListener('change', () => { handleFiles(fileInput.files); fileInput.value = ''; });
+
+    // Build the persisted run out of what's ticked and start it.
+    async function start() {
+      if (busy || !selectedCount()) return;
+      if (!ownerId) { setStatus('Открой страницу аудио сообщества (vk.ru/audios-…) и запусти заново', true); return; }
+      session = await bulkalbReadSession();
+      renderLimit();
+      if (session.count >= BULKALB_SESSION_LIMIT) {
+        setStatus(`Лимит сессии исчерпан: ${session.count} из ${BULKALB_SESSION_LIMIT}. Перезайди в VK или сбрось счётчик.`, true);
+        return;
+      }
+      const picked = albums.filter(a => a.checked.size);
+      const total = selectedCount();
+      const ok = await vmuConfirmBulkAction(
+        actionsEl, goBtn,
+        `Залить ${total} ${plcPlural(total, 'трек', 'трека', 'треков')} (${picked.length} ${plcPlural(picked.length, 'альбом', 'альбома', 'альбомов')})? Страница будет перезагружаться между альбомами.`,
+        'Залить');
+      if (!ok) return;
+
+      setBusy(true);
+      setStatus('Сохраняю файлы для прогона…');
+      const runId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+      const state = {
+        version: 1,
+        runId,
+        createdAt: Date.now(),
+        ownerId,
+        origin: location.origin,
+        status: 'running',
+        cursor: 0,
+        note: '',
+        albums: [],
+      };
+      try {
+        let stored = 0;
+        for (let ai = 0; ai < picked.length; ai++) {
+          const a = picked[ai];
+          const chosen = [...a.checked].sort((x, y) => x - y).map(i => a.items[i]);
+          const tracks = [];
+          for (let ti = 0; ti < chosen.length; ti++) {
+            const it = chosen[ti];
+            const fileKey = `${runId}/${ai}/${ti}`;
+            await bulkalbPutBlob(fileKey, it.file);
+            stored++;
+            if (statusEl.isConnected) setStatus(`Сохраняю файлы для прогона… ${stored} из ${total}`);
+            tracks.push({
+              fileKey,
+              name: it.file.name,
+              type: it.file.type || 'audio/mpeg',
+              entry: it.entry,
+              // Only the frames the upload and the playlist title actually
+              // read — APIC and the rest would blow past chrome.storage's quota.
+              tags: {
+                TPE1: it.tags?.TPE1 || '', TPE2: it.tags?.TPE2 || '', TIT2: it.tags?.TIT2 || '',
+                TALB: it.tags?.TALB || '', TYER: it.tags?.TYER || '', TDRC: it.tags?.TDRC || '',
+                TRCK: it.tags?.TRCK || '',
+              },
+              uploaded: false,
+              audioId: null,
+            });
+          }
+          let coverKey = null;
+          if (coverCheck.checked) {
+            const src = await bulkalbResolveCoverSource(a.items);
+            if (src) {
+              try {
+                const blob = await makePerezalitoCover(src);
+                if (blob) { coverKey = `${runId}/${ai}/cover`; await bulkalbPutBlob(coverKey, blob); }
+              } catch (err) { console.warn('[VK Multi Upload] bulk albums: cover failed', err); }
+            }
+          }
+          state.albums.push({
+            title: a.title, album: a.album, artist: a.artist, year: a.year, folder: a.folder,
+            playlistTitle: a.title,
+            playlistDescription: `${a.title}\n${BULKALB_SIGNATURE}`,
+            stage: 'pending',
+            error: null,
+            startCount: null,
+            gained: null,
+            sentCount: 0,
+            playlistKey: null,
+            addedCount: 0,
+            coverKey,
+            tracks,
+          });
+        }
+      } catch (err) {
+        console.warn('[VK Multi Upload] bulk albums: could not store files', err);
+        await bulkalbDiscardRun(state);
+        setBusy(false);
+        setStatus('Не удалось сохранить файлы для прогона: ' + (err.message || err), true);
+        return;
+      }
+      await bulkalbSaveState(state);
+      closeBulkAlbumsPanel();
+      bulkalbRenderProgress(state);
+      bulkalbTick();
+    }
+    goBtn.addEventListener('click', start);
+
+    renderLimit();
+    limitHint.title = 'Счёт ведётся по куке аккаунта и сбрасывается, когда меняется сессия VK';
+    limitHint.style.cursor = 'pointer';
+    limitHint.addEventListener('click', async () => {
+      if (busy) return;
+      await bulkalbResetSession();
+      session = await bulkalbReadSession();
+      renderLimit();
+      updateControls();
+      setStatus('Счётчик сессии сброшен');
+    });
+    renderTree();
+  }
+
+  // Cover for an album's playlist: the user's own cover from settings wins,
+  // else the first embedded ID3 picture — the same priority runAutoPlaylist uses.
+  async function bulkalbResolveCoverSource(items) {
+    if (settings.coverDataUrl) return settings.coverDataUrl;
+    const withArt = items.find(it => it.tags?.APIC?.data);
+    if (!withArt) return null;
+    const apic = withArt.tags.APIC;
+    const blob = new Blob([apic.data], { type: apic.mime || 'image/jpeg' });
+    return new Promise(res => {
+      const r = new FileReader();
+      r.onload = () => res(r.result);
+      r.onerror = () => res(null);
+      r.readAsDataURL(blob);
+    });
+  }
+
+  // ── progress panel ─────────────────────────────────────────────────────────
+  const BULKALB_STAGE_LABEL = {
+    pending: 'в очереди',
+    uploading: 'заливается',
+    uploaded: 'залит, собираю плейлист',
+    creating: 'создаётся плейлист',
+    done: 'готово',
+    failed: 'ошибка',
+    skipped: 'пропущен',
+  };
+
+  function bulkalbRenderProgress(state, note) {
+    if (!state) { document.getElementById('vmu-bulkalb-run')?.remove(); return; }
+    let panel = document.getElementById('vmu-bulkalb-run');
+    if (!panel) {
+      syncVmuTheme();
+      panel = document.createElement('div');
+      panel.id = 'vmu-bulkalb-run';
+      panel.className = 'vmu-bulkops-panel vmu-bulkalb-run';
+      panel.innerHTML = `
+        <div class="vmu-bulkops-head">
+          <span class="vmu-bulkops-title">Заливка альбомов</span>
+          <button type="button" class="vmu-check-close" id="vmu-bulkalb-run-hide" title="Свернуть">${ICON_CLOSE}</button>
+        </div>
+        <div class="vmu-bulkops-body vmu-plcollect-body">
+          <div class="vmu-plc-status" id="vmu-bulkalb-run-note"></div>
+          <div class="vmu-bulkalb-tree" id="vmu-bulkalb-run-list"></div>
+          <div class="vmu-plc-actions">
+            <span class="vmu-plc-count" id="vmu-bulkalb-run-count"></span>
+            <button type="button" id="vmu-bulkalb-resume" class="vmu-pick-btn" style="display:none">Продолжить</button>
+            <button type="button" id="vmu-bulkalb-stop" class="vmu-pick-btn vmu-plc-secondary">Остановить</button>
+          </div>
+        </div>`;
+      document.body.appendChild(panel);
+      makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+      panel.querySelector('#vmu-bulkalb-run-hide').addEventListener('click', () => panel.remove());
+      panel.querySelector('#vmu-bulkalb-stop').addEventListener('click', async () => {
+        const s = await bulkalbLoadState();
+        if (!s) { panel.remove(); return; }
+        s.status = 'stopped';
+        await bulkalbSaveState(s);
+        await bulkalbDiscardRun(s);
+        panel.remove();
+        showProgressToast('Заливка альбомов остановлена', { id: 'vmu-bulkalb', kind: 'done' });
+      });
+      panel.querySelector('#vmu-bulkalb-resume').addEventListener('click', async () => {
+        const s = await bulkalbLoadState();
+        if (!s) { panel.remove(); return; }
+        s.status = 'running';
+        s.note = '';
+        await bulkalbSaveState(s);
+        bulkalbRenderProgress(s);
+        bulkalbTick();
+      });
+    }
+    if (note != null) state.note = note;
+    const done = state.albums.filter(a => a.stage === 'done').length;
+    panel.querySelector('#vmu-bulkalb-run-note').textContent = state.note || '';
+    panel.querySelector('#vmu-bulkalb-run-count').textContent =
+      `Альбомов готово: ${done} из ${state.albums.length}` + (state.sessionLeft != null ? ` · лимит: осталось ${state.sessionLeft}` : '');
+    panel.querySelector('#vmu-bulkalb-resume').style.display = state.status === 'paused' ? '' : 'none';
+    panel.querySelector('#vmu-bulkalb-run-list').innerHTML = state.albums.map((a, i) => `
+      <div class="vmu-bulkalb-runrow" data-stage="${a.stage}"${i === state.cursor ? ' data-current="1"' : ''}>
+        <span class="vmu-bulk-preview-text">
+          <span class="vmu-plmake-found">${escHtml(a.title)}</span>
+          <span class="vmu-plmake-file">${escHtml(a.error || BULKALB_STAGE_LABEL[a.stage] || a.stage)} · ${a.tracks.filter(t => t.uploaded).length} из ${a.tracks.length}${a.addedCount ? ` · в плейлисте ${a.addedCount}` : ''}</span>
+        </span>
+      </div>`).join('');
+    return panel;
+  }
+
+  // ── the loop ───────────────────────────────────────────────────────────────
+  let bulkalbTicking = false;
+
+  // Opens VK's own upload dialog and waits until injected.js can see the
+  // native file input it hands the batch to.
+  async function bulkalbOpenUploadDialog() {
+    for (let i = 0; i < 40; i++) {
+      if (document.querySelector('[data-vmu-vk="1"]')) return true;
+      if (i % 10 === 0) {
+        const btn = document.querySelector('[data-testid="AudioCatalogUploadAudioAction"]');
+        if (btn && !getUploadDialog()) btn.click();
+      }
+      await sleep(300);
+    }
+    return !!document.querySelector('[data-vmu-vk="1"]');
+  }
+
+  // Hands one album's files to VK's native uploader — the same single
+  // transport handoffFilesNatively uses (VK_HANDOFF_FILES → the dialog's own
+  // input), with the same per-file preparation (filename→ID3 patch under
+  // «Авто-метаданные», then the Slim processing chain when it's on).
+  async function bulkalbUploadFiles(files, onStep) {
+    const items = [];
+    const slim = settings.slimEnabled;
+    if (slim) showProcessingUI(files.length);
+    try {
+      for (let i = 0; i < files.length; i++) {
+        let file = files[i];
+        onStep?.(i, files.length, file.name);
+        if (settings.autoMeta) {
+          try {
+            const tags = file._vmuTags || {};
+            const artistSplit = splitTrailingTagJunk(tags.TPE1 || tags.TPE2);
+            const titleSplit = splitTrailingTagJunk(tags.TIT2);
+            const hasArtist = !!(tags.TPE1 || tags.TPE2) && !!artistSplit.core;
+            const hasTitle = !!tags.TIT2 && !!titleSplit.core;
+            if (!hasArtist || !hasTitle) {
+              const parsed = parseMetaFromFilename(file.name);
+              const artist = hasArtist ? (tags.TPE1 || tags.TPE2) : joinWithJunk(parsed.artist, artistSplit.junk);
+              const title = hasTitle ? tags.TIT2 : joinWithJunk(parsed.title, titleSplit.junk);
+              if (artist || title) file = await patchID3(file, artist, title);
+            }
+          } catch {}
+        }
+        if (slim) {
+          try {
+            updateProcessingUI(file.name, i + 1, files.length, 0);
+            file = await applyAudioProcessing(file, pct => updateProcessingUI(file.name, i + 1, files.length, pct));
+          } catch (err) { console.error('[VMU Slim] processing error:', err); }
+        }
+        items.push({ name: file.name, mimeType: file.type || 'audio/mpeg', buffer: await file.arrayBuffer() });
+      }
+    } finally {
+      if (slim) hideProcessingUI();
+    }
+    if (!await bulkalbOpenUploadDialog()) throw new Error('Не удалось открыть диалог загрузки VK');
+    return new Promise(resolve => {
+      const h = e => {
+        if (e.source !== window || e.data?.type !== 'VK_HANDOFF_DISPATCHED') return;
+        window.removeEventListener('message', h);
+        clearTimeout(t);
+        resolve(!!e.data.ok);
+      };
+      const t = setTimeout(() => { window.removeEventListener('message', h); resolve(false); }, 20000);
+      window.addEventListener('message', h);
+      window.postMessage({ type: 'VK_HANDOFF_FILES', items }, '*', items.map(i => i.buffer));
+    });
+  }
+
+  // The album's tracks as the page now shows them, matched by title/artist and
+  // kept as exact audio ids — the same matcher «Плейлист из файлов» uses, run
+  // against the top of the catalog where a fresh upload lands.
+  async function bulkalbResolveAudioIds(album, onProgress) {
+    const wanted = album.tracks.filter(t => t.uploaded);
+    if (!wanted.length) return { ids: [], missing: [] };
+    const entries = wanted.map(t => t.entry);
+    const limit = Math.max(150, wanted.length * 6);
+    const allFound = collected => collected.size >= entries.length
+      && plmakeMatch(entries, [...collected.values()]).every(m => m && m.sure && m.exact);
+    const map = await harvestPageTracks(onProgress, limit, allFound);
+    const matches = plmakeMatch(entries, [...map.values()]);
+    const ids = [];
+    const missing = [];
+    matches.forEach((m, i) => {
+      if (m) { wanted[i].audioId = m.track.id; ids.push(m.track.id); }
+      else missing.push(wanted[i].name);
+    });
+    return { ids, missing };
+  }
+
+  // Playlists whose cell is mounted right now, by title — used to tell a
+  // half-finished creation (page died between "created" and "filled") from one
+  // that never happened, so a resumed run can never make a second playlist.
+  function bulkalbFindPlaylistByTitle(title) {
+    const norm = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const want = norm(title);
+    for (const p of plmakeMountedPlaylists()) if (norm(p.title) === want) return p;
+    return null;
+  }
+  async function bulkalbScanPlaylistByTitle(ownerId, title) {
+    const res = await new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ type: 'VKD_SCAN_PLAYLISTS', url: `${location.origin}/audios${ownerId}` }, r => resolve(r));
+      } catch { resolve({ ok: false }); }
+    });
+    if (!res?.ok) return null;
+    const norm = s => (s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const want = norm(title);
+    return (res.playlists || []).find(p => norm(p.title) === want) || null;
+  }
+
+  function bulkalbReload() { setTimeout(() => location.reload(), 1200); }
+
+  async function bulkalbTick() {
+    if (bulkalbTicking) return;
+    bulkalbTicking = true;
+    try { await bulkalbRun(); }
+    catch (err) {
+      console.error('[VK Multi Upload] bulk albums run failed:', err);
+      const s = await bulkalbLoadState();
+      if (s) {
+        s.status = 'paused';
+        s.note = 'Ошибка: ' + translateError(err.message || String(err));
+        await bulkalbSaveState(s);
+        bulkalbRenderProgress(s);
+      }
+    } finally { bulkalbTicking = false; }
+  }
+
+  async function bulkalbRun() {
+    let state = await bulkalbLoadState();
+    if (!state || state.status !== 'running') return;
+    if (Date.now() - (state.createdAt || 0) > BULKALB_MAX_AGE_MS) {
+      await bulkalbDiscardRun(state);
+      showProgressToast('Старый прогон заливки альбомов отброшен', { id: 'vmu-bulkalb', kind: 'error' });
+      return;
+    }
+    // Skip past everything already settled.
+    while (state.cursor < state.albums.length
+      && ['done', 'failed', 'skipped'].includes(state.albums[state.cursor].stage)) state.cursor++;
+    if (state.cursor >= state.albums.length) {
+      const done = state.albums.filter(a => a.stage === 'done').length;
+      await bulkalbDiscardRun(state);
+      bulkalbRenderProgress(null);
+      showProgressToast(`Заливка альбомов закончена: готово ${done} из ${state.albums.length}`, { id: 'vmu-bulkalb', kind: 'done' });
+      return;
+    }
+
+    const album = state.albums[state.cursor];
+    const session = await bulkalbReadSession();
+    state.sessionLeft = Math.max(0, BULKALB_SESSION_LIMIT - session.count);
+    bulkalbRenderProgress(state, `«${album.title}»…`);
+
+    if (album.stage === 'pending') {
+      const todo = album.tracks.filter(t => !t.uploaded);
+      const left = state.sessionLeft;
+      if (left <= 0 || (todo.length > left && left < BULKALB_SESSION_LIMIT)) {
+        // Stopping BEFORE a partial album: half an album uploaded and then
+        // cut off is worse than waiting, and the rest of the queue stays
+        // saved for the next session.
+        state.status = 'paused';
+        state.note = `Лимит сессии ${BULKALB_SESSION_LIMIT} исчерпан (залито ${session.count}). В очереди осталось ${bulkalbQueuedTracks(state)} ${plcPlural(bulkalbQueuedTracks(state), 'трек', 'трека', 'треков')} в ${state.albums.length - state.cursor} ${plcPlural(state.albums.length - state.cursor, 'альбоме', 'альбомах', 'альбомах')}.`;
+        await bulkalbSaveState(state);
+        bulkalbRenderProgress(state);
+        showProgressToast(state.note, { id: 'vmu-bulkalb', kind: 'error' });
+        return;
+      }
+      const batch = todo.slice(0, left);
+
+      // Marked BEFORE anything is sent: a reload between the hand-off and the
+      // confirmation must never cause a second copy of these tracks.
+      album.stage = 'uploading';
+      album.startCount = getPageTrackCount();
+      album.sentCount = batch.length;
+      for (const t of batch) t.sent = true;
+      await bulkalbSaveState(state);
+      await bulkalbBumpSession(batch.length);
+      for (let i = 0; i < batch.length; i++) bumpTodayUploadCount();
+
+      const files = [];
+      for (const t of batch) {
+        const blob = await bulkalbGetBlob(t.fileKey);
+        if (!blob) throw new Error(`Файл «${t.name}» не найден в хранилище прогона`);
+        const f = new File([blob], t.name, { type: t.type || 'audio/mpeg' });
+        f._vmuTags = t.tags || {};
+        files.push(f);
+      }
+      bulkalbRenderProgress(state, `«${album.title}»: готовлю ${batch.length} ${plcPlural(batch.length, 'файл', 'файла', 'файлов')}…`);
+      const sent = await bulkalbUploadFiles(files, (i, n, name) =>
+        bulkalbRenderProgress(state, `«${album.title}»: ${i + 1} из ${n} — ${name}`));
+      if (!sent) throw new Error('VK не принял файлы (диалог загрузки не отдал свой input)');
+
+      bulkalbRenderProgress(state, `«${album.title}»: жду подтверждения загрузки…`);
+      const gained = album.startCount != null
+        ? await waitForTrackCountIncrease(album.startCount, batch.length, null, (got, left) =>
+            bulkalbRenderProgress(state, `«${album.title}»: подтвердилось ${got} из ${batch.length}, жду ещё ${left} с…`))
+        : (await sleep(Math.max(15000, batch.length * 4000)), batch.length);
+      album.gained = gained;
+      // Without per-file confirmation from VK the honest reading is "as many
+      // as the library grew by" — matching below works by id, so a track that
+      // never landed simply won't be found and is reported, not guessed at.
+      for (const t of batch) t.uploaded = true;
+      album.stage = 'uploaded';
+      if (gained <= 0) album.error = 'загрузка не подтвердилась';
+      await bulkalbSaveState(state);
+      // Through VK's own close button, so the modal and its dim overlay both
+      // go: a reload fired with the upload modal still up leaves VK asking
+      // whether to leave the page on some builds.
+      try { closeUploadModal(); } catch {}
+      bulkalbRenderProgress(state, `«${album.title}»: загружено, перезагружаю страницу…`);
+      bulkalbReload();
+      return;
+    }
+
+    if (album.stage === 'uploading') {
+      // Resumed after a reload that landed mid-hand-off: the batch is already
+      // on its way to VK, so it is never re-sent — move on and let the id
+      // match below say what actually arrived.
+      for (const t of album.tracks) if (t.sent) t.uploaded = true;
+      album.stage = 'uploaded';
+      await bulkalbSaveState(state);
+      bulkalbRenderProgress(state, `«${album.title}»: проверяю, что залилось…`);
+    }
+
+    if (album.stage === 'uploaded') {
+      bulkalbRenderProgress(state, `«${album.title}»: ищу залитые треки на странице…`);
+      const { ids, missing } = await bulkalbResolveAudioIds(album, n =>
+        bulkalbRenderProgress(state, `«${album.title}»: просмотрено треков ${n}…`));
+      if (!ids.length) {
+        album.stage = 'failed';
+        album.error = 'залитые треки не нашлись на странице';
+        state.cursor++;
+        await bulkalbSaveState(state);
+        bulkalbRenderProgress(state);
+        bulkalbReload();
+        return;
+      }
+      album.audioIds = ids;
+      album.missing = missing;
+      album.stage = 'creating';
+      await bulkalbSaveState(state);
+    }
+
+    if (album.stage === 'creating') {
+      const ids = album.audioIds || [];
+      const trackNames = album.tracks
+        .filter(t => t.audioId && ids.includes(t.audioId))
+        .map(t => ({ artist: t.entry.artist || '', title: t.entry.title || '' }));
+
+      // Resumed into this stage: a playlist with this title may already exist
+      // from the attempt that was cut short. Fill that one instead of making a
+      // twin of it.
+      let existing = album.playlistKey
+        ? { id: album.playlistKey, title: album.playlistTitle }
+        : bulkalbFindPlaylistByTitle(album.playlistTitle);
+      if (!existing && album.createAttempted) {
+        bulkalbRenderProgress(state, `«${album.title}»: проверяю, не создался ли плейлист…`);
+        existing = await bulkalbScanPlaylistByTitle(state.ownerId, album.playlistTitle);
+      }
+
+      if (existing) {
+        album.playlistKey = existing.id;
+        await bulkalbSaveState(state);
+        bulkalbRenderProgress(state, `«${album.title}»: плейлист уже есть, дозаполняю…`);
+        const [plOwner, plIdStr] = String(existing.id).split('_');
+        const res = await pageCall('VK_ADD_TRACKS_TO_PLAYLIST', 'VK_ADD_TRACKS_TO_PLAYLIST_DONE', {
+          reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+          ownerId: plOwner, playlistId: parseInt(plIdStr, 10), trackNames, audioIds: ids,
+        }, 300000, 'reqId').catch(err => ({ ok: false, error: err.message }));
+        album.addedCount = res?.selectedCount || 0;
+        album.stage = 'done';
+        if (!album.addedCount) album.error = 'треки в плейлист не добавились';
+      } else {
+        album.createAttempted = true;
+        await bulkalbSaveState(state);
+        bulkalbRenderProgress(state, `«${album.title}»: создаю плейлист…`);
+        let coverBuf = null;
+        if (album.coverKey) {
+          const blob = await bulkalbGetBlob(album.coverKey).catch(() => null);
+          if (blob) coverBuf = await blob.arrayBuffer();
+        }
+        const created = await pageCall('VK_CREATE_PLAYLIST', 'VK_PLAYLIST_CREATED', {
+          reqId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+          title: String(album.playlistTitle).slice(0, 255),
+          description: String(album.playlistDescription).slice(0, 1000),
+          trackNames, audioIds: ids, coverBuf,
+        }, 300000, 'reqId');
+        album.playlistKey = created.ownerId != null ? `${created.ownerId}_${created.playlistId}` : null;
+        album.addedCount = created.selectedCount || 0;
+        album.stage = 'done';
+        if (!album.addedCount) album.error = 'плейлист создан, но треки не добавились';
+      }
+
+      if (album.missing?.length) {
+        album.error = (album.error ? album.error + '; ' : '') + `не найдено треков: ${album.missing.length}`;
+      }
+      // An album bigger than the whole session budget is the one case that
+      // uploads only part of itself (see the limit check above) — say so
+      // instead of quietly leaving tracks behind.
+      const leftOver = album.tracks.filter(t => !t.uploaded).length;
+      if (leftOver) album.error = (album.error ? album.error + '; ' : '') + `не поместилось в лимит: ${leftOver}`;
+      // Done with this album's bytes — a 40-track run would otherwise sit on
+      // hundreds of megabytes until the whole thing finished.
+      await bulkalbDeleteBlobs([...album.tracks.map(t => t.fileKey), album.coverKey].filter(Boolean));
+      state.cursor++;
+      await bulkalbSaveState(state);
+      bulkalbRenderProgress(state, `«${album.title}»: готово. Перезагружаю страницу…`);
+      bulkalbReload();
+    }
+  }
+
+  // Picked back up on every page load: the loop above reloads the page on
+  // purpose, so this is what makes it a loop at all.
+  async function bulkalbResumeOnLoad() {
+    const state = await bulkalbLoadState();
+    if (!BULKALB_ACTIVE(state)) return;
+    if (state.origin && state.origin !== location.origin) return;
+    const here = location.href.match(/audios(-?\d+)/)?.[1] || null;
+    if (state.ownerId && here !== state.ownerId) {
+      // A run belongs to one community's page; anywhere else it just waits.
+      bulkalbRenderProgress(state, `Прогон ждёт страницу сообщества ${state.ownerId}`);
+      return;
+    }
+    bulkalbRenderProgress(state);
+    if (state.status !== 'running') return;
+    // Let VK finish mounting its list first — getPageTrackCount, the picker
+    // and the matcher all read the rendered page.
+    for (let i = 0; i < 40 && !vmuPageHasAudio(true); i++) await sleep(500);
+    await sleep(1500);
+    bulkalbTick();
+  }
+
   // ─── Playlist order ──────────────────────────────────────────────────────────
   // VK removed drag-to-reorder for playlists from the desktop site (community
   // and personal music); the server method is still there and VK's own web
@@ -9620,7 +10786,7 @@
 
   function injectCatalogToolbarButtons() {
     // each one on its own: a failure in one must not skip the ones after it
-    for (const fn of [injectPlaylistOrderButton, injectPlaylistMakerButton, injectBulkOpsButton, injectToolbarSettingsButtons]) {
+    for (const fn of [injectPlaylistOrderButton, injectPlaylistMakerButton, injectBulkAlbumsButton, injectBulkOpsButton, injectToolbarSettingsButtons]) {
       try { fn(); } catch (err) { console.warn('[VK Multi Upload] toolbar button failed:', fn.name, err); }
     }
   }
@@ -9635,6 +10801,9 @@
   // (each a document-wide attribute scan) on EVERY mutation batch, on every
   // vk.com page, buttons present or not.
   injectCatalogToolbarButtons();
+  // A batch-album run reloads the page between albums on purpose, so it is
+  // this call — not the click that started it — that keeps the loop going.
+  setTimeout(() => { bulkalbResumeOnLoad().catch(err => console.warn('[VK Multi Upload] bulk albums resume failed:', err)); }, 2000);
 
   function buildBulkOpsSection(list, { pageTracks, entries }) {
     const wrap = document.createElement('div');
@@ -13147,6 +14316,28 @@
   // page — stamping it would make it look like a second native player
   function vmuInOverlay(el) { return !!el.closest('#vmu-overlay-panel'); }
 
+  // Tells the player block's own wrapper div (VK's in-flow copy) apart from its
+  // duplicate (a second copy VK keeps around and makes position:fixed once the
+  // page scrolls past the first — see applyTabsBarPin's "HOW THE MERGE WORKS").
+  // Used to be "whichever wrapper has a later <section> sibling" (the in-flow
+  // one sits alongside the rest of the catalog's section blocks) — VK's current
+  // build no longer puts either copy next to a sibling section, so that test
+  // now fails for both and applyTabsBarPin's CSS hid the whole player. The
+  // duplicate is the one VK itself already makes position:fixed a few ancestors
+  // up; the in-flow one never is. Marked once (by applyTabsBarPin, on whatever
+  // AudioPage_PlayerBlock it finds, testid native or stamped) — the wrapper
+  // node is stable across VK's own re-renders of its content.
+  function markPlayerBlockWrap(sec) {
+    const wrap = sec.parentElement;
+    if (!wrap || wrap.classList.contains('vmu-pb-wrap-flow') || wrap.classList.contains('vmu-pb-wrap-fixed')) return;
+    let anc = wrap, isFixed = false;
+    for (let d = 0; d < 4 && anc; d++) {
+      if (getComputedStyle(anc).position === 'fixed') { isFixed = true; break; }
+      anc = anc.parentElement;
+    }
+    wrap.classList.add(isFixed ? 'vmu-pb-wrap-fixed' : 'vmu-pb-wrap-flow');
+  }
+
   function vmuStampPlayerBlocks() {
     for (const sec of document.querySelectorAll('section')) {
       if (sec.getAttribute('data-testid') === 'AudioPage_PlayerBlock'
@@ -13172,6 +14363,7 @@
       for (const b of btns) {
         const l = vmuLabel(b);
         if (/^Поделиться/i.test(l)) vmuStamp(b, 'MusicAudio_Share');
+        else if (/^Транслировать/i.test(l)) vmuStamp(b, 'ToggleCurrentTargets');
         else if (/звук$/i.test(l)) mute = b;
       }
       // the volume bar sits next to the mute button; the progress bars are the
@@ -13416,6 +14608,77 @@
     return row;
   }
 
+  // VK's own audio-upload dialog. injectIntoVkDialog keeps VK's header and
+  // footer and swaps only the middle section for the extension's queue UI —
+  // with neither the ids nor the old vkitModalHeader/Footer class names left
+  // (checked live on the 17.11 build), it found no header at all, took the
+  // TITLE row for the body and wiped it: the dialog lost its heading and its
+  // close cross, and VK's own «Выбрать файл» section stayed on screen under
+  // our dropzone. The layout itself is unchanged — [header, body, footer] —
+  // and the footer is the one row holding VK's real «Закрыть» <button>, while
+  // the header's own close control is a role="button" with the same name.
+  function vmuStampUploadDialog() {
+    for (const box of document.querySelectorAll('[role="dialog"]')) {
+      if (vmuInOverlay(box)) continue;
+      if (!String(box.className || '').includes('vkitInternalModalBox')) continue;
+      if (box.querySelector('[data-testid="modalfooter"]')) continue;
+      if (!box.querySelector('input[type="file"][accept*="audio"], input[type="file"][accept*="mp3"], [data-vmu-vk="1"]')) continue;
+      if (isPlaylistDialog(box)) continue;
+      const kids = [...box.children];
+      if (kids.length < 2) continue;
+      const isClose = el => /^Закрыть$/i.test(vmuLabel(el));
+      const footer = [...kids].reverse().find(c => [...c.querySelectorAll('button')].some(isClose));
+      const header = kids.find(c => c !== footer && !c.querySelector('input[type="file"]'));
+      if (footer) {
+        vmuStamp(footer, 'modalfooter');
+        const cancel = [...footer.querySelectorAll('button')].find(isClose);
+        if (cancel) vmuStamp(cancel, 'UploadAudio_CancelButton');
+      }
+      if (header && header !== footer) {
+        vmuStamp(header, 'modalheader');
+        const close = [...header.querySelectorAll('[role="button"], button')].find(isClose);
+        if (close) vmuStamp(close, 'modal-close-button');
+      }
+      const pick = [...box.querySelectorAll('label, button, [role="button"]')]
+        .find(el => /^Выбрать файл/i.test(vmuLabel(el)));
+      if (pick) vmuStamp(pick, 'UploadAudio_SelectFileButton');
+    }
+  }
+
+  // Playlist cells. VK still writes the playlist's own «ownerId_playlistId»
+  // into data-id (checked live: 21 cells on the community page) — only the
+  // testid went, so a cell is recognised by that id plus the actions every
+  // playlist cell carries («Редактировать / Слушать / Поделиться»). Without
+  // this the whole playlist half of the extension is blind: creating one and
+  // then filling it, the duplicate check and the «в существующий» picker all
+  // look up MusicPlaylistItem_Cell.
+  function vmuStampPlaylists() {
+    for (const cell of document.querySelectorAll('[data-id]:not([data-testid])')) {
+      if (vmuInOverlay(cell)) continue;
+      if (!/^-?\d+_\d+$/.test(cell.getAttribute('data-id') || '')) continue;
+      if (cell.hasAttribute('data-audio-id')) continue;
+      if (!/Редактировать|Слушать/.test(cell.textContent || '')) continue;
+      vmuStamp(cell, 'MusicPlaylistItem_Cell');
+      // the title sits inside the cell's own «Открыть» control
+      let open = cell.querySelector('[role="button"][aria-label="Открыть"]');
+      if (!open) {
+        open = [...cell.querySelectorAll('[role="button"]')]
+          .find(b => !/^(Редактировать|Слушать|Поделиться)$/i.test(vmuLabel(b)));
+      }
+      const title = open?.firstElementChild || open;
+      if (title) vmuStamp(title, 'MusicPlaylistItem_Title');
+    }
+    // A playlist's own page: the action openPlaylistPageEditButton waits for
+    // when the playlist has no cell mounted on the page we're standing on.
+    if (location.pathname.includes('/music/playlist/')
+      && !document.querySelector('[data-testid="Action_Edit"]')) {
+      for (const b of document.querySelectorAll('button, [role="button"]')) {
+        if (vmuInOverlay(b)) continue;
+        if (/^Редактировать/i.test(vmuLabel(b))) { vmuStamp(b, 'Action_Edit'); break; }
+      }
+    }
+  }
+
   let _vmuStampAt = 0, _vmuNativeAt = -1e9, _vmuNative = false;
   function restoreVkTestIds(force) {
     const now = performance.now();
@@ -13446,6 +14709,8 @@
     }
     try { vmuStampTopPlayer(); } catch (err) { console.warn('[VK Multi Upload] testid top player:', err); }
     try { vmuStampTopPopup(); } catch (err) { console.warn('[VK Multi Upload] testid top popup:', err); }
+    try { vmuStampUploadDialog(); } catch (err) { console.warn('[VK Multi Upload] testid upload dialog:', err); }
+    try { vmuStampPlaylists(); } catch (err) { console.warn('[VK Multi Upload] testid playlists:', err); }
     if (hasRows) {
       try { vmuStampCatalog(); } catch (err) { console.warn('[VK Multi Upload] testid catalog:', err); }
       try { vmuStampRows(); } catch (err) { console.warn('[VK Multi Upload] testid rows:', err); }
@@ -13456,7 +14721,7 @@
   restoreVkTestIds(true);
   // a stamp of which build of this file the browser actually loaded, so a
   // page check can tell a reloaded extension from a stale one
-  document.documentElement.setAttribute('data-vmu-build', '2026-11-17-perf4');
+  document.documentElement.setAttribute('data-vmu-build', '2026-11-18-bulkalbums5');
 
   function onPageMutated() {
     restoreVkTestIds(true);

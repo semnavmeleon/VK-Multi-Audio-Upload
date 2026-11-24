@@ -778,8 +778,18 @@
   // real upload request, so deferUploadDone() never ran and the queue just
   // sat on "uploading…" until the 90s timeout in content.js gave up — kept
   // the old hosts too in case VK serves either depending on region/rollout.
-  function isVkUploadUrl(url) {
-    return url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php') || url.includes('.ms.vk.ru');
+  function isVkUploadUrl(url, body) {
+    if (url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php')) return true;
+    // VK's audio upload host is <digits>.ms.vk.ru — but so is the music
+    // long-poll, which is hit at the bare origin (no path) every ~30 s with
+    // no file attached. Matching that too made deferUploadDone() queue a
+    // phantom upload each time, which 8 s later logged «done_add timeout —
+    // flushing raw upload response for null» and posted a VK_UPLOAD_DONE for
+    // a file that never existed (seen live on an idle /audios page). A real
+    // upload either has a path of its own or carries the file in its body.
+    if (!url.includes('.ms.vk.ru')) return false;
+    try { if (new URL(url, location.href).pathname.replace(/\/+$/, '')) return true; } catch {}
+    return !!(body && extractUploadFileName(body));
   }
 
   // Pull the File out of a multipart upload body to identify WHICH queued
@@ -829,7 +839,7 @@
     if (!this._vkUrl) return origSend.call(this, body);
     const url = this._vkUrl;
 
-    const isUploadUrl = isVkUploadUrl(url);
+    const isUploadUrl = isVkUploadUrl(url, body);
     if (isUploadUrl) {
       const xhr = this;
       const fileName = extractUploadFileName(body);
@@ -934,7 +944,7 @@
   window.fetch = async function (...args) {
     const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
 
-    const isUploadUrl = isVkUploadUrl(url);
+    const isUploadUrl = isVkUploadUrl(url, args[1]?.body);
     if (isUploadUrl) {
       const fileName = extractUploadFileName(args[1]?.body);
       window.__vmuLastUploadUrl = url; // saved for zombie-mode direct uploads
@@ -2634,15 +2644,30 @@
     const createBtn = await waitForCreateBtn(8000);
 
     const responseText = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => { __savePlaylistCapture = null; __editPlaylistCapture = null; reject(new Error('save_playlist_timeout')); }, 30000);
+      // Not seeing the save response is no longer fatal: VK's 18.11 build
+      // saves a new community playlist through a transport none of our hooks
+      // sees (checked live — the playlist appeared in the catalog while this
+      // promise sat waiting, and the whole creation then failed with
+      // save_playlist_timeout over a playlist that existed). The response is
+      // still the authoritative source of the new id when it does arrive, so
+      // it is waited for — but only briefly, and then the DOM lookup below
+      // gets its turn instead of being skipped by a throw.
+      const timeout = setTimeout(() => { __savePlaylistCapture = null; __editPlaylistCapture = null; trace('[vmu] save response not seen — falling back to the DOM'); resolve(null); }, 12000);
       const onCapture = (text) => { clearTimeout(timeout); __savePlaylistCapture = null; __editPlaylistCapture = null; resolve(text); };
-      __savePlaylistCapture = onCapture;
-      __editPlaylistCapture = onCapture;
+      // The capture is armed only right before Save is clicked, NOT here.
+      // On a community page VK answers the save with act=playlists_edit_data
+      // (see the XHR hook), and OPENING this very dialog now fires the same
+      // act — checked live: one al_audio.php?act=playlists_edit_data XHR goes
+      // out the moment «Создать плейлист» is clicked. Armed up front, that
+      // request resolved this promise as if it were the save response: the
+      // flow then hunted for a playlist id that nothing had created yet and
+      // died with playlist_id_not_found, leaving VK's dialog standing open.
 
       (async () => {
         createBtn.click();
         const dialog = await waitForEl('.audio_pl_edit_box', 4000);
-        if (!dialog) { clearTimeout(timeout); __savePlaylistCapture = null; reject(new Error('dialog_not_opened')); return; }
+        if (!dialog) { clearTimeout(timeout); reject(new Error('dialog_not_opened')); return; }
+        trace('[vmu] create dialog opened');
 
         await pause(400);
 
@@ -2723,23 +2748,29 @@
         // of just failing loudly with save_btn_not_found.
         const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
         const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
-        if (!saveBtn) { clearTimeout(timeout); __savePlaylistCapture = null; reject(new Error('save_btn_not_found')); return; }
+        if (!saveBtn) { clearTimeout(timeout); reject(new Error('save_btn_not_found')); return; }
+        trace('[vmu] create dialog filled, saving: ' + (titleEl ? titleEl.value : '(no title field!)'));
+        __savePlaylistCapture = onCapture;
+        __editPlaylistCapture = onCapture;
         saveBtn.click();
-      })();
+      })().catch(err => { clearTimeout(timeout); reject(err); });
     });
 
     // Get playlist ID: primary = parse from the save-request's own network
     // response (authoritative, immune to title collisions), fallback =
     // find by title in DOM (data-id attr), restricted to cells that weren't
     // already there before we started (see preExistingIds above).
+    // ~21 s of polling (was 6): with no network response to read, the only
+    // signal left is VK re-rendering its own playlist list, and on a
+    // community page with hundreds of playlists that takes its time.
     let result = null;
-    for (let i = 0; i < 12; i++) {
-      result = parsePlaylistIdFromResponse(responseText) || findPlaylistInDOMByTitle(title, preExistingIds);
+    for (let i = 0; i < 30; i++) {
+      result = (responseText && parsePlaylistIdFromResponse(responseText)) || findPlaylistInDOMByTitle(title, preExistingIds);
       if (result) break;
-      await pause(500);
+      await pause(700);
     }
     if (!result) throw new Error('playlist_id_not_found');
-    console.log('[vmu] Playlist created:', result.ownerId, result.playlistId);
+    trace('[vmu] Playlist created: ' + result.ownerId + '_' + result.playlistId);
 
     // PHASE 2: Add tracks via UI.
     if (trackNames.length > 0 || audioIds?.length) {
@@ -2764,15 +2795,22 @@
     // MusicPlaylist_OpenEditing (dropped "Item"); match by suffix so either survives.
     let btn = cell.querySelector('[data-testid$="OpenEditing"]');
     if (btn) return btn;
-    // Class-based variants
-    btn = cell.querySelector('.audio_pl__edit, .audio_pl_actions__edit, [class*="edit"]');
+    // Class-based variants (old VK)
+    btn = cell.querySelector('.audio_pl__edit, .audio_pl_actions__edit');
     if (btn) return btn;
-    // aria-label containing "редакт" (case-insensitive)
-    for (const b of cell.querySelectorAll('button, [role="button"]')) {
-      const lbl = (b.getAttribute('aria-label') || b.title || b.textContent || '').toLowerCase();
-      if (lbl.includes('редакт')) return b; // "редакт"
-    }
-    return null;
+    // The cell's own «Редактировать» control, matched INNERMOST-first. The
+    // old "first clickable thing whose text contains редакт" lost on the
+    // 18.11 build: the cover is a div[role=button] that WRAPS the three
+    // action buttons, so its own textContent reads «РедактироватьСлушать
+    // Поделиться…» and matched first. Clicking it opens the playlist
+    // (?z=audio_playlist…) instead of its editor, and the add-tracks step
+    // then died with dialog_not_opened over a playlist that had just been
+    // created — checked live, that is why fresh playlists came out empty.
+    const named = [...cell.querySelectorAll('button, [role="button"]')].filter(b =>
+      (b.getAttribute('aria-label') || b.title || b.textContent || '').toLowerCase().includes('редакт'));
+    for (const b of named) if (!named.some(o => o !== b && b.contains(o))) return b;
+    // Last resort, kept for any build that still names the control in a class
+    return cell.querySelector('[class*="edit"]');
   }
 
   // Open edit dialog for the newly created playlist and select tracks by name

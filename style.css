@@ -1292,13 +1292,22 @@ html.vmu-theme-light {
    second position:fixed copy — switched by VK's own asynchronous scroll handling,
    several frames after the scroll itself, with the corners restyled on the same late
    schedule. Anything synchronised «to VK's switch» was therefore late by design.
-   Here the in-flow copy does the job on its own: position:sticky keeps it under the
-   top bar in the very frame the page scrolls (the browser does it, no script), and VK's
-   fixed copy is never displayed. The look is then a function of ONE class,
+   Here the in-flow copy is held position:fixed directly above the tabs instead, in the
+   same pass that pins them — content.js tells the two copies apart itself
+   (markPlayerBlockWrap) and stamps their wrapper divs .vmu-pb-wrap-flow /
+   .vmu-pb-wrap-fixed, toggling .vmu-pb-wrap-pinned on the flow one once merged — and
+   VK's own fixed copy is never displayed. The look is then a function of ONE class,
    html.vmu-merged, set in the same pass that pins the tabs. */
-/* the in-flow copy's wrapper: the one that has the catalog's cards as later siblings */
-html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ section) {
-  position: sticky !important;
+/* VK's own duplicate copy: hidden outright whenever there's a header to pin against,
+   so its own async switch never shows through ours */
+html.vmu-pinmode div.vmu-pb-wrap-fixed {
+  display: none !important;
+}
+/* the in-flow copy, once merged: held fixed under the top bar (content.js sets
+   left/width to the catalog column's rect each pass; top comes from --vmu-topbar-h,
+   set in that same pass) */
+html.vmu-pinmode div.vmu-pb-wrap-pinned {
+  position: fixed !important;
   top: var(--vmu-topbar-h, 48px) !important;
   z-index: 3 !important;              /* what VK gives its own fixed copy */
   visibility: visible !important;     /* VK hides this copy while it shows the fixed one */
@@ -1306,12 +1315,8 @@ html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ s
      the top of the pinned tabs' buttons: it lets the pointer through, the card does not */
   pointer-events: none !important;
 }
-html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ section) > section[data-testid="AudioPage_PlayerBlock"] {
+html.vmu-pinmode div.vmu-pb-wrap-pinned > section[data-testid="AudioPage_PlayerBlock"] {
   pointer-events: auto !important;
-}
-/* VK's own fixed copy (its wrapper has no cards after it) */
-html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):not(:has(~ section)) {
-  display: none !important;
 }
 /* corners and outline: released … */
 html.vmu-pinmode section[data-testid="AudioPage_PlayerBlock"],
@@ -1336,9 +1341,9 @@ html.vmu-pinmode.vmu-merged section[data-testid="AudioPage_PlayerBlock"] {
 }
 /* The swapped-track panel (injected.js, #vmu-overlay-panel) is put right after the
    player block inside the same wrapper. In this mode it simply covers the block from
-   there — it moves with the sticky wrapper for free instead of being re-positioned by
+   there — it moves with the pinned wrapper for free instead of being re-positioned by
    script — and takes the same two looks from the same class. */
-html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ section) > #vmu-overlay-panel {
+html.vmu-pinmode div.vmu-pb-wrap-pinned > #vmu-overlay-panel {
   position: absolute !important;
   top: 0 !important;
   left: 0 !important;
@@ -1346,7 +1351,7 @@ html.vmu-pinmode div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ s
   border-radius: 12px !important;
   box-shadow: inset 0 0 0 1px var(--vmu-pin-border, rgb(54, 55, 56)) !important;
 }
-html.vmu-pinmode.vmu-merged div:has(> section[data-testid="AudioPage_PlayerBlock"]):has(~ section) > #vmu-overlay-panel {
+html.vmu-pinmode.vmu-merged div.vmu-pb-wrap-pinned > #vmu-overlay-panel {
   border-radius: 0 !important;
   box-shadow:
     inset 0 1px 0 0 var(--vmu-pin-border, rgb(54, 55, 56)),
@@ -2524,11 +2529,25 @@ html.vmu-pinmode.vmu-merged div:has(> section[data-testid="AudioPage_PlayerBlock
 .vmu-fx-ab-switch button:hover { color: var(--vmu-text-2); }
 .vmu-fx-ab-switch button.active { background: rgba(38,136,235,0.85); color: #fff; }
 
+/* Its own floating window (content.js attachAudioFxHandlers' openPresetBrowser),
+   not an inline section of the equalizer panel any more — opening it used to push
+   the chain/tabs/sliders below it down the panel's own scroll area every time.
+   position:fixed + JS-computed left/top/width/maxHeight, same anchor-under-the-
+   button approach as .vmu-sel-list; z-index above the equalizer panel's own 500
+   (it has to float over it) but still well under VK's overlay system (1100), same
+   reasoning as .vmu-audiofx-panel's own z-index comment. */
 .vmu-fx-preset-browser {
-  margin: 8px 12px 0;
-  background: rgba(var(--vmu-ov),0.03);
+  /* display is NOT set here — content.js's open/closePresetBrowser toggle the
+     element's own inline style.display between '' and 'none' (same as the
+     template's initial style="display:none"); a display rule here would win
+     back over style.display = '' and the window could never open again. */
+  position: fixed;
+  z-index: 600;
+  box-sizing: border-box;
+  background: var(--vmu-panel-bg);
   border: 1px solid rgba(var(--vmu-ov),0.08);
-  border-radius: 8px;
+  border-radius: 10px;
+  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.35);
   padding: 8px;
 }
 .vmu-fx-preset-search {
@@ -3836,3 +3855,72 @@ html.vmu-theme-light .vmu-sx-note { color: #8a5d0a; }
   40%  { transform: translate(-50%, 0) scale(1.06); }
   100% { transform: translate(-50%, 0) scale(1); }
 }
+
+/* ── «Альбомы с диска»: пакетная заливка ─────────────────────────────────────
+   Shell, sections and buttons reuse the collector panel's classes
+   (.vmu-bulkops-panel / .vmu-plcollect-body / .vmu-plc-*); only the
+   album→tracks tree and the run-progress rows are new. */
+.vmu-bulkalb-panel { width: 460px; }
+.vmu-bulkalb-run { width: 420px; }
+.vmu-bulkalb-panel .vmu-pl-sort-dz { flex-wrap: wrap; }
+.vmu-bulkalb-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.vmu-bulkalb-tree:empty { display: none; }
+.vmu-bulkalb-album { border-radius: 7px; }
+.vmu-bulkalb-album + .vmu-bulkalb-album { margin-top: 2px; }
+.vmu-bulkalb-albumhead {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 7px;
+  border-radius: 7px;
+  cursor: default;
+  min-width: 0;
+}
+.vmu-bulkalb-albumhead:hover { background: rgba(var(--vmu-ov),0.05); }
+.vmu-bulkalb-albumhead input[type="checkbox"] { flex-shrink: 0; margin: 2px 0 0; accent-color: #2688eb; }
+.vmu-bulkalb-toggle {
+  flex-shrink: 0;
+  width: 16px;
+  padding: 0;
+  margin-top: 1px;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--vmu-text-hint-2);
+  cursor: pointer;
+}
+.vmu-bulkalb-toggle:hover { color: var(--vmu-text); }
+.vmu-bulkalb-src { color: var(--vmu-text-hint-2); font-size: 11px; }
+.vmu-bulkalb-tracks { display: none; flex-direction: column; gap: 1px; padding: 0 0 4px 30px; }
+.vmu-bulkalb-album[data-open="1"] .vmu-bulkalb-tracks { display: flex; }
+.vmu-bulkalb-track {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  min-width: 0;
+}
+.vmu-bulkalb-track:hover { background: rgba(var(--vmu-ov),0.05); }
+.vmu-bulkalb-track input[type="checkbox"] { flex-shrink: 0; margin: 2px 0 0; accent-color: #2688eb; }
+.vmu-bulkalb-runrow {
+  display: flex;
+  gap: 8px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  border-left: 2px solid transparent;
+  min-width: 0;
+}
+.vmu-bulkalb-runrow[data-current="1"] { background: rgba(38,136,235,0.10); border-left-color: #2688eb; }
+.vmu-bulkalb-runrow[data-stage="done"] .vmu-plmake-found { color: var(--vmu-text-dim); }
+.vmu-bulkalb-runrow[data-stage="failed"] .vmu-plmake-file { color: #e64646; }
+.vmu-bulkalb-panel.vmu-plmake-busy .vmu-bulkalb-tree { opacity: 0.6; pointer-events: none; }
