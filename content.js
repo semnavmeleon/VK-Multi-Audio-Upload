@@ -3442,7 +3442,8 @@
   // page can't be hit; VK marks the button with an audiolistitems-expandbutton
   // attribute, with its text as the fallback.
   async function revealPlaylistPageList() {
-    const scope = document.querySelector('[data-testid="MusicPlaylistPage_Tracks"], [data-testid="MusicPlaylistTracks_Items"]');
+    const scope = getPlaylistPageView()?.body
+      || document.querySelector('[data-testid="MusicPlaylistPage_Tracks"], [data-testid="MusicPlaylistTracks_Items"]');
     if (!scope) return false;
     const btn = scope.querySelector('[audiolistitems-expandbutton]')
       || [...scope.querySelectorAll('span, a, button, div')].find(el =>
@@ -3456,7 +3457,8 @@
   async function scanPlaylistTracksOnPage() {
     await waitForElement(VMU_MODAL_ROW_SEL, 8000); // null on timeout = legitimately empty playlist
     await revealPlaylistPageList();
-    const items = await expandPlaylistModal(null, null, document.body);
+    const view = getPlaylistPageView();
+    const items = await expandPlaylistModal(null, null, view?.body || view?.scope || document.body);
     // artist/title are what the original callers read. id/isBlocked/duration
     // are extras for the playlist collector: isBlocked already comes off each
     // row's stamp (expandPlaylistModal), and durations are read from those
@@ -3983,8 +3985,7 @@
   }
 
   // ─── duplicate finder ─────────────────────────────────────────────────────────
-  function getPlaylistInfoFromUrl() {
-    const url = location.href;
+  function getPlaylistInfoFromUrl(url = location.href) {
     // /music/playlist/-206614096_44  or  /music/playlist/-206614096_44_accesshash
     const m1 = url.match(/playlist\/([-\d]+)_(\d+)(?:_([a-zA-Z0-9_]+))?/);
     if (m1) return { ownerId: m1[1], playlistId: m1[2], accessHash: m1[3] || null };
@@ -3998,14 +3999,49 @@
     return null;
   }
 
+  function getPlaylistModalView(plInfo) {
+    for (const scope of document.querySelectorAll('[class*="vkitInternalModalBox"]')) {
+      if (!scope.checkVisibility()) continue;
+      const nativeHeader = scope.querySelector('[data-testid="MusicPlaylistModal_Header"], [class*="vkitAudioListBoxHeader__root"]');
+      const links = [...scope.querySelectorAll('a[href^="/music/playlist/"]')];
+      const titleLink = links.find(link => {
+        const id = link.pathname.match(/^\/music\/playlist\/(-?\d+)_(\d+)(?:_|\/|$)/);
+        return id && (!plInfo || (id[1] === String(plInfo.ownerId) && id[2] === String(plInfo.playlistId)));
+      });
+      if (!nativeHeader && !titleLink) continue;
+      let header = nativeHeader || titleLink;
+      if (!nativeHeader) while (header.parentElement !== scope) header = header.parentElement;
+      const title = header.querySelector('[data-testid="MusicPlaylistModal_Title"]') || titleLink;
+      const body = scope.querySelector('[data-testid="MusicPlaylistModal_Body"], [class*="vkitModalBody__container"]')
+        || [...scope.children].find(el => el !== header && el.querySelector('[data-audio-id], [data-testid$="MusicTrackRow"]'));
+      const oldGroup = header.querySelector('[class*="vkuiButtonGroup__stretch"]');
+      const playback = header.querySelector('button:has(svg:is([class~="vkuiIcon--play_24"], [class~="vkuiIcon--pause_24"]))');
+      const controls = oldGroup?.closest('[class*="vkuiFlex__host"]')
+        || playback?.closest('[role="group"]')?.parentElement?.parentElement || header;
+      return { scope, header, body, title, controls };
+    }
+    return null;
+  }
+
+  function getPlaylistPageView() {
+    if (!location.pathname.startsWith('/music/playlist/')) return null;
+    const scope = document.getElementById('spa_layout_content');
+    const title = scope?.querySelector('h1');
+    if (!title) return null;
+    const action = scope.querySelector('button:has(svg:is([class~="vkuiIcon--play_24"], [class~="vkuiIcon--pause_24"], [class~="vkuiIcon--pen_outline_24"]))');
+    const group = action?.closest('[role="group"]');
+    const controls = group?.parentElement?.closest('[role="group"]') || group;
+    const body = scope.querySelector('[data-audio-id]')?.closest('section');
+    return controls ? { scope, title, controls, body } : null;
+  }
+
   // Find the playlist container in DOM to scope track search
   function findPlaylistContainer(plInfo) {
     if (plInfo) {
       const plKey = `${plInfo.ownerId}_${plInfo.playlistId}`;
       // Playlist opened in a modal dialog
-      const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-        .find(m => m.getBoundingClientRect().width > 0);
-      if (modal) return modal;
+      const view = getPlaylistModalView(plInfo) || getPlaylistPageView();
+      if (view) return view.body || view.scope;
       // Old VK playlist container with matching class
       const oldPl = document.querySelector(`[class*="_audio_pl_${plKey}"]`);
       if (oldPl) return oldPl.closest('.audio_pl_snippet, .AudioPlaylistSnippet') || oldPl;
@@ -4030,6 +4066,13 @@
     for (const row of rows) {
       const fullId = row.dataset.fullId || row.dataset.audioId;
       if (!fullId || seen.has(fullId)) continue;
+      const stamped = getTrackDataFromRow(row);
+      if (stamped?.title) {
+        seen.add(fullId);
+        const [ownerId, id = fullId] = fullId.split('_');
+        tracks.push({ ...stamped, id, owner_id: ownerId, fullId });
+        continue;
+      }
 
       const titleEl = row.querySelector('.audio_title, .ai_title, [class*="audio_title"], [class*="AudioRow__title"]');
       const artistEl = row.querySelector('.audio_artist, .ai_artist, [class*="audio_artist"], [class*="AudioRow__artist"]');
@@ -5325,6 +5368,13 @@
       const n = parseInt((countEl.textContent || '').replace(/[\s ]/g, ''), 10);
       if (Number.isFinite(n) && n > 0) return n;
     }
+    for (const label of modal.querySelectorAll(':is([role="heading"], h2, h3) span')) {
+      if (label.textContent.trim() !== 'Треки') continue;
+      const number = [...label.parentElement.children]
+        .map(el => el.textContent.trim())
+        .find(text => /^\d[\d\s]*$/.test(text));
+      if (number) return Number(number.replace(/\s/g, ''));
+    }
     const text = (modal.textContent || '').slice(0, 4000);
     const m = text.match(/(\d[\d\s ]{0,6})\s*(?:трек(?:а|ов)?|записе?[йяи]|композици[йия])/i);
     if (!m) return null;
@@ -5337,8 +5387,7 @@
 
   // Finds the currently-open playlist popup, if any.
   function findOpenPlaylistModal() {
-    return [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-      .find(m => m.getBoundingClientRect().width > 0) || null;
+    return getPlaylistModalView()?.scope || null;
   }
 
   // Switches the popup from its collapsed preview (first handful of tracks)
@@ -5499,14 +5548,14 @@
       }
     }
 
-    const modalScroller = findModalScroller(modal);
-
     await harvest();
     const reportProgress = () => {
       if (!onProgress) return;
       try { onProgress(collected.size, declaredTotal); } catch {}
     };
     reportProgress();
+    if (declaredTotal && collected.size >= declaredTotal) return [...collected.values()];
+    const modalScroller = findModalScroller(modal);
 
     // Harvest loop. Fast path drives VK's fetch callback directly and only
     // waits for rows to actually land (poll, not fixed sleeps), so each
@@ -5703,10 +5752,12 @@
       // every row into VK's own DOM/React state, which the in-popup
       // highlight and the click-to-jump markers below both need — they can
       // only scroll to a row that actually exists.
+      const page = findOpenPlaylistModal() ? null : getPlaylistPageView();
+      if (page) await revealPlaylistPageList();
       let tracks = await expandPlaylistModal((loaded, total) => {
         if (total) report(`Раскрываем плейлист… ${loaded} / ${total}`, false, { loaded, total });
         else report(`Раскрываем плейлист… ${loaded}`);
-      }, isCancelled);
+      }, isCancelled, page?.body || page?.scope);
 
       const wasCancelled = isCancelled() && tracks.length > 0;
 
@@ -12485,9 +12536,9 @@
 
   // Single delegated listener — catches ANY click on ANY playlist card element
   document.addEventListener('click', e => {
-    const card = e.target.closest('[class*="_audio_pl_"]');
+    const card = e.target.closest?.('[data-testid="MusicPlaylistItem_Cell"], [class*="_audio_pl_"]');
     if (!card) return;
-    const m = card.className.match(/_audio_pl_([-\d]+_\d+)/);
+    const m = card.dataset.id?.match(/^(-?\d+_\d+)$/) || card.className.match(/_audio_pl_([-\d]+_\d+)/);
     if (!m) return;
     const parts = m[1].split('_');
     _pendingDupesPlaylist = { ownerId: parts[0], playlistId: parts[1] };
@@ -12691,33 +12742,6 @@
   const ICON_DUPES_SCAN = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3" width="10" height="10" rx="2"/><path d="M3 7a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2"/></svg>`;
   const ICON_DUPES_STOP = `<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`;
 
-  // sessionStorage key for the dupes-scan pre-reload → auto-resume flow.
-  // A first click on "Проверить на дубликаты" stores the target playlist
-  // here and reloads the page; on the next load, tryInjectDupesIntoEditDialog
-  // sees a matching entry and auto-clicks the freshly-injected button,
-  // which then finds the flag still present and runs the actual scan. This
-  // guarantees the scan runs against a freshly-mounted playlist modal
-  // instead of whatever stale DOM state accumulated since the page loaded
-  // (highlights from a prior scan, tracks uploaded during this session but
-  // not yet reflected in VK's popup, etc.).
-  const DUPES_SCAN_RESUME_KEY = 'vmu-dupes-scan-resume';
-  const DUPES_SCAN_RESUME_MAX_AGE_MS = 60_000;
-
-  function readDupesScanResume() {
-    try {
-      const raw = sessionStorage.getItem(DUPES_SCAN_RESUME_KEY);
-      if (!raw) return null;
-      const saved = JSON.parse(raw);
-      if (!saved || (Date.now() - (saved.ts || 0)) > DUPES_SCAN_RESUME_MAX_AGE_MS) {
-        sessionStorage.removeItem(DUPES_SCAN_RESUME_KEY);
-        return null;
-      }
-      return saved;
-    } catch {
-      return null;
-    }
-  }
-
   function makeDupesBtn(plInfo) {
     const btn = document.createElement('button');
     btn.className = 'vmu-dupes-dialog-btn';
@@ -12733,29 +12757,6 @@
         // collected so far instead of starting a new scan.
         cancelToken.cancelled = true;
         btn.disabled = true;
-        return;
-      }
-      const resume = readDupesScanResume();
-      const matches = resume
-        && resume.ownerId === (plInfo?.ownerId ?? null)
-        && resume.playlistId === (plInfo?.playlistId ?? null);
-      if (matches) {
-        // Second click after reload (either the auto-click below or the
-        // user retrying) — clear the flag and run the actual scan against
-        // this fresh DOM.
-        sessionStorage.removeItem(DUPES_SCAN_RESUME_KEY);
-      } else {
-        // First click — remember the target playlist, reload so the scan
-        // runs against fresh VK state, and let the auto-resume path below
-        // trigger the click again once the button is re-injected.
-        try {
-          sessionStorage.setItem(DUPES_SCAN_RESUME_KEY, JSON.stringify({
-            ownerId: plInfo?.ownerId ?? null,
-            playlistId: plInfo?.playlistId ?? null,
-            ts: Date.now(),
-          }));
-        } catch {}
-        location.reload();
         return;
       }
       cancelToken = { cancelled: false };
@@ -12789,123 +12790,53 @@
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
-      if (document.getElementById('vmu-dlp-strip')) return;
-      startDlSession(plInfo, mode);
+      startDlSession(plInfo, mode, btn);
     });
     return btn;
   }
 
-  function tryInjectDupesIntoEditDialog() {
-    // Prefer URL-derived info — it may contain accessHash from popup URL (?z=audio_playlist...)
+  function injectPlaylistViewActions() {
     const urlInfo = getPlaylistInfoFromUrl();
-    const plInfo = urlInfo || _pendingDupesPlaylist;
+    const modal = getPlaylistModalView();
+    const page = getPlaylistPageView();
+    const view = modal || page;
+    if (!view) return;
+    const plInfo = (modal && modal.title?.href && getPlaylistInfoFromUrl(modal.title.href)) || urlInfo || _pendingDupesPlaylist;
     if (!plInfo) return;
-
-    // Find the VISIBLE modal — React keeps multiple instances, only one has non-zero dimensions
-    const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-      .find(m => m.getBoundingClientRect().width > 0);
-    if (!modal) return;
-    if (modal.querySelector('input[type="text"]')) return;
-    if (modal.querySelector('[data-vmu-dupes-dialog]')) return;
-
-    // VK's playlist popup body has two rows of icon-only buttons rendered as
-    // vkuiButtonGroup__stretch inside a vkuiFlex__wrap container. The old code
-    // looked for a button with literal text "Слушать", which VK removed when
-    // they switched the play/follow/share/etc buttons to icon-only. Anchor on
-    // the structural class instead — works whether or not labels are present.
-    let anchorGroup = modal.querySelector('[class*="vkuiButtonGroup__stretch"]');
-    if (!anchorGroup) {
-      // Legacy fallback: look for the "Слушать" text button
-      const listenBtn = [...modal.querySelectorAll('button')]
-        .find(b => b.textContent.trim() === 'Слушать');
-      anchorGroup = listenBtn?.closest('[class*="vkuiButtonGroup"]') || null;
+    const key = plInfo.ownerId + "_" + plInfo.playlistId + "_" + (plInfo.accessHash || "");
+    const existing = view.scope.querySelector("[data-vmu-playlist-actions]");
+    if (existing?.dataset.vmuPlaylistActions === key) {
+      if (view.controls.nextElementSibling !== existing) view.controls.after(existing);
+      return;
     }
-    if (!anchorGroup) return;
+    existing?.remove();
 
-    // The flex wrapper that hosts all body-button rows — its presence just
-    // confirms we're looking at the right dialog (playlist view, not e.g.
-    // the plain edit form).
-    const flexParent = anchorGroup.closest('[class*="vkuiFlex__host"]')
-      || anchorGroup.parentElement?.parentElement;
-    if (!flexParent) return;
-
-    const newRow = document.createElement('div');
-    newRow.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;padding:8px 0 0;';
+    const newRow = document.createElement("div");
+    newRow.className = "vmu-playlist-actions";
+    newRow.dataset.vmuPlaylistActions = key;
     const dupesBtn = makeDupesBtn(plInfo);
     newRow.appendChild(dupesBtn);
     newRow.appendChild(makeDlDialogBtn(plInfo, 'individual'));
     newRow.appendChild(makeDlDialogBtn(plInfo, 'zip'));
 
-    // Auto-resume: if the user clicked "Проверить на дубликаты" just before
-    // this reload, and VK has restored the same playlist modal via its
-    // hashed URL, click the freshly-injected button once so the scan runs
-    // without a second manual click. makeDupesBtn's own click handler sees
-    // the still-present sessionStorage flag and treats this as the actual
-    // scan (not another reload) — see readDupesScanResume above.
-    const resume = readDupesScanResume();
-    if (resume
-        && resume.ownerId === (plInfo?.ownerId ?? null)
-        && resume.playlistId === (plInfo?.playlistId ?? null)) {
-      setTimeout(() => {
-        if (document.body.contains(dupesBtn)) dupesBtn.click();
-      }, 300);
-    }
-
-    // Appending inside flexParent used to be enough to have the row sit below
-    // VK's own buttons, but VK's header (MusicPlaylistModal_Header, was
-    // vkitAudioListBoxHeader__root) now has a fixed height + overflow:hidden
-    // — sized for exactly VK's own rows, so a 3rd row appended inside it gets
-    // silently clipped and never shows up. Insert it as a sibling right after
-    // the header instead (same header/body split dlpInit's progress strip
-    // already relies on), landing it in the unclipped body area below.
-    const headerEl = modal.querySelector('[data-testid="MusicPlaylistModal_Header"]');
-    if (headerEl && headerEl.parentNode) {
-      headerEl.insertAdjacentElement('afterend', newRow);
-      // Measured BEFORE insertion (inserting a sibling after headerEl doesn't
-      // move headerEl/flexParent, only pushes the body down):
-      // Vertical — headerEl reserves ~40-50px of its own bottom padding below
-      // the native button row (for its own now-empty layout slot), so
-      // appending after the whole header leaves a big dead gap before our
-      // row. Pull newRow up by that exact gap so it sits flush under the
-      // native buttons — its own 8px top padding then reads as a normal row
-      // gap instead of a stray empty band.
-      // Horizontal — headerEl spans the album art + the text/button column,
-      // but flexParent (the native button row, both icon subgroups) only
-      // covers the text/button column further right. A full-width newRow
-      // therefore starts under the album art, not under the buttons. Match
-      // flexParent's left offset and width so it lines up with the buttons
-      // above it instead of the artwork.
-      const headerRect = headerEl.getBoundingClientRect();
-      const flexRect = flexParent.getBoundingClientRect();
-      const gap = headerRect.bottom - flexRect.bottom;
-      if (gap > 8) newRow.style.marginTop = `-${Math.round(gap)}px`;
-      newRow.style.marginLeft = `${Math.round(flexRect.left - headerRect.left)}px`;
-      newRow.style.width = `${Math.round(flexRect.width)}px`;
-    } else {
-      flexParent.appendChild(newRow);
-    }
+    view.controls.after(newRow);
   }
 
   // ─── playlist download feature ────────────────────────────────────────────────
 
 
   // ─── Embedded download progress (no backdrop) ────────────────────────────────
-  // The progress strip is injected into the visible playlist modal between its
-  // header and body. If no modal is open, falls back to a fixed floating bar.
-  // Per-track status is shown as a badge inside the row's right-side slot.
+  // Keep progress in the playlist window, below its header and above its content.
   let _dlpStrip = null;
+  let _dlpCloseTimer = null;
 
-  function startDlSession(plInfo, mode) {
-    dlpInit(mode);
+  function startDlSession(plInfo, mode, button) {
+    if (_dlpStrip?.isConnected && !_dlpStrip.matches('.vmu-dlp-done, .vmu-dlp-error-state')) return;
+    dlpInit(mode, button);
     runPlaylistDownload(plInfo, mode);
   }
 
-  function getActiveModal() {
-    return [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-      .find(m => m.getBoundingClientRect().width > 0) || null;
-  }
-
-  function dlpInit(mode) {
+  function dlpInit(mode, button) {
     dlpClose();
     const strip = document.createElement('div');
     strip.id = 'vmu-dlp-strip';
@@ -12919,23 +12850,20 @@
       </div>
       <div class="vmu-dlp-barwrap"><div class="vmu-dlp-bar" style="width:0%"></div></div>
       <div class="vmu-dlp-error" style="display:none"></div>`;
-    const modal = getActiveModal();
+    const modal = button.closest('[class*="vkitInternalModalBox"], [role="dialog"]');
+    const page = modal ? null : getPlaylistPageView();
     if (modal) {
-      // Insert between header and body. VK renamed both again: the header's
-      // class lost the vkitAudioListBoxHeader__root semantic name (now a bare
-      // hash), but it kept a context testid (MusicPlaylistModal_Header) with
-      // MusicPlaylistModal_Body as its sibling — same relationship the old
-      // class pair described, just moved from class to data-testid.
-      const header = modal.querySelector('[data-testid="MusicPlaylistModal_Header"], [class*="vkitAudioListBoxHeader__root"]');
-      const body = modal.querySelector('[data-testid="MusicPlaylistModal_Body"], [class*="vkitModalBody__container"]');
-      if (header && body && header.parentNode === body.parentNode) {
-        body.parentNode.insertBefore(strip, body);
-      } else {
-        modal.appendChild(strip);
-      }
+      const view = getPlaylistModalView();
+      let header = view?.scope === modal ? view.header : button;
+      while (header.parentElement !== modal) header = header.parentElement;
+      header.after(strip);
+      strip.classList.add('vmu-dlp-in-modal');
+    } else if (page) {
+      if (page.body) page.body.before(strip);
+      else page.scope.prepend(strip);
       strip.classList.add('vmu-dlp-in-modal');
     } else {
-      strip.classList.add('vmu-dlp-floating');
+      strip.classList.add("vmu-dlp-floating");
       document.body.appendChild(strip);
     }
     strip.querySelector('.vmu-dlp-stop').onclick = () => {
@@ -12947,6 +12875,8 @@
   }
 
   function dlpClose() {
+    clearTimeout(_dlpCloseTimer);
+    _dlpCloseTimer = null;
     document.getElementById('vmu-dlp-strip')?.remove();
     // Also clear any per-row badges
     document.querySelectorAll('.vmu-row-status').forEach(n => n.remove());
@@ -12973,10 +12903,17 @@
   }
 
   function dlSetFinished(ok) {
-    if (!_dlpStrip) return;
-    _dlpStrip.classList.add(ok ? 'vmu-dlp-done' : 'vmu-dlp-error-state');
-    const stop = _dlpStrip.querySelector('.vmu-dlp-stop');
+    const strip = _dlpStrip;
+    if (!strip) return;
+    strip.classList.add(ok ? 'vmu-dlp-done' : 'vmu-dlp-error-state');
+    const stop = strip.querySelector('.vmu-dlp-stop');
     if (stop) { stop.textContent = 'Закрыть'; stop.disabled = false; stop.onclick = dlpClose; }
+    clearTimeout(_dlpCloseTimer);
+    if (ok) {
+      _dlpCloseTimer = setTimeout(() => {
+        if (_dlpStrip === strip) dlpClose();
+      }, 1600);
+    }
   }
 
   // Per-track row badges removed — progress is now communicated only through
@@ -13000,8 +12937,11 @@
   function sendDlMsg(url, filename) {
     return new Promise(resolve => {
       try {
-        chrome.runtime.sendMessage({ type: 'VKD_DOWNLOAD', url, filename }, res => resolve(res));
-      } catch { resolve({ ok: false }); }
+        chrome.runtime.sendMessage({ type: 'VKD_DOWNLOAD', url, filename }, res => {
+          const error = chrome.runtime.lastError?.message;
+          resolve(error ? { ok: false, error } : res);
+        });
+      } catch (err) { resolve({ ok: false, error: err.message }); }
     });
   }
 
@@ -13212,11 +13152,17 @@
         await scrollToCollect();
       }
 
-      if (dlCancelFlag) { dlSetPhase('Отменено'); return; }
+      if (dlCancelFlag) {
+        dlSetPhase('Отменено');
+        dlSetFinished(false);
+        return;
+      }
 
       // ALWAYS extract from popup DOM via React fiber (runs in page context via injected.js)
       dlSetPhase('Читаем треки из попапа…');
 
+      const page = findOpenPlaylistModal() ? null : getPlaylistPageView();
+      if (page) await revealPlaylistPageList();
       await expandPlaylistModal((loaded, total) => {
         if (total) {
           dlSetPhase(`Раскрываем плейлист… ${loaded} / ${total}`);
@@ -13224,7 +13170,7 @@
         } else {
           dlSetPhase(`Раскрываем плейлист… ${loaded}`);
         }
-      });
+      }, () => dlCancelFlag, page?.body || page?.scope);
 
       // Extract via page context (injected.js can read React fiber, content.js cannot)
       // Fiber extraction is authoritative — it reads only tracks visible in the playlist popup
@@ -13323,6 +13269,9 @@
         } catch (e) { res = { ok: false, error: e.message }; }
 
         console.log('[vmu] dl', i + 1, res?.ok ? 'OK' : ('ERR: ' + res?.error), isHls ? 'HLS' : 'direct');
+        if (wantBuffer && res?.ok && !bytes?.byteLength) {
+          res = { ok: false, error: 'Получен пустой аудиофайл' };
+        }
         if (res?.ok) {
           done++;
           if (wantBuffer && bytes) zipFiles.push({ name: fn + '.' + ext, data: new Uint8Array(bytes) });
@@ -13352,7 +13301,13 @@
         const zipBlob = vmuZipBuild(zipFiles);
         const blobUrl = URL.createObjectURL(zipBlob);
         const zipRes = await sendDlMsg(blobUrl, playlistName + '.zip');
-        if (!zipRes?.ok) errors++;
+        if (!zipRes?.ok) {
+          URL.revokeObjectURL(blobUrl);
+          dlSetPhase('Не удалось скачать ZIP');
+          dlSetError(zipRes?.error || 'Chrome не подтвердил скачивание архива.');
+          dlSetFinished(false);
+          return;
+        }
       }
 
       dlSetPhase(dlCancelFlag
@@ -13367,13 +13322,8 @@
   }
 
   function getPlaylistTitle() {
-    const modal = getActiveModal();
-    if (!modal) return null;
-    // vkitAudioListBoxHeader__info's class is hashed away now; VK gives the
-    // title itself a stable testid instead, so read it directly rather than
-    // hunting for an <a> or a TextClamp-classed span inside the info block.
-    const title = modal.querySelector('[data-testid="MusicPlaylistModal_Title"], [class*="vkitAudioListBoxHeader__info"] a, [class*="vkitAudioListBoxHeader__info"] [class*="TextClamp"]');
-    return title?.textContent?.trim() || null;
+    const view = getPlaylistModalView() || getPlaylistPageView();
+    return view?.title?.textContent?.trim() || null;
   }
 
   // ─── Single-track download on hover ──────────────────────────────────────────
@@ -15373,7 +15323,6 @@
     list.parentElement.insertBefore(row, list);
   }
 
-  let _dupesDialogTimer = null;
   // ─── SPA watcher + dialog watcher ────────────────────────────────────────────
   let lastHref = location.href;
 
@@ -15762,15 +15711,17 @@
       const title = open?.firstElementChild || open;
       if (title) vmuStamp(title, 'MusicPlaylistItem_Title');
     }
-    // A playlist's own page: the action openPlaylistPageEditButton waits for
-    // when the playlist has no cell mounted on the page we're standing on.
-    if (location.pathname.includes('/music/playlist/')
-      && !document.querySelector('[data-testid="Action_Edit"]')) {
-      for (const b of document.querySelectorAll('button, [role="button"]')) {
-        if (vmuInOverlay(b)) continue;
-        if (/^Редактировать/i.test(vmuLabel(b))) { vmuStamp(b, 'Action_Edit'); break; }
-      }
-    }
+  }
+
+  function vmuStampPlaylistPageEditAction() {
+    if (!location.pathname.startsWith('/music/playlist/') ||
+        document.querySelector('#spa_layout_content [data-testid="Action_Edit"]')) return;
+    const controls = getPlaylistPageView()?.controls;
+    if (!controls) return;
+    const edit = controls.querySelector('button:has(svg[class~="vkuiIcon--pen_outline_24"])')
+      || [...controls.querySelectorAll('button, [role="button"]')]
+        .find(button => /^Редактировать(?: плейлист)?$/i.test(vmuLabel(button)));
+    if (edit) vmuStamp(edit, 'Action_Edit');
   }
 
   function vmuStampFriendsMusicSection() {
@@ -15790,6 +15741,7 @@
     if (!force && now - _vmuStampAt < 60) return;
     _vmuStampAt = now;
     if (settings.hideFriendsMusic) vmuStampFriendsMusicSection();
+    vmuStampPlaylistPageEditAction();
     // A build that still marks its own music UI: leave the page alone (asking
     // for VK's own ids, not just any — another extension's data-testid must not
     // look like VK's). Which build this is cannot change while the page is
@@ -15829,6 +15781,7 @@
   // page check can tell a reloaded extension from a stale one
   document.documentElement.setAttribute('data-vmu-build', '2026-11-26-puerrito-catalog');
   injectPlaylistCollectButton();
+  injectPlaylistViewActions();
 
   function onPageMutated() {
     restoreVkTestIds(true);
@@ -15881,10 +15834,7 @@
       injectClearIntoNativeFooter(box.querySelector('[data-testid="modalfooter"], [class*="vkitModalFooter"]'));
     }
 
-    // Inject download buttons on music/playlist pages
-    // Inject dupes button into playlist edit dialog (debounced)
-    clearTimeout(_dupesDialogTimer);
-    _dupesDialogTimer = setTimeout(tryInjectDupesIntoEditDialog, 300);
+    injectPlaylistViewActions();
 
     injectPlaylistCollectButton();
     if (hasAudio) {

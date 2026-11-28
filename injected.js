@@ -2241,8 +2241,10 @@
     const seen = new Set();
 
     const modal = [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
-      .find(m => m.getBoundingClientRect().width > 0);
-    const container = modal || document;
+      .find(m => m.checkVisibility() && m.querySelector('[data-vmu-playlist-actions], [data-testid="MusicPlaylistModal_Header"], a[href^="/music/playlist/"]'));
+    const pageTracks = location.pathname.startsWith('/music/playlist/')
+      ? document.querySelector('#spa_layout_content [data-audio-id]')?.closest('section') : null;
+    const container = modal || pageTracks || document;
     const rows = container.querySelectorAll('[data-testid$="MusicTrackRow"], [class*="vkitAudioRow__root"], .AudioRow, [data-full-id]');
 
     for (const row of rows) {
@@ -3120,6 +3122,23 @@
     const wanted = String(playlistId);
     const owner = ownerId == null || ownerId === '' ? null : String(ownerId);
     const sameOwner = o => owner === null || o === owner;
+    const matchesPlaylist = path => {
+      const match = path.match(/^\/music\/playlist\/(-?\d+)_(\d+)(?:_|\/|$)/);
+      return match && match[2] === wanted && sameOwner(match[1]);
+    };
+    for (const modal of document.querySelectorAll('[class*="vkitInternalModalBox"]')) {
+      if (!modal.checkVisibility()) continue;
+      const link = [...modal.querySelectorAll('a[href^="/music/playlist/"]')].find(a => matchesPlaylist(a.pathname));
+      if (!link) continue;
+      let header = link;
+      while (header.parentElement !== modal) header = header.parentElement;
+      const edit = header.querySelector('button:has(svg[class~="vkuiIcon--pen_outline_24"])');
+      if (edit) return edit;
+    }
+    if (matchesPlaylist(location.pathname)) {
+      const edit = document.querySelector('#spa_layout_content [data-testid="Action_Edit"]');
+      if (edit) return edit;
+    }
     for (const cell of document.querySelectorAll('[data-testid="MusicPlaylistItem_Cell"][data-id], .audio_pl_item[data-id], .audio_pl[data-id]')) {
       const m = (cell.getAttribute('data-id') || '').match(/^(-?\d+)_(\d+)$/);
       if (!m || m[2] !== wanted || !sameOwner(m[1])) continue;
@@ -3145,7 +3164,10 @@
   async function openPlaylistPageEditButton(ownerId, playlistId) {
     if (ownerId == null || ownerId === '') return null;
     const path = `/music/playlist/${ownerId}_${playlistId}`;
-    const onTarget = () => location.pathname.replace(/\/$/, '') === path;
+    const onTarget = () => {
+      const current = location.pathname.replace(/\/$/, '');
+      return current === path || current.startsWith(path + '_');
+    };
     const selector = '[data-testid="Action_Edit"]';
     const previousButton = onTarget() ? null : document.querySelector(selector);
     if (!onTarget()) {

@@ -889,15 +889,19 @@ html.vmu-theme-light {
 
 /* ── Buttons injected into VK playlist popup — styled to match VK native ──── */
 /* Computed from VK's own vkuiButton__appearanceOverlay: bg #fff, color #000, radius 8px */
+.vmu-playlist-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0 0;
+}
+
 .vmu-dupes-dialog-btn,
 .vmu-dl-dialog-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  /* The row's container now matches the native button row's own width
-     (set from flexParent in content.js, not the full modal-body width like
-     before), so stretching to fill it lines up with how VK stretches its
-     own button subgroups instead of ballooning past them. */
+  /* Match how VK stretches the buttons in the row above. */
   flex: 1;
   min-width: 0;
   height: 32px;
@@ -1031,6 +1035,11 @@ html.vmu-theme-light {
   box-shadow: 0 6px 24px rgba(0,0,0,0.45);
   border: 1px solid rgba(var(--vmu-ov),0.08);
   background: var(--vmu-panel-bg-solid2);
+}
+.vmu-dlp-in-modal {
+  box-sizing: border-box;
+  flex: none;
+  width: 100%;
 }
 .vmu-dlp-strip.vmu-dlp-done { color: var(--vmu-text-2); }
 .vmu-dlp-strip.vmu-dlp-error-state { color: var(--vmu-text-2); }
