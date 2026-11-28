@@ -63,6 +63,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  if (msg.type === 'VMU_PUERRITO_READ_COVER') {
+    readPuerritoCdnCover(msg.url, sender.url)
+      .then(sendResponse)
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
   if (msg.type === 'VKD_SCAN_PLAYLISTS') {
     scanPlaylistsInHiddenTab(msg.url, sender.tab?.windowId)
       .then(sendResponse)
@@ -78,6 +85,95 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   return false;
+});
+
+// One broker connection per background VK tab. The catalog tab runs its own queue.
+const puerritoWorkers = new Map();
+chrome.runtime.onConnect.addListener(coordinator => {
+  if (coordinator.name !== 'vmu-puerrito-queue') return;
+  const parent = coordinator.sender?.tab;
+  const origin = /^https:\/\/(?:vk\.com|vk\.ru)(?=\/|$)/.exec(coordinator.sender?.url || '')?.[0];
+  if (parent?.id == null || !origin) {
+    coordinator.disconnect();
+    return;
+  }
+
+  let tabId;
+  let worker;
+  let started = false;
+  let finished = false;
+  const releaseTab = () => {
+    if (tabId == null) return;
+    const id = tabId;
+    tabId = null;
+    void chrome.tabs.remove(id).catch(() => {});
+  };
+  const finish = result => {
+    if (finished) return;
+    finished = true;
+    if (started) {
+      const workers = puerritoWorkers.get(parent.id);
+      workers?.delete(coordinator);
+      if (workers?.size === 0) puerritoWorkers.delete(parent.id);
+    }
+    if (result) {
+      try { coordinator.postMessage({ type: 'done', ...result }); } catch {}
+    }
+    try { worker?.disconnect(); } catch {}
+    releaseTab();
+  };
+
+  coordinator.onDisconnect.addListener(() => finish());
+  coordinator.onMessage.addListener(async message => {
+    if (finished) return;
+    if (message.type === 'stop') {
+      if (worker) {
+        try { worker.postMessage({ type: 'stop' }); }
+        catch (err) { finish({ error: err.message }); }
+      } else {
+        finish({ stopped: true, processed: 0 });
+      }
+      return;
+    }
+    if (message.type !== 'start' || started) return;
+    const { playlists } = message;
+    const workers = puerritoWorkers.get(parent.id) || new Set();
+    if (workers.size >= 3 || !Array.isArray(playlists) || !playlists.length ||
+      playlists.some(p => !/^-?\d+_\d+$/.test(p?.id) || typeof p.title !== 'string')) {
+      finish({ error: 'Не удалось назначить очередь фоновой вкладке' });
+      return;
+    }
+    started = true;
+    workers.add(coordinator);
+    puerritoWorkers.set(parent.id, workers);
+    try {
+      const tab = await chrome.tabs.create({
+        windowId: parent.windowId, active: false, url: coordinator.sender.url,
+      });
+      tabId = tab.id;
+      if (finished) { releaseTab(); return; }
+      await waitForTabComplete(tabId, 20000);
+      if (finished) return;
+      await sendMessageWithRetry(tabId, { type: 'VMU_PUERRITO_READY' }, 10000);
+      if (finished) return;
+      worker = chrome.tabs.connect(tabId, { name: 'vmu-puerrito-worker', frameId: 0 });
+      worker.onDisconnect.addListener(() => {
+        const error = chrome.runtime.lastError?.message;
+        if (!finished) finish({ error: error || 'Фоновая вкладка закрылась или перезагрузилась' });
+      });
+      worker.onMessage.addListener(event => {
+        if (finished) return;
+        if (event.type === 'done') {
+          finish(event);
+        } else if (event.type === 'progress' || event.type === 'result') {
+          try { coordinator.postMessage(event); } catch { finish(); }
+        }
+      });
+      worker.postMessage({ type: 'start', playlists });
+    } catch (err) {
+      finish({ error: err.message });
+    }
+  });
 });
 
 // ─── SoundCloud resolving ──────────────────────────────────────────────────
@@ -497,12 +593,16 @@ async function geniusAlbumTracks(albumId, albumUrl, originalWindowId) {
 // restrictions. Returned as a data: URL (base64 string) rather than the raw
 // ArrayBuffer since that's guaranteed to survive chrome.runtime.sendMessage
 // without relying on structured-clone support for binary payloads.
-async function fetchImageAsDataUrl(url) {
+async function fetchImageAsDataUrl(url, imageOnly = false) {
   if (!url) return { ok: false, error: 'пустой URL' };
-  const res = await fetch(url, { credentials: 'omit' });
+  const options = { credentials: 'omit' };
+  if (imageOnly) Object.assign(options, { redirect: 'error', signal: AbortSignal.timeout(7000) });
+  const res = await fetch(url, options);
   if (!res.ok) return { ok: false, error: 'HTTP ' + res.status };
-  const buf = await res.arrayBuffer();
   const mime = res.headers.get('content-type') || 'image/jpeg';
+  if (imageOnly && !res.headers.get('content-type')?.startsWith('image/')) return { ok: false };
+  const buf = await res.arrayBuffer();
+  if (imageOnly && buf.byteLength > 5 * 1024 * 1024) return { ok: false };
   const bytes = new Uint8Array(buf);
   let binary = '';
   const chunk = 0x8000;
@@ -510,4 +610,14 @@ async function fetchImageAsDataUrl(url) {
     binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
   }
   return { ok: true, dataUrl: `data:${mime};base64,${btoa(binary)}` };
+}
+
+async function readPuerritoCdnCover(url, source) {
+  const page = new URL(source);
+  const image = new URL(url);
+  if (page.protocol !== 'https:' || !['vk.com', 'vk.ru'].includes(page.hostname) ||
+      image.protocol !== 'https:' || !/(^|\.)(userapi\.com|vkuserphoto\.ru)$/.test(image.hostname)) {
+    return { ok: false };
+  }
+  return fetchImageAsDataUrl(image.href, true);
 }

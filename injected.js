@@ -206,6 +206,7 @@
   // unmounts). The user-facing close must therefore drop the hold-open flag
   // AND tear down the popup ourselves.
   function getAudioUploadBox() {
+    if (__vmuTrackedUploadBox?.isConnected) return { box: __vmuTrackedUploadBox, isNew: !__vmuTrackedUploadBox.matches('.audio_add_box') };
     // Protected zombie modal (React closed it but we kept the DOM alive)
     const zombie = document.querySelector('[class*="vkitInternalModalBox"][data-vmu-protected]');
     if (zombie) return { box: zombie, isNew: true };
@@ -228,12 +229,13 @@
     if (!found) return;
     const { box, isNew } = found;
 
-    const isXIcon = !!t.closest('.box_x_button, ._box_x_button, .popup_box_close, [class*="popup_box_close"], [class*="DismissButton"]');
+    const isXIcon = !!t.closest('[data-testid="modal-close-button"], .box_x_button, ._box_x_button, .popup_box_close, [class*="popup_box_close"], [class*="DismissButton"]');
     const closeBtn = t.closest('button, div[role="button"]');
     const isCloseBtn = closeBtn && /^\s*Закрыть\s*$/.test(closeBtn.textContent || '');
 
     if (isXIcon || isCloseBtn) {
-      if (__vmuBlockAudioBoxHide) {
+      if (__vmuTrackedUploadBox && !box.contains(t)) return;
+      if (__vmuBlockAudioBoxHide && !__vmuTrackedUploadBox) {
         // Queue is still working (or waiting on the end-of-batch reload) —
         // closing now would orphan the batch and skip the reload that's
         // supposed to make the 2nd+ files show up. Swallow the click.
@@ -374,6 +376,7 @@
   // still has files to upload; while it's true, any hide call against a popup
   // that contains .audio_add_box becomes a no-op.
   let __vmuBlockAudioBoxHide = false;
+  let __vmuTrackedUploadBox = null;
   Object.defineProperty(window, '__vmuFlag', {
     get() { return __vmuBlockAudioBoxHide; },
     configurable: true,
@@ -389,6 +392,12 @@
   const __origReplaceChild = Node.prototype.replaceChild;
   function __markZombie(node) {
     if (!(node instanceof Element)) return false;
+    if (__vmuTrackedUploadBox) {
+      if (!node.contains(__vmuTrackedUploadBox)) return false;
+      node.dataset.vmuProtected = '1';
+      __vmuTrackedUploadBox.dataset.vmuProtected = '1';
+      return true;
+    }
     // #vmu-embedded is inserted as a plain DOM sibling of VK's own
     // React-rendered header/footer inside the modal box (see
     // injectIntoVkDialog in content.js) — it's invisible to React's vdom.
@@ -452,7 +461,11 @@
   function __vmuSetBlockFlag(on) {
     __vmuBlockAudioBoxHide = !!on;
     if (__vmuBlockAudioBoxHide) __vmuZombieGuard.observe(document.documentElement, { childList: true, subtree: true });
-    else __vmuZombieGuard.disconnect();
+    else {
+      __vmuZombieGuard.disconnect();
+      __vmuTrackedUploadBox?.removeAttribute('data-vmu-tracked-upload');
+      __vmuTrackedUploadBox = null;
+    }
   }
 
   function boxHasAudioAddBox(box) {
@@ -528,6 +541,7 @@
     const layers = [];
     // New VK: prefer protected zombie (no width/input check needed), then live modal
     const newBox =
+      __vmuTrackedUploadBox ||
       document.querySelector('[class*="vkitInternalModalBox"][data-vmu-protected]') ||
       [...document.querySelectorAll('[class*="vkitInternalModalBox"]')]
         .find(m => m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
@@ -598,6 +612,12 @@
     if (e.source !== window || !e.data) return;
     if (e.data.type === 'VMU_BLOCK_AUDIO_HIDE') {
       const wasBlocking = __vmuBlockAudioBoxHide;
+      if (!e.data.block && e.data.batchId && __vmuTrackedUploadBox?.dataset.vmuTrackedUpload !== e.data.batchId) return;
+      if (e.data.block && e.data.batchId) {
+        __vmuTrackedUploadBox = [...document.querySelectorAll('[data-vmu-tracked-upload]')]
+          .find(box => box.dataset.vmuTrackedUpload === e.data.batchId) || null;
+        if (!__vmuTrackedUploadBox) return;
+      }
       __vmuSetBlockFlag(e.data.block);
       if (__vmuBlockAudioBoxHide) {
         // entering "hold open" — re-arm in case VK started fading already
@@ -650,6 +670,64 @@
   // response below, and VK processes a batch's commits one at a time even
   // when uploads are inflight together.
   const __vmuPendingUploads = [];
+  const uploadTracksByFile = new WeakMap();
+  let namedUploadTracks = new Map();
+  let uploadTracksById = new Map();
+  const pendingAudioSaves = new Map();
+  const earlyAudioSaves = new Map();
+
+  function audioSaveHash(body) {
+    if (body instanceof FormData || body instanceof URLSearchParams) return body.get('hash');
+    if (typeof body !== 'string') return null;
+    try { return JSON.parse(body)?.hash; } catch {}
+    return new URLSearchParams(body).get('hash');
+  }
+
+  function uploadTrack(file) {
+    return file && (uploadTracksByFile.get(file) || namedUploadTracks.get(`${file.name}\0${file.size}`));
+  }
+
+  function finishUploadTransfer(track) {
+    if (!track || track.phase === 'cancelled') return;
+    track.phase = 'transferred';
+    track.abort = null;
+  }
+
+  function rememberAudioSave(map, hash, value) {
+    map.set(hash, value);
+    setTimeout(() => { if (map.get(hash) === value) map.delete(hash); }, 120_000);
+  }
+
+  function reportAudioSave(hash, outcome) {
+    if (!hash || typeof hash !== 'string') return;
+    const pending = pendingAudioSaves.get(hash);
+    if (!pending) {
+      rememberAudioSave(earlyAudioSaves, hash, outcome);
+      return;
+    }
+    pendingAudioSaves.delete(hash);
+    window.postMessage({ type: 'VK_UPLOAD_DONE', ...pending, ...outcome }, '*');
+  }
+
+  function observeAudioSave(body, responseText, status) {
+    let response;
+    try { response = JSON.parse(responseText); } catch {}
+    const error = response?.error;
+    const hash = audioSaveHash(body) || error?.request_params?.find?.(entry => entry.key === 'hash')?.value;
+    const errorCode = error?.error_code;
+    if (error || status >= 400) {
+      reportAudioSave(hash, { error: true, errorCode, errorMsg: error?.error_msg || `ВК вернул HTTP ${status}` });
+    } else if (response?.response != null) {
+      reportAudioSave(hash, { confirmed: true });
+    }
+  }
+
+  function isAudioSaveUrl(url) {
+    try {
+      const parsed = new URL(url, location.href);
+      return /^(?:[\w-]+\.)*api\.vk\.(ru|com)$/.test(parsed.hostname) && parsed.pathname === '/method/audio.save';
+    } catch { return false; }
+  }
   function emitDoneFromDoneAdd(text) {
     if (!__vmuPendingUploads.length) return false;
     const pending = __vmuPendingUploads.shift();
@@ -660,11 +738,11 @@
       code = d?.payload?.[0];
       errArr = d?.payload?.[1];
     } catch {
-      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: 'Ошибка ответа done_add', fileName: pending.fileName }, '*');
+      window.postMessage({ type: 'VK_UPLOAD_DONE', fileName: pending.fileName, trackId: pending.trackId }, '*');
       return true;
     }
     if (code === 0 || code === '0') {
-      window.postMessage({ type: 'VK_UPLOAD_DONE', response: text, fileName: pending.fileName }, '*');
+      window.postMessage({ type: 'VK_UPLOAD_DONE', confirmed: true, response: text, fileName: pending.fileName, trackId: pending.trackId }, '*');
     } else {
       let msg = 'Ошибка загрузки';
       if (Array.isArray(errArr) && errArr[0]) {
@@ -674,11 +752,11 @@
         msg = raw.replace(/<br\s*\/?>/gi, ' ').replace(/\\"/g, '"').trim() || msg;
       }
       console.log('[VMU UPLOAD] done_add error code=', code, 'msg=', msg);
-      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: code, fileName: pending.fileName }, '*');
+      window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: code, fileName: pending.fileName, trackId: pending.trackId }, '*');
     }
     return true;
   }
-  function deferUploadDone(uploadResponseText, fileName) {
+  function deferUploadDone(uploadResponseText, fileName, trackId) {
     // New VK v2 API path: upload server replies with {"redirect":"vk.com/audio.php?act=done_add&audio={...}"}
     // The frontend never re-fetches that URL via XHR/fetch — VK uses navigation
     // (form/sendBeacon) for it, so the al_audio.php hook below never fires.
@@ -689,9 +767,10 @@
       // Detect VK rate-limit / size / quality errors that come back at the
       // upload-server stage with no "redirect" field.
       if (r && (r.error_code != null || r.error != null) && !r.redirect) {
-        const msg = r.error_msg || r.error || ('VK error ' + r.error_code);
+        const code = r.error_code ?? r.error?.error_code;
+        const msg = r.error_msg || r.error?.error_msg || (typeof r.error === 'string' ? r.error : '') || `Ошибка ВК${code == null ? '' : ' (' + code + ')'}`;
         trace('[VMU UPLOAD] upload-server error: ' + msg);
-        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: r.error_code, fileName }, '*');
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: msg, errorCode: code, fileName, trackId }, '*');
         return;
       }
       if (r && typeof r.redirect === 'string' && r.redirect.includes('done_add')) {
@@ -716,6 +795,18 @@
         } catch {}
         const weDrove = !!window.__vmuOurUpload;
         window.__vmuOurUpload = false;
+        if (!weDrove && trackId) {
+          window.postMessage({ type: 'VK_UPLOAD_SAVING', fileName, trackId }, '*');
+          if (r.hash && typeof r.hash === 'string') {
+            rememberAudioSave(pendingAudioSaves, r.hash, { fileName, trackId });
+            if (earlyAudioSaves.has(r.hash)) {
+              const outcome = earlyAudioSaves.get(r.hash);
+              earlyAudioSaves.delete(r.hash);
+              reportAudioSave(r.hash, outcome);
+            }
+          }
+          return;
+        }
         if (weDrove) {
           trace('[VMU UPLOAD] v2 upload ok sha=' + sha + ' — following redirect to commit');
           // Normalise //vk.com/... shape and follow with cookies so the server
@@ -742,13 +833,13 @@
       }
     } catch {}
     // Legacy VK path: wait for al_audio.php?act=done_add XHR
-    const pending = { response: uploadResponseText, fileName, timer: null };
+    const pending = { response: uploadResponseText, fileName, trackId, timer: null };
     pending.timer = setTimeout(() => {
       const idx = __vmuPendingUploads.indexOf(pending);
       if (idx === -1) return;
       console.log('[VMU UPLOAD] done_add timeout — flushing raw upload response for', fileName);
       __vmuPendingUploads.splice(idx, 1);
-      window.postMessage({ type: 'VK_UPLOAD_DONE', response: pending.response, fileName: pending.fileName }, '*');
+      window.postMessage({ type: 'VK_UPLOAD_DONE', response: pending.response, fileName: pending.fileName, trackId }, '*');
     }, 8000);
     __vmuPendingUploads.push(pending);
   }
@@ -779,6 +870,7 @@
   // sat on "uploading…" until the 90s timeout in content.js gave up — kept
   // the old hosts too in case VK serves either depending on region/rollout.
   function isVkUploadUrl(url, body) {
+    if (/^https:\/\/pu\.vk\.ru\/gu\/audio\//.test(url)) return true;
     if (url.includes('pu.vk.com') || url.includes('vkontakte.ru') || url.includes('upload.php')) return true;
     // VK's audio upload host is <digits>.ms.vk.ru — but so is the music
     // long-poll, which is hit at the bare origin (no path) every ~30 s with
@@ -797,16 +889,17 @@
   // uploads (see VK_INJECT_FILES) can have several of these in flight/
   // pending at once — a single global "current upload" no longer identifies
   // anything.
-  function extractUploadFileName(body) {
+  function extractUploadFile(body) {
     try {
       if (body instanceof FormData) {
         for (const v of body.values()) {
-          if (v instanceof File) return v.name;
+          if (v instanceof File) return v;
         }
       }
     } catch {}
     return null;
   }
+  function extractUploadFileName(body) { return extractUploadFile(body)?.name || null; }
 
   // fileName -> in-flight XHR, so VMU_CANCEL_UPLOAD can abort the ONE the
   // user clicked ✕ on instead of whatever happens to be "current".
@@ -842,7 +935,23 @@
     const isUploadUrl = isVkUploadUrl(url, body);
     if (isUploadUrl) {
       const xhr = this;
-      const fileName = extractUploadFileName(body);
+      const file = extractUploadFile(body);
+      const fileName = file?.name || null;
+      const track = uploadTrack(file);
+      const trackId = track?.id;
+      if (track?.phase === 'cancelled') {
+        // Let VK's own error handler advance its queue without sending bytes.
+        queueMicrotask(() => {
+          xhr.abort();
+          xhr.dispatchEvent(new ProgressEvent('abort'));
+          xhr.dispatchEvent(new ProgressEvent('loadend'));
+        });
+        return;
+      }
+      if (track?.phase === 'waiting' || track?.phase === 'uploading') {
+        track.phase = 'uploading';
+        track.abort = () => xhr.abort();
+      }
       xhr._vmuFileName = fileName;
       if (fileName) window.__vmuCurrentUploads.set(fileName, xhr);
       window.__vmuCurrentUpload = xhr; // last-writer-wins alias, kept for the frozen direct pipeline
@@ -853,32 +962,44 @@
       // THIS file's transfer actually began, so content.js can flip only
       // this row to "uploading" instead of spinning the whole batch from
       // the moment it was sent.
-      if (fileName) window.postMessage({ type: 'VK_UPLOAD_STARTED', fileName }, '*');
+      if (fileName) window.postMessage({ type: 'VK_UPLOAD_STARTED', fileName, trackId }, '*');
       if (xhr.upload) {
         xhr.upload.addEventListener('progress', (e) => {
           if (e.lengthComputable) {
-            window.postMessage({ type: 'VK_UPLOAD_PROGRESS', loaded: e.loaded, total: e.total, fileName }, '*');
+            window.postMessage({ type: 'VK_UPLOAD_PROGRESS', loaded: e.loaded, total: e.total, fileName, trackId }, '*');
           }
         });
       }
       this.addEventListener('load', () => {
+        if (track?.phase === 'cancelled') return;
+        finishUploadTransfer(track);
         console.log('[VMU XHR] load', xhr.status, (xhr.responseText || '').slice(0, 200), 'file=', fileName);
         if (fileName) window.__vmuCurrentUploads.delete(fileName);
         if (window.__vmuCurrentUpload === xhr) window.__vmuCurrentUpload = null;
-        deferUploadDone(xhr.responseText, fileName);
+        if (xhr.status >= 400) {
+          window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: `ВК вернул HTTP ${xhr.status}`, fileName, trackId }, '*');
+        } else deferUploadDone(xhr.responseText, fileName, trackId);
       });
       this.addEventListener('error', () => {
+        if (track?.phase === 'cancelled') return;
+        finishUploadTransfer(track);
         console.log('[VMU XHR] error', 'file=', fileName);
         if (fileName) window.__vmuCurrentUploads.delete(fileName);
         if (window.__vmuCurrentUpload === xhr) window.__vmuCurrentUpload = null;
-        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, fileName }, '*');
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, fileName, trackId }, '*');
       });
       this.addEventListener('abort', () => {
         console.log('[VMU XHR] abort', 'file=', fileName);
         if (fileName) window.__vmuCurrentUploads.delete(fileName);
         if (window.__vmuCurrentUpload === xhr) window.__vmuCurrentUpload = null;
-        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, aborted: true, fileName }, '*');
+        if (track?.phase === 'cancelled') return;
+        finishUploadTransfer(track);
+        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, aborted: true, fileName, trackId }, '*');
       });
+    }
+    if (isAudioSaveUrl(url)) {
+      this.addEventListener('load', () => observeAudioSave(body, this.responseText, this.status));
+      this.addEventListener('error', () => reportAudioSave(audioSaveHash(body), { error: true, errorMsg: 'Сетевая ошибка при сохранении записи.' }));
     }
 
     // Capture hashes from VK's own al_audio.php calls
@@ -946,21 +1067,50 @@
 
     const isUploadUrl = isVkUploadUrl(url, args[1]?.body);
     if (isUploadUrl) {
-      const fileName = extractUploadFileName(args[1]?.body);
+      const request = args[0];
+      const filePromise = args[1]?.body == null && request instanceof Request
+        ? request.clone().formData().then(extractUploadFile, () => null)
+        : Promise.resolve(extractUploadFile(args[1]?.body));
+      const file = await filePromise;
+      const track = uploadTrack(file);
+      const info = { fileName: file?.name || null, trackId: track?.id };
+      if (track?.phase === 'cancelled') throw new DOMException('Upload cancelled', 'AbortError');
+      if (track?.phase === 'waiting' || track?.phase === 'uploading') {
+        const controller = new AbortController();
+        const originalSignal = args[1]?.signal !== undefined
+          ? args[1].signal : request instanceof Request ? request.signal : null;
+        const signal = originalSignal ? AbortSignal.any([originalSignal, controller.signal]) : controller.signal;
+        args[1] = { ...args[1], signal };
+        track.phase = 'uploading';
+        track.abort = () => controller.abort();
+      }
+      if (info.fileName) window.postMessage({ type: 'VK_UPLOAD_STARTED', ...info }, '*');
       window.__vmuLastUploadUrl = url; // saved for zombie-mode direct uploads
-      if (fileName) window.postMessage({ type: 'VK_UPLOAD_STARTED', fileName }, '*');
       return origFetch.apply(this, args).then(result => {
-        result.clone().text().then(text => {
-          deferUploadDone(text, fileName);
-        }).catch(() => window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, fileName }, '*'));
+        if (track?.phase === 'cancelled') throw new DOMException('Upload cancelled', 'AbortError');
+        finishUploadTransfer(track);
+        result.clone().text().then(body => {
+          if (!result.ok) window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, errorMsg: `ВК вернул HTTP ${result.status}`, ...info }, '*');
+          else deferUploadDone(body, info.fileName, info.trackId);
+        }).catch(() => window.postMessage({ type: 'VK_UPLOAD_DONE', ...info }, '*'));
         return result;
       }, err => {
-        window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, fileName }, '*');
+        if (track?.phase !== 'cancelled') {
+          finishUploadTransfer(track);
+          window.postMessage({ type: 'VK_UPLOAD_DONE', error: true, ...info }, '*');
+        }
         throw err;
       });
     }
 
-    const result = await origFetch.apply(this, args);
+    const save = isAudioSaveUrl(url);
+    const saveBody = save && args[1]?.body == null && args[0] instanceof Request
+      ? args[0].clone().text().catch(() => null)
+      : Promise.resolve(args[1]?.body);
+    const result = await origFetch.apply(this, args).catch(err => {
+      if (save) saveBody.then(body => reportAudioSave(audioSaveHash(body), { error: true, errorMsg: 'Сетевая ошибка при сохранении записи.' }));
+      throw err;
+    });
 
     // One clone+text() shared by every consumer below (al_audio.php responses
     // used to be cloned and decoded twice — hash capture, then track
@@ -968,6 +1118,7 @@
     // to the page, so the body can't already be consumed by then.
     let _bodyTextP = null;
     const bodyText = () => (_bodyTextP ||= result.clone().text());
+    if (save) Promise.all([saveBody, bodyText()]).then(([body, response]) => observeAudioSave(body, response, result.status)).catch(() => {});
 
     if (url.includes('al_audio.php')) {
       const bStr = parseBodyStr(args[1]?.body);
@@ -1162,31 +1313,64 @@
       // no attempt to observe or correlate the actual network transfer,
       // since that's what turned out unreliable. Fire-and-forget by design.
       case 'VK_HANDOFF_FILES': {
+        const batchId = e.data.batchId;
         const items = e.data.items || [];
-        const files = items.map(it => new File([it.buffer], it.name, { type: it.mimeType || 'audio/mpeg' }));
+        if (batchId) {
+          namedUploadTracks = new Map();
+          uploadTracksById = new Map();
+        }
+        const files = items.map(it => {
+          const file = new File([it.buffer], it.name, { type: it.mimeType || 'audio/mpeg' });
+          if (it.trackId) {
+            const track = { id: it.trackId, phase: 'waiting', abort: null };
+            uploadTracksByFile.set(file, track);
+            uploadTracksById.set(track.id, track);
+            const key = `${file.name}\0${file.size}`;
+            namedUploadTracks.set(key, namedUploadTracks.has(key) ? null : track);
+          }
+          return file;
+        });
         console.log('[VMU HANDOFF] sending', files.length, 'file(s) straight to VK\'s native input:', files.map(f => f.name).join(', '));
         let tries = 0;
         (function tryInject() {
-          const input = document.querySelector('[data-vmu-vk="1"]');
+          const input = batchId
+            ? (__vmuTrackedUploadBox?.dataset.vmuTrackedUpload === batchId
+              ? __vmuTrackedUploadBox.querySelector('[data-vmu-vk="1"]') : null)
+            : document.querySelector('[data-vmu-vk="1"]');
           if (input) {
             const dt = new DataTransfer();
-            files.forEach(f => dt.items.add(f));
-            input.files = dt.files;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
+            for (const file of files) {
+              if (uploadTrack(file)?.phase !== 'cancelled') dt.items.add(file);
+            }
+            if (dt.files.length) {
+              input.files = dt.files;
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
             console.log('[VMU HANDOFF] dispatched change on native input');
-            window.postMessage({ type: 'VK_HANDOFF_DISPATCHED', ok: true }, '*');
+            window.postMessage({ type: 'VK_HANDOFF_DISPATCHED', ok: true, batchId }, '*');
           } else if (tries++ < 15) {
             setTimeout(tryInject, 200);
           } else {
             console.log('[VMU HANDOFF] no native input found — giving up');
-            window.postMessage({ type: 'VK_HANDOFF_DISPATCHED', ok: false }, '*');
+            window.postMessage({ type: 'VK_HANDOFF_DISPATCHED', ok: false, batchId }, '*');
           }
         })();
         break;
       }
 
       case 'VMU_CANCEL_UPLOAD': {
-        const { fileName } = e.data;
+        const { fileName, trackId } = e.data;
+        if (trackId) {
+          const track = uploadTracksById.get(trackId);
+          const ok = !!track && track.phase !== 'transferred';
+          if (ok && track.phase !== 'cancelled') {
+            track.phase = 'cancelled';
+            track.abort?.();
+            track.abort = null;
+          }
+          window.postMessage({ type: 'VK_UPLOAD_CANCEL_RESULT', trackId, ok }, '*');
+          break;
+        }
         if (fileName && window.__vmuCurrentUploads?.has(fileName)) {
           try { window.__vmuCurrentUploads.get(fileName).abort(); } catch {}
           window.__vmuCurrentUploads.delete(fileName);
@@ -1398,6 +1582,14 @@
 
       case 'VK_UPLOAD_COVER': {
         injectCoverFile(new File([e.data.buffer], 'cover.jpg', { type: 'image/jpeg' }));
+        break;
+      }
+
+      case 'VKD_OPEN_PLAYLIST_EDITOR': {
+        const { ownerId, playlistId, reqId } = e.data;
+        openPlaylistEditor(ownerId, playlistId)
+          .then(result => window.postMessage({ type: 'VKD_PLAYLIST_EDITOR_OPENED', reqId, ok: true, ...result }, '*'))
+          .catch(err => window.postMessage({ type: 'VKD_PLAYLIST_EDITOR_OPENED', reqId, ok: false, error: err.message }, '*'));
         break;
       }
 
@@ -2793,24 +2985,17 @@
     if (!cell) return null;
     // data-testid variant (new VK) — VK renamed MusicPlaylistItem_OpenEditing to
     // MusicPlaylist_OpenEditing (dropped "Item"); match by suffix so either survives.
-    let btn = cell.querySelector('[data-testid$="OpenEditing"]');
-    if (btn) return btn;
-    // Class-based variants (old VK)
-    btn = cell.querySelector('.audio_pl__edit, .audio_pl_actions__edit');
-    if (btn) return btn;
-    // The cell's own «Редактировать» control, matched INNERMOST-first. The
-    // old "first clickable thing whose text contains редакт" lost on the
-    // 18.11 build: the cover is a div[role=button] that WRAPS the three
-    // action buttons, so its own textContent reads «РедактироватьСлушать
-    // Поделиться…» and matched first. Clicking it opens the playlist
-    // (?z=audio_playlist…) instead of its editor, and the add-tracks step
-    // then died with dialog_not_opened over a playlist that had just been
-    // created — checked live, that is why fresh playlists came out empty.
-    const named = [...cell.querySelectorAll('button, [role="button"]')].filter(b =>
-      (b.getAttribute('aria-label') || b.title || b.textContent || '').toLowerCase().includes('редакт'));
-    for (const b of named) if (!named.some(o => o !== b && b.contains(o))) return b;
-    // Last resort, kept for any build that still names the control in a class
-    return cell.querySelector('[class*="edit"]');
+    const editLabel = /^(?:Редактировать(?: плейлист)?|Изменить плейлист)$/i;
+    const known = '[data-testid$="OpenEditing"], .audio_pl__edit, .audio_pl_actions__edit';
+    const control = 'button, [role="button"], a, ' + known;
+    const candidates = [...cell.querySelectorAll(control)].filter(el => {
+      const label = el.getAttribute('aria-label') || el.title || el.getAttribute('data-vmu-tip');
+      if (typeof el.click !== 'function' || /^Открыть/i.test(label || '') ||
+          el.matches('a[href*="/music/playlist/"], a[href*="audio_playlist"]')) return false;
+      if (el.matches(known) || editLabel.test(label?.trim() || '')) return true;
+      return !label && !el.querySelector(control) && editLabel.test(el.textContent.trim());
+    });
+    return candidates.find(el => !candidates.some(child => child !== el && el.contains(child))) || null;
   }
 
   // Open edit dialog for the newly created playlist and select tracks by name
@@ -2958,17 +3143,60 @@
   // .audio_pl_edit_box dialog). SPA navigation only — a full location change
   // would tear down this very script mid-flow. Returns the button, or null.
   async function openPlaylistPageEditButton(ownerId, playlistId) {
-    if (typeof window.nav?.go !== 'function' || ownerId == null || ownerId === '') return null;
-    const key = `${ownerId}_${playlistId}`;
-    window.nav.go(`/music/playlist/${key}`);
+    if (ownerId == null || ownerId === '') return null;
+    const path = `/music/playlist/${ownerId}_${playlistId}`;
+    const onTarget = () => location.pathname.replace(/\/$/, '') === path;
+    const selector = '[data-testid="Action_Edit"]';
+    const previousButton = onTarget() ? null : document.querySelector(selector);
+    if (!onTarget()) {
+      if (typeof window.nav?.go !== 'function') return null;
+      window.nav.go(path);
+    }
     const deadline = Date.now() + 15000;
     while (Date.now() < deadline) {
       await pause(300);
-      if (!location.pathname.includes(key)) continue;
-      const btn = document.querySelector('[data-testid="Action_Edit"]');
-      if (btn) return btn;
+      if (!onTarget()) continue;
+      const btn = document.querySelector(selector);
+      if (btn && btn !== previousButton) return btn;
     }
     return null;
+  }
+
+  async function openPlaylistEditor(ownerId, playlistId) {
+    if (!/^-?\d+$/.test(ownerId) || !/^\d+$/.test(playlistId)) throw new Error('Некорректный ID плейлиста');
+    if (getEditPlaylistBox()) throw new Error('Уже открыт диалог редактирования');
+    const id = `${ownerId}_${playlistId}`;
+    const cards = [...document.querySelectorAll(`[data-id="${id}"]:not([data-audio-id])`)];
+    let button = findPlaylistEditButton(playlistId, ownerId);
+    const card = cards.find(el => el.matches('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl')) || cards[0];
+    if (!button && !card) return { unavailable: 'card' };
+    const hover = !button;
+    if (hover) {
+      card.dispatchEvent(new PointerEvent('pointerover', { bubbles: true, pointerType: 'mouse' }));
+      card.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    }
+    try {
+      for (let i = 0; !button && i < 8; i++) {
+        button = findEditBtnInCell(card);
+        if (!button) await pause(125);
+      }
+      if (!button) return { unavailable: 'pencil' };
+      if (getEditPlaylistBox()) throw new Error('Уже открыт диалог редактирования');
+      const startHref = location.href;
+      button.click();
+      const deadline = Date.now() + 7000;
+      while (Date.now() < deadline) {
+        if (getEditPlaylistBox()?.querySelector('#ape_pl_name, input.ape_pl_input')) return {};
+        await pause(150);
+      }
+      if (location.href !== startHref) return { unavailable: 'viewer' };
+      throw new Error('Карандаш нажат, но редактор VK не открылся');
+    } finally {
+      if (hover) {
+        card.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+        card.dispatchEvent(new PointerEvent('pointerout', { bubbles: true, pointerType: 'mouse' }));
+      }
+    }
   }
 
   async function openAddTracksPicker(playlistId, ownerId) {
@@ -3562,7 +3790,8 @@
   // nothing (verified live). So: use the input directly if present, else
   // click the delete button first and wait for the input to mount.
   function injectCoverFile(coverFile) {
-    const coverEl = document.querySelector('.ape_cover');
+    const editor = getEditPlaylistBox();
+    const coverEl = (editor || document).querySelector('.ape_cover');
     if (!coverEl) { window.postMessage({ type: 'VK_COVER_DONE', ok: false, error: 'ape_cover не найден' }, '*'); return; }
 
     const setFile = input => {
@@ -3594,7 +3823,7 @@
 
     let tries = 0;
     const waitT = setInterval(() => {
-      const input = coverEl.querySelector('input[type="file"]');
+      const input = (editor || document).querySelector('.ape_cover input[type="file"]');
       if (input) { clearInterval(waitT); setFile(input); return; }
       if (++tries >= 20) { clearInterval(waitT); window.postMessage({ type: 'VK_COVER_DONE', ok: false, error: 'input не появился после удаления обложки' }, '*'); }
     }, 200);
@@ -4360,12 +4589,8 @@
     // bookkeeping is private and too fragile to safely redirect this way.
     // Instead: pause + mute VK's own <audio> element in place (a completely
     // normal operation VK already handles fine) and play our replacement
-    // through a separate <audio> element of our own layered on top. VK's
-    // queue/shuffle/_currentPlaylist never changes at all, so next/prev and
-    // auto-advance keep working exactly as if nothing happened — once our
-    // overlay ends, the (still muted) original is resumed just long enough
-    // for VK's own preview-cutoff/end-of-track to fire and auto-advance
-    // normally, then the next slot is evaluated fresh.
+    // through a separate <audio> element. VK still owns the queue and picks
+    // the next track, which is then evaluated for a replacement.
     let nativeAudioEl = null;
     let lastSlotKey = null;
     let overlay = null; // { audioEl, nativeEl, forSlotKey }
@@ -4378,25 +4603,6 @@
       if (e.key === INDEX_KEY) { indexMap = null; indexForOwner = null; }
     });
 
-    // --- Overlay panel: a live copy of VK's native player block ---------------
-    // Sits next to the native block in the DOM (same stacking context, so VK's
-    // modals and its top bar cover it exactly like the original) and slides in
-    // over it while a community version is playing. Its markup is the native
-    // block's own, mirrored from it; only play/pause, progress, volume and the
-    // title are driven by the overlay <audio>. A click on any other button is
-    // forwarded to the real one, so shuffle / repeat / like / lyrics / share /
-    // the extension's own EQ button all keep working.
-    let panelEl = null;
-    let panelCtl = null;
-    let panelTip = null;
-    let hidePanelTip = null;
-    let currentMatch = null;
-    const iconCache = { play: null, pause: null };
-    // «elapsed / remaining», for the panel and for VK's drop-down separately —
-    // VK keeps the choice per player now, so ours follows each of them. The
-    // panel's is seeded from the copy it takes of VK's block, the drop-down's
-    // from whatever VK last wrote into its own clock.
-    let clockRemaining = true;
     let popRemaining = true, popClockWritten = null;
 
     const NATIVE_PANEL_SELECTOR = 'section[data-testid="AudioPage_PlayerBlock"]';
@@ -4404,12 +4610,10 @@
     const SEL_PLAY = '[data-testid="audio-player-controls-state-button"]';
     const SEL_NEXT = '[data-testid="audio-player-controls-forward-button"]';
     const SEL_PROGRESS = '[data-testid="audioplayerplaybackbody-progressbar"]';
-    const SEL_VOLUME = '[data-testid="audioplayervolumeslider-bar"]';
     const SEL_TITLE = '[data-testid="audioplayeraudioinfo-title"]';
     const SEL_EXTRA = '[data-testid="audioplayeraudioinfo-extra"]';
     const SEL_NOTICE = '[data-testid="audioplayeraudioinfo-titleNoticeIcon"]';
     const SEL_PROGRESSTIME = '[data-testid="audioplayerplaybackbody-progresstime"]';
-    const SEL_COVER = '[data-testid="audioplayerplaybackbody-cover"]';
     const SEL_SHARE = '[data-testid="MusicAudio_Share"]';
     // VK's second player: the drop-down under the mini player in the top bar
     const SEL_POP_BLOCK = '[data-testid="TopPlayerPopup_Block"]';
@@ -4434,17 +4638,10 @@
     }
 
     // VK renders the player block twice (in-flow + the pinned copy that takes
-    // over once the page scrolls — the extension pins it too). Only one is on
-    // screen; like content.js, take the on-screen one with the largest bottom.
-    // When two copies are on screen at once (scrolling hands the block over
-    // from one to the other) the one the user actually SEES is the one that is
-    // topmost at its own centre; the copy the panel must cover is that one.
-    // Called from many places (button forwarding, the panel tracker, the media
-    // session...), and each call reads layout. In profiling it was the biggest
-    // single cost of the extension (a forced reflow of the whole VK page, up
-    // to 20 ms each). So the answer is cached for 1 s (dropped on scroll /
-    // resize), and the hit-test is only done when two copies are on screen.
-    let _gvn = null, _gvnAt = 0, _gvnCount = -1;
+    // over once the page scrolls. Prefer the one that receives input.
+    let _gvn = null, _gvnAt = 0;
+    window.addEventListener("scroll", () => { _gvnAt = 0; }, { passive: true });
+    window.addEventListener("resize", () => { _gvnAt = 0; });
     function getVisibleNativePanel() {
       const now = performance.now();
       if (_gvn && _gvn.isConnected && now - _gvnAt < 1000) return _gvn;
@@ -4463,7 +4660,7 @@
           try {
             const cx = Math.min(Math.max(r.left + r.width / 2, 0), window.innerWidth - 1);
             const cy = Math.min(Math.max(r.top + r.height / 2, 0), window.innerHeight - 1);
-            const top = document.elementsFromPoint(cx, cy).find(e => !(panelEl && panelEl.contains(e)));
+            const top = document.elementFromPoint(cx, cy);
             if (top && el.contains(top) && r.bottom > seenBottom) { seen = el; seenBottom = r.bottom; }
           } catch {}
         }
@@ -4472,25 +4669,6 @@
       pick = pick || document.querySelector(NATIVE_PANEL_SELECTOR);
       _gvn = pick; _gvnAt = now;
       return pick;
-    }
-
-    function nativeButtons(native) {
-      return [...native.querySelectorAll('button')].filter(b => !b.hasAttribute('data-vmu-swap-native'));
-    }
-    function panelButtons() {
-      return [...panelEl.querySelectorAll('button')].filter(b => !b.hasAttribute('data-vmu-swap'));
-    }
-
-    // The real button behind a button of the copy: by data-testid when it has
-    // one, otherwise by position (the copy has the same button order).
-    function nativeButtonFor(cloneBtn, native) {
-      const tid = cloneBtn.getAttribute('data-vmu-testid');
-      if (tid) {
-        const b = native.querySelector('[data-testid="' + tid + '"]');
-        if (b) return b;
-      }
-      const i = panelButtons().indexOf(cloneBtn);
-      return i >= 0 ? (nativeButtons(native)[i] || null) : null;
     }
 
     function clickNativeNavButton(dir) {
@@ -4502,63 +4680,6 @@
         const m = dir === 'next' ? 'playNext' : 'playPrev';
         try { if (typeof window.ap[m] === 'function') window.ap[m](); } catch {}
       }
-    }
-
-    // Both states of the play button are remembered from the native block as
-    // it shows them, so the copy can show the right icon at any moment.
-    function cacheNativeIcon() {
-      if (!enabled) return;
-      cacheNativeBar();
-      // both copies of the block show the same state, so there is no need to
-      // work out which one is on screen (that costs a layout read)
-      for (const native of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
-        const btn = native.querySelector(SEL_PLAY);
-        const svg = btn && btn.querySelector('svg');
-        if (!svg) continue;
-        const cls = svg.getAttribute('class') || '';
-        if (cls.includes('play_circle')) iconCache.play = btn.innerHTML;
-        else if (cls.includes('pause_circle')) iconCache.pause = btn.innerHTML;
-        break;
-      }
-    }
-
-    // The native progress bar has two looks: a «loading» skeleton (one full
-    // fill + animated stripes, no hover layer) while VK thinks it is
-    // buffering, and the real three-layer bar (buffered / played / hover, the
-    // last one carrying the pointer cursor). A copy taken during loading never
-    // gets the real structure by itself — it stayed striped with a dead
-    // timeline for the whole track. So the real markup is remembered whenever
-    // the native bar shows it, and the copy is given it as soon as it can.
-    let progressBarCache = null;
-    function barFills(bar) { return bar ? bar.querySelectorAll('div[style*="width"]') : []; }
-    function isReadyBar(bar) { return barFills(bar).length >= 3; }
-    function cacheNativeBar() {
-      for (const native of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
-        const bar = native.querySelector(SEL_PROGRESS);
-        if (isReadyBar(bar)) { progressBarCache = bar.innerHTML; return; }
-      }
-    }
-    function ensureReadyBar() {
-      const bar = panelCtl && panelCtl.progressBar;
-      if (!bar || isReadyBar(bar)) return false;
-      if (progressBarCache) {
-        bar.innerHTML = progressBarCache;
-        renameTestIds(bar);
-        for (const f of barFills(bar)) f.style.width = '0%';
-        return true;
-      }
-      // nothing real seen yet: at least drop the loading stripes
-      bar.querySelectorAll('div').forEach(n => {
-        if (/repeating-linear-gradient/.test(getComputedStyle(n).backgroundImage)) n.style.display = 'none';
-      });
-      return false;
-    }
-
-    function renameTestIds(root) {
-      root.querySelectorAll('[data-testid]').forEach(n => {
-        n.setAttribute('data-vmu-testid', n.getAttribute('data-testid'));
-        n.removeAttribute('data-testid');
-      });
     }
 
     // The toggle button is a stripped clone of the native share button, so it
@@ -4582,283 +4703,9 @@
       return b;
     }
 
-    function ensurePanelShell() {
-      if (panelEl) return;
-      panelEl = document.createElement('section');
-      panelEl.id = 'vmu-overlay-panel';
-      Object.assign(panelEl.style, {
-        position: 'fixed',
-        top: '0px',
-        left: '0px',
-        width: '0px',
-        margin: '0',
-        opacity: '0',
-        pointerEvents: 'none',
-        transition: 'none',
-        boxSizing: 'border-box',
-      });
-      // no shadow at all — neither ours nor one that comes with the copied classes
-      panelEl.style.setProperty('box-shadow', 'none', 'important');
-
-      const stop = e => { e.stopPropagation(); e.preventDefault(); };
-      let dragging = null;
-      const ratioIn = (el, clientX) => {
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : null;
-      };
-      const seekTo = clientX => {
-        if (!overlay || !panelCtl || !panelCtl.progressBar) return;
-        const dur = overlay.audioEl.duration;
-        const ratio = ratioIn(panelCtl.progressBar, clientX);
-        if (ratio === null || !isFinite(dur) || dur <= 0) return;
-        overlay.audioEl.currentTime = ratio * dur;
-        updatePanel();
-      };
-      const setVolumeTo = clientX => {
-        if (!overlay || !panelCtl || !panelCtl.volumeBar) return;
-        const pos = ratioIn(panelCtl.volumeBar, clientX);
-        if (pos === null) return;
-        // VK's volume slider is logarithmic: position → volume = (35^pos − 1) / 34.
-        // VK's own volume is the source of truth (its sliders, the top bar,
-        // the saved setting all follow it); the overlay follows VK.
-        const vol = (Math.pow(35, pos) - 1) / 34;
-        try { window.ap.setVolume(vol); } catch {}
-        overlay.audioEl.muted = false;
-        overlay.audioEl.volume = Math.min(1, Math.max(0, vol));
-        updatePanel();
-      };
-
-      panelEl.addEventListener('mousedown', e => {
-        if (!overlay || !panelCtl) return;
-        if (panelCtl.progressBar && panelCtl.progressBar.contains(e.target)) { stop(e); dragging = 'seek'; seekTo(e.clientX); }
-        else if (panelCtl.volumeBar && panelCtl.volumeBar.contains(e.target)) { stop(e); dragging = 'volume'; setVolumeTo(e.clientX); }
-      }, true);
-      window.addEventListener('mousemove', e => {
-        if (dragging === 'seek') seekTo(e.clientX);
-        else if (dragging === 'volume') setVolumeTo(e.clientX);
-      });
-      window.addEventListener('mouseup', () => { dragging = null; });
-
-      // Time tooltip over the timeline, drawn like VK's own (dark bubble above
-      // the pointer), plus the lighter «hover» fill of the bar. VK's version is
-      // React-driven and does not survive the copy.
-      panelTip = document.createElement('div');
-      Object.assign(panelTip.style, {
-        position: 'fixed', display: 'none', zIndex: '2147483000', pointerEvents: 'none',
-        background: 'rgb(50, 50, 50)', color: 'rgb(225, 227, 230)', font: '400 13px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif',
-        padding: '9px 12px 10px', borderRadius: '8px', whiteSpace: 'nowrap',
-        boxShadow: '0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.4)',
-      });
-      document.body.appendChild(panelTip);
-      const hoverFill = () => {
-        if (!panelCtl || !panelCtl.progressBar) return null;
-        const fills = panelCtl.progressBar.querySelectorAll('div[style*="width"]');
-        return fills[2] || null;
-      };
-      const hideTip = () => {
-        if (panelTip) panelTip.style.display = 'none';
-        const f = hoverFill(); if (f) f.style.width = '0%';
-      };
-      hidePanelTip = hideTip;
-      panelEl.addEventListener('mousemove', e => {
-        if (!overlay || !panelCtl) return hideTip();
-        // volume slider: VK's hint is the slider position as a percentage
-        if (panelCtl.volumeBar && (panelCtl.volumeBar.contains(e.target) || dragging === 'volume')) {
-          const pos = ratioIn(panelCtl.volumeBar, e.clientX);
-          if (pos === null) return hideTip();
-          panelTip.textContent = Math.floor(100 * pos) + '%';
-          panelTip.style.display = 'block';
-          const vr = panelCtl.volumeBar.getBoundingClientRect();
-          const w = panelTip.offsetWidth, h = panelTip.offsetHeight;
-          panelTip.style.left = Math.max(4, Math.min(window.innerWidth - w - 4, e.clientX - w / 2)) + 'px';
-          panelTip.style.top = Math.max(4, vr.top - h - 6) + 'px';
-          return;
-        }
-        if (!panelCtl.progressBar) return hideTip();
-        const bar = panelCtl.progressBar;
-        if (!bar.contains(e.target) && dragging !== 'seek') return hideTip();
-        const dur = overlay.audioEl.duration;
-        const ratio = ratioIn(bar, e.clientX);
-        if (ratio === null || !isFinite(dur) || dur <= 0) return hideTip();
-        panelTip.textContent = fmtTime(ratio * dur);
-        panelTip.style.display = 'block';
-        const br = bar.getBoundingClientRect();
-        const tw = panelTip.offsetWidth, th = panelTip.offsetHeight;
-        panelTip.style.left = Math.max(4, Math.min(window.innerWidth - tw - 4, e.clientX - tw / 2)) + 'px';
-        panelTip.style.top = Math.max(4, br.top - th - 6) + 'px';
-        const f = hoverFill(); if (f) f.style.width = (ratio * 100) + '%';
-      });
-      panelEl.addEventListener('mouseleave', hideTip);
-
-      panelEl.addEventListener('click', e => {
-        if (!overlay || !panelCtl) return;
-        if ((panelCtl.progressBar && panelCtl.progressBar.contains(e.target)) ||
-            (panelCtl.volumeBar && panelCtl.volumeBar.contains(e.target))) { stop(e); return; }
-        if (panelCtl.progressTime && panelCtl.progressTime.contains(e.target)) {
-          stop(e);
-          clockRemaining = !clockRemaining;
-          try { window.ap.toggleDurationType(); } catch {} // keeps VK's stored value in step
-          updatePanel();
-          return;
-        }
-        const btn = e.target.closest && e.target.closest('button');
-        if (!btn || !panelEl.contains(btn)) return;
-        stop(e);
-        if (btn.hasAttribute('data-vmu-swap')) { switchToOriginal(); return; }
-        if (btn === panelCtl.playBtn) {
-          if (overlay.audioEl.paused) overlay.audioEl.play().catch(() => {});
-          else overlay.audioEl.pause();
-          return;
-        }
-        if (btn === panelCtl.volButton) {
-          // VK's mute is «volume 0, previous volume remembered»
-          try { window.ap.toggleMuted(); } catch {}
-          followVkVolume();
-          updatePanel();
-          return;
-        }
-        const native = getVisibleNativePanel();
-        const real = native && nativeButtonFor(btn, native);
-        if (real) {
-          real.click();
-          // the heartbeat is slow now: show the new state of the clicked toggle at once
-          setTimeout(() => { try { syncFromNative(); } catch {} }, 150);
-        }
-      }, true);
-    }
-
-    // Fresh copy of the native block's current markup + the toggle button.
-    function rebuildPanelContent(native) {
-      panelEl.className = native.className;
-      panelEl.innerHTML = native.innerHTML;
-      panelEl.querySelectorAll('[id]').forEach(n => n.removeAttribute('id'));
-      panelEl.querySelectorAll('[data-vmu-swap-native]').forEach(n => n.remove());
-      renameTestIds(panelEl);
-      const q = sel => panelEl.querySelector(sel.replace('data-testid', 'data-vmu-testid'));
-      panelCtl = {
-        playBtn: q(SEL_PLAY),
-        progressBar: q(SEL_PROGRESS),
-        volumeBar: q(SEL_VOLUME),
-        titleEl: q(SEL_TITLE),
-        extraEl: q(SEL_EXTRA),
-        noticeIcon: q(SEL_NOTICE),
-        progressTime: q(SEL_PROGRESSTIME),
-        cover: q(SEL_COVER),
-        volButton: null,
-      };
-      // the copy was taken from VK's block as it stands: its clock shows which
-      // of the two the user last chose there
-      if (panelCtl.progressTime) {
-        const t0 = panelCtl.progressTime.textContent.trim();
-        if (/^-?\d+:\d\d/.test(t0)) clockRemaining = t0.charAt(0) === '-';
-      }
-      // the button right before the volume slider is VK's mute toggle
-      if (panelCtl.volumeBar) {
-        for (const b of panelEl.querySelectorAll('button')) {
-          if (b.compareDocumentPosition(panelCtl.volumeBar) & Node.DOCUMENT_POSITION_FOLLOWING) panelCtl.volButton = b;
-        }
-      }
-      const share = q(SEL_SHARE);
-      const sw = makeSwapButton(native, 'Включить оригинал', 'data-vmu-swap', true);
-      if (share && share.parentNode) share.parentNode.insertBefore(sw, share);
-      else panelEl.appendChild(sw);
-    }
-
-    // A text line that never wraps: a long title / credit is cut with an ellipsis
-    // and cannot make the block taller or push the controls beside it.
-    function oneLine(el) {
-      el.style.whiteSpace = 'nowrap';
-      el.style.overflow = 'hidden';
-      el.style.textOverflow = 'ellipsis';
-      el.style.minWidth = '0';
-    }
-
-    // Texts / bars of the copy are ours, everything else stays native.
-    function applyOverrides(match) {
-      if (!panelCtl) return;
-      if (panelCtl.titleEl) {
-        panelCtl.titleEl.textContent = decodeEntities(match.title || '');
-        oneLine(panelCtl.titleEl);
-      }
-      if (panelCtl.extraEl) {
-        // The artist line is VK's «extra» box wrapping a one-line-clamped div that
-        // holds the author links. Replacing the whole box with plain text dropped
-        // that clamp, so a long credit ("FRIENDLY THUG 52 NGG & kizaru") wrapped to
-        // a second line, made the block taller and pushed the controls around.
-        // The text goes inside the clamped div instead, in a span that keeps the
-        // links' look, and the line is forced to a single ellipsised line anyway.
-        const extra = panelCtl.extraEl;
-        const artist = decodeEntities(match.artist || '');
-        const inner = extra.firstElementChild;
-        if (inner) {
-          const link = inner.querySelector('a');
-          const span = document.createElement('span');
-          if (link) span.className = link.className;
-          span.textContent = artist;
-          inner.replaceChildren(span);
-          oneLine(inner);
-        } else {
-          extra.textContent = artist;
-        }
-        oneLine(extra);
-      }
-      if (panelCtl.noticeIcon) panelCtl.noticeIcon.style.display = 'none';
-      if (panelCtl.progressBar) {
-        ensureReadyBar();
-        const fills = panelCtl.progressBar.querySelectorAll('div[style*="width"]');
-        if (fills[0]) fills[0].style.width = '100%'; // buffered
-        if (fills[1]) fills[1].style.width = '0%';   // played
-        // a copy taken while VK was still buffering carries its loading animation
-        panelCtl.progressBar.querySelectorAll('*').forEach(n => {
-          if (getComputedStyle(n).animationName !== 'none') n.style.animation = 'none';
-        });
-      }
-      updatePanel();
-    }
-
-    // Keeps the copy's buttons (toggle states, like, dislike...) and cover in
-    // step with the native block.
-    function syncFromNative() {
-      if (!panelEl || !panelCtl) return;
-      const native = getVisibleNativePanel();
-      if (!native) return;
-      if (panelCtl.progressBar && !isReadyBar(panelCtl.progressBar) && ensureReadyBar() && currentMatch) applyOverrides(currentMatch);
-      const nb = nativeButtons(native), cb = panelButtons();
-      if (nb.length !== cb.length) {
-        rebuildPanelContent(native);
-        if (currentMatch) applyOverrides(currentMatch);
-        return;
-      }
-      for (let i = 0; i < nb.length; i++) {
-        const n = nb[i], c = cb[i];
-        if (c === panelCtl.playBtn) continue; // (the mute button follows VK's volume like the rest)
-        if (c.className !== n.className) c.className = n.className;
-        for (const a of n.attributes) {
-          if (a.name === 'data-testid' || a.name === 'style' || a.name === 'id') continue;
-          if (c.getAttribute(a.name) !== a.value) c.setAttribute(a.name, a.value);
-        }
-        for (const a of [...c.attributes]) {
-          if (/^(data-vmu|style$|id$|data-testid$)/.test(a.name)) continue;
-          if (!n.hasAttribute(a.name)) c.removeAttribute(a.name);
-        }
-        if (c.__vmuSig !== n.innerHTML) {
-          c.innerHTML = n.innerHTML;
-          c.__vmuSig = n.innerHTML;
-          renameTestIds(c);
-        }
-      }
-      const nc = native.querySelector(SEL_COVER);
-      if (nc && panelCtl.cover && panelCtl.cover.__vmuSig !== nc.innerHTML) {
-        panelCtl.cover.innerHTML = nc.innerHTML;
-        panelCtl.cover.__vmuSig = nc.innerHTML;
-        renameTestIds(panelCtl.cover);
-      }
-    }
-
     // The small player in VK's top bar (shown while the big block is scrolled
-    // out of view) carries «Artist — Title» of the ORIGINAL and the restriction
-    // icon. While the community version plays it shows the same text as the
-    // panel. React owns these nodes, so only the data of existing text nodes
+    // out of view) shows the community version while it plays. React owns
+    // these nodes, so only the data of existing text nodes
     // is changed (never the structure), re-asserted on a timer in case VK
     // rewrites it, and handed back only if it is still our text.
     let topSaved = null; // { root, recs: [{ n, orig, ours }], icon, iconDisplay }
@@ -4901,14 +4748,8 @@
 
     // --- VK's second player: the drop-down under the top-bar mini player ----
     // It is a player in its own right — transport, timeline, clock, title —
-    // and during a swap VK went on showing the original in it: the restricted
-    // name, its badge, a clock standing still where the muted original
-    // stopped, a timeline that never moved. Unlike the block at the bottom of
-    // the page this one is NOT covered with a copy: VK mounts, re-renders and
-    // throws the popup away whenever it likes, and a copy would have to live
-    // inside it. It is corrected in place instead — the data of existing text
-    // nodes, the widths of the fills it already has — and its own play/pause
-    // button and timeline are routed to the community version.
+    // Both VK players keep their original elements and React handlers.
+    // Only presentation values and playback input are routed to the replacement.
     let popSaved = null; // { recs: [{ n, orig, ours }], icon, iconDisplay, match }
     let _pop = null, _popAt = 0;
     function topPopup() {
@@ -5056,344 +4897,12 @@
     // the bar under the pointer, if it is one the swap is in charge of
     function swapSeekBar(t) {
       if (!t || !t.closest) return null;
-      const pop = t.closest(SEL_POP_PROGRESS);
-      if (pop) return pop;
+      const playerBar = t.closest(SEL_PROGRESS + "," + SEL_POP_PROGRESS);
+      if (playerBar) return playerBar;
       const bar = t.closest(SEL_ROW_PROGRESS);
       if (!bar) return null;
       const row = bar.closest('[data-audio-id]');
       return row && row.getAttribute('data-audio-id') === currentSlotKey() ? bar : null;
-    }
-
-    function updatePanelPlayIcon(isPlaying) {
-      if (!panelCtl || !panelCtl.playBtn) return;
-      // one of the two looks may never have been seen on the native button yet
-      // (it only shows the state it is in) — derive it from the other one
-      const swapIcon = (html, from, to) => (html ? html.replace(new RegExp(from + '_circle', 'g'), to + '_circle') : null);
-      const desired = isPlaying
-        ? (iconCache.pause || swapIcon(iconCache.play, 'play', 'pause'))
-        : (iconCache.play || swapIcon(iconCache.pause, 'pause', 'play'));
-      if (desired && panelCtl.playBtn.innerHTML !== desired) {
-        try { panelCtl.playBtn.innerHTML = desired; } catch {}
-      }
-    }
-
-    // Returns the native panel's on-screen rect (the content column can be
-    // shifted by the extension's «Смещение контента» slider with a left
-    // transition, and the pinned copy moves while scrolling — so this is
-    // re-read continuously instead of on a few events).
-    let _lastRect = null, _lastNative = null, _styledAt = 0;
-    // In pinmode the copy's height is the only thing the stylesheet does not
-    // give it, and a ResizeObserver reports the block's height without the
-    // browser having to lay the page out on the spot — which a rect read here
-    // did, at about 4 ms a time on a long music page (profiled: 100 ms of the
-    // 563 ms the swap spent over 39 s, with a 28.8 ms worst case).
-    let _nativeRO = null, _nativeROEl = null, _nativeH = null;
-    function watchNativeSize(el) {
-      if (_nativeROEl === el && _nativeRO) return;
-      if (_nativeRO) _nativeRO.disconnect();
-      _nativeROEl = el;
-      _nativeH = null;
-      try {
-        _nativeRO = new ResizeObserver(entries => {
-          const e = entries[entries.length - 1];
-          const box = e.borderBoxSize && e.borderBoxSize[0];
-          const h = box ? box.blockSize : e.contentRect.height;
-          if (!(h > 0)) return;
-          _nativeH = h;
-          if (!panelEl || !document.documentElement.classList.contains('vmu-pinmode')) return;
-          const px = h + 'px';
-          if (panelEl.style.height !== px) panelEl.style.height = px;
-        });
-        _nativeRO.observe(el);
-      } catch { _nativeRO = null; _nativeROEl = null; }
-    }
-    function stopWatchingNativeSize() {
-      if (_nativeRO) _nativeRO.disconnect();
-      _nativeRO = null; _nativeROEl = null; _nativeH = null;
-    }
-    // force: read the geometry for real even in pinmode — the slide in and out
-    // is measured from it, and it is read once per show and once per hide.
-    function positionOverNative(force) {
-      if (!panelEl) return null;
-      // VK adds / removes its second copy of the block some frames after the scroll that
-      // caused it (measured: 45–60 ms) — after the last scroll event had already dropped
-      // the cached answer and a new one had been cached for a second. The panel then sat
-      // on the copy that was no longer the visible one for up to a second. A change in
-      // the number of copies drops the cache at once.
-      const cnt = document.querySelectorAll(NATIVE_PANEL_SELECTOR).length;
-      if (cnt !== _gvnCount) { _gvnCount = cnt; _gvnAt = 0; }
-      const native = getVisibleNativePanel();
-      if (!native) return _lastRect;
-      const place = () => {
-        if (panelEl.previousElementSibling === native) return;
-        native.after(panelEl);
-        const nz = parseInt(getComputedStyle(native).zIndex, 10);
-        panelEl.style.zIndex = String(isFinite(nz) ? nz + 1 : 2);
-      };
-      // The stylesheet covers the block with the copy in pinmode (position,
-      // left, top, width and the whole look, all !important — the values
-      // written below are overridden there), so nothing has to be measured on
-      // a heartbeat: the copy rides the sticky wrapper and only its height
-      // comes from the observer above.
-      if (!force && document.documentElement.classList.contains('vmu-pinmode')) {
-        place();
-        watchNativeSize(native);
-        if (panelEl.__vmuRing !== 'css') {
-          panelEl.__vmuRing = 'css';
-          panelEl.style.removeProperty('box-shadow');
-          panelEl.style.borderRadius = '';
-        }
-        if (_nativeH != null) {
-          const px = _nativeH + 'px';
-          if (panelEl.style.height !== px) panelEl.style.height = px;
-        }
-        return _lastRect;
-      }
-      const r = native.getBoundingClientRect();
-      if (r.width <= 0 || r.height <= 0) { _gvnAt = 0; return _lastRect; } // not displayed: pick again next time
-      const sameSpot = _lastRect && native === _lastNative && r.left === _lastRect.left && r.top === _lastRect.top
-        && r.width === _lastRect.width && r.height === _lastRect.height;
-      _lastRect = r;
-      place();
-      // nothing moved and the look was read less than a second ago: done
-      const nowT = performance.now();
-      if (sameSpot && nowT - _styledAt < 1000) return r;
-      _lastNative = native; _styledAt = nowT;
-      // On the music catalog with the pinned tabs bar (html.vmu-pinmode, set by content.js)
-      // the copy's place, corners and outline come from the stylesheet: it covers the
-      // sticky in-flow block as an absolutely positioned sibling and takes its look from
-      // html.vmu-merged — in the same frame as everything else. Copying the look from the
-      // native block here (at most once a second) was what left it with square corners
-      // or a stale outline after scrolling. The inline values are only cleared.
-      if (document.documentElement.classList.contains('vmu-pinmode')) {
-        if (panelEl.__vmuRing !== 'css') {
-          panelEl.__vmuRing = 'css';
-          panelEl.style.removeProperty('box-shadow');
-          panelEl.style.borderRadius = '';
-        }
-        panelEl.style.left = r.left + 'px';
-        panelEl.style.top = r.top + 'px';
-        panelEl.style.width = r.width + 'px';
-        panelEl.style.height = r.height + 'px';
-        return r;
-      }
-      // the corner radius comes from the native block's context, not from its
-      // classes, so the copy would be square — and the pinned copy rounds
-      // differently from the in-flow one, hence read on every move
-      const nbr = getComputedStyle(native).borderRadius;
-      if (panelEl.style.borderRadius !== nbr) panelEl.style.borderRadius = nbr;
-      // the thin outline of the native block is an inset ring on its ::before,
-      // which the copy does not get; the copy draws the same ring on itself
-      // (and still no outer shadow)
-      // (the in-flow block keeps it on ::before, the pinned one on itself as
-      // inset shadows — both are read, outer shadows are dropped)
-      const insetParts = css => (css && css !== 'none' ? css.split(/,(?![^(]*\))/).map(s => s.trim()).filter(s => /\binset\b/.test(s)) : []);
-      const rings = insetParts(getComputedStyle(native).boxShadow).concat(insetParts(getComputedStyle(native, '::before').boxShadow));
-      const wantRing = rings.length ? rings.join(', ') : 'none';
-      if (panelEl.__vmuRing !== wantRing) {
-        panelEl.__vmuRing = wantRing;
-        panelEl.style.setProperty('box-shadow', wantRing, 'important');
-      }
-      panelEl.style.left = r.left + 'px';
-      panelEl.style.top = r.top + 'px';
-      panelEl.style.width = r.width + 'px';
-      panelEl.style.height = r.height + 'px';
-      return r;
-    }
-
-    // setInterval, not rAF: rAF stops in a background tab, and the panel
-    // must stay glued to the native one for as long as it is shown.
-    // While the copy is on screen the native block(s) underneath are made
-    // invisible (opacity, not display/visibility: the block keeps its place,
-    // its geometry and its hit-testing, which the copy and the forwarded
-    // clicks rely on). The 40 ms tracker also catches the second copy VK
-    // swaps in while scrolling. Everything is handed back the moment the copy
-    // starts to leave.
-    let panelShownAt = 0;
-    function setNativesHidden(hide) {
-      for (const n of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
-        if (hide) {
-          if (n.dataset.vmuHid !== '1') { n.dataset.vmuHid = '1'; n.dataset.vmuOp = n.style.opacity || ''; }
-          if (n.style.opacity !== '0') n.style.opacity = '0';
-        } else if (n.dataset.vmuHid === '1') {
-          n.style.opacity = n.dataset.vmuOp || '';
-          delete n.dataset.vmuHid;
-          delete n.dataset.vmuOp;
-        }
-      }
-    }
-    let _trackTimer = null;
-    let _trackTick = 0;
-    // The copy has to stay glued to the native block while that moves (page
-    // scroll handing the block from one copy to the other, the content-offset
-    // transition, a window resize). That used to be a 40 ms poll: ~5 % of a CPU
-    // core for as long as the panel was up. Now: a burst of animation frames
-    // right after any of those events, and a calm heartbeat for anything
-    // else (content loading and shifting the layout), every 500 ms.
-    let _burstRaf = 0, _burstUntil = 0;
-    function burstFrame() {
-      _burstRaf = 0;
-      positionOverNative();
-      if (performance.now() < _burstUntil) _burstRaf = requestAnimationFrame(burstFrame);
-    }
-    function kickTracking(ms) {
-      _gvnAt = 0; // the on-screen copy may have changed
-      _burstUntil = Math.max(_burstUntil, performance.now() + (ms || 700));
-      if (!_burstRaf) _burstRaf = requestAnimationFrame(burstFrame);
-    }
-    // Only movements that can actually move the native block: a scroll of the
-    // PAGE (not of some inner list or chat), a resize, a transition on an
-    // ancestor of the block (the content-offset shift). Transitions of the copy
-    // itself (its progress fill animates on every update) must not retrigger
-    // the tracking, or it would feed itself.
-    const _kickListener = e => {
-      const t = e && e.target;
-      if (e && e.type === 'scroll') {
-        if (t !== document && t !== document.documentElement && t !== document.body && t !== window) return;
-      } else if (e && (e.type === 'transitionrun' || e.type === 'transitionend')) {
-        if (!(t instanceof Element) || (panelEl && panelEl.contains(t)) || !_gvn || !t.contains(_gvn)) return;
-      }
-      kickTracking(700);
-    };
-    function startPositionTracking() {
-      if (_trackTimer) return;
-      window.addEventListener('scroll', _kickListener, { passive: true, capture: true });
-      window.addEventListener('resize', _kickListener, { passive: true });
-      document.addEventListener('transitionrun', _kickListener, { passive: true, capture: true });
-      document.addEventListener('transitionend', _kickListener, { passive: true, capture: true });
-      kickTracking(900);
-      document.addEventListener('visibilitychange', _kickListener);
-      _trackTimer = setInterval(() => {
-        // a hidden tab paints nothing: the copy is re-glued (and measured) on
-        // the burst that visibilitychange kicks off, before the first frame
-        // the user gets to see
-        if (!document.hidden) positionOverNative();
-        // after the slide-in has finished
-        if (overlay && overlay.mode === 'community' && panelShownAt && Date.now() - panelShownAt > 220) setNativesHidden(true);
-        {
-          syncFromNative();
-          updatePanel(); // the play/pause icon and the timer must not wait for the next timeupdate
-          // VK sets its own media metadata a moment after a track starts (page-load
-          // autoplay especially) — the community title is put back
-          try {
-            if (overlay && overlay.mode === 'community' && ourMediaMetadata && navigator.mediaSession
-              && navigator.mediaSession.metadata !== ourMediaMetadata) navigator.mediaSession.metadata = ourMediaMetadata;
-          } catch {}
-          if (overlay && overlay.mode === 'community') { applyTopPlayer(overlay.match); updateTopPopup(); }
-          else if ((topSaved || popSaved) && !panelGrace) restoreTopPlayer();
-        }
-      }, 500);
-    }
-    function stopPositionTracking() {
-      if (_trackTimer) { clearInterval(_trackTimer); _trackTimer = null; }
-      document.removeEventListener('visibilitychange', _kickListener);
-      stopWatchingNativeSize();
-      window.removeEventListener('scroll', _kickListener, true);
-      window.removeEventListener('resize', _kickListener);
-      document.removeEventListener('transitionrun', _kickListener, true);
-      document.removeEventListener('transitionend', _kickListener, true);
-    }
-
-    let _hideTimer = null;
-    // Consecutive swapped tracks: the panel is NOT taken away and brought back
-    // between them. On teardown it waits a moment (_graceTimer); if the next
-    // track is swapped too, showPanel just refills the panel that is already
-    // on screen — no slide, no flash of VK's own block, no header flicker.
-    let panelVisible = false;
-    let panelGrace = false;
-    let _graceTimer = null;
-    function showPanel(match) {
-      const native = getVisibleNativePanel();
-      if (!native || !overlay) return;
-      currentMatch = match;
-      if (_graceTimer) { clearTimeout(_graceTimer); _graceTimer = null; }
-      panelGrace = false;
-      const recopy = () => {
-        // the native block may still have been in its loading state when it was
-        // copied just now — take a second copy once VK has settled
-        const live = overlay && overlay.mode !== 'original' && panelEl && getVisibleNativePanel();
-        if (!live) return;
-        rebuildPanelContent(live);
-        applyOverrides(match);
-      };
-      if (panelVisible && panelEl && panelEl.isConnected) {
-        ensurePanelShell();
-        rebuildPanelContent(native);
-        positionOverNative(true);
-        applyOverrides(match);
-        applyTopPlayer(match);
-        startPositionTracking();
-        setTimeout(recopy, 400);
-        return;
-      }
-      panelShownAt = Date.now();
-      ensurePanelShell();
-      rebuildPanelContent(native);
-      const r = positionOverNative(true);
-      applyOverrides(match);
-      applyTopPlayer(match);
-      startPositionTracking();
-
-      // Slide down from above onto the native block. The start state is
-      // applied without a transition and flushed with a reflow, so the browser
-      // has a real "from" value to animate from. The content column sits
-      // below VK's top bar in the stacking order, so it emerges from under it.
-      const hiddenY = r ? -(r.top + r.height + 24) : -160;
-      if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
-      panelEl.style.transition = 'none';
-      panelEl.style.opacity = '0';
-      panelEl.style.transform = 'translateY(' + hiddenY + 'px)';
-      panelEl.style.pointerEvents = 'auto';
-      void panelEl.offsetHeight;
-      panelEl.style.transition = 'transform 0.16s cubic-bezier(0.2, 0.9, 0.3, 1), opacity 0.1s ease-out';
-      panelEl.style.opacity = '1';
-      panelEl.style.transform = 'translateY(0)';
-      panelVisible = true;
-      setTimeout(recopy, 400);
-    }
-
-    // graceMs: keep the panel for that long in case the next track is swapped
-    // too (see above); without it the panel leaves right away.
-    function hidePanel(graceMs) {
-      if (!panelEl) return;
-      if (graceMs && panelVisible) {
-        panelGrace = true;
-        if (_graceTimer) clearTimeout(_graceTimer);
-        _graceTimer = setTimeout(() => {
-          _graceTimer = null;
-          panelGrace = false;
-          if (!overlay || overlay.mode === 'original') { restoreTopPlayer(); hidePanel(); }
-        }, graceMs);
-        return;
-      }
-      if (_graceTimer) { clearTimeout(_graceTimer); _graceTimer = null; }
-      panelGrace = false;
-      panelVisible = false;
-      // the slide out is measured from where the block is NOW (the heartbeat
-      // no longer measures in pinmode): one read per hide
-      const r = positionOverNative(true) || _lastRect;
-      const hiddenY = r ? -(r.top + r.height + 24) : -160;
-      if (hidePanelTip) hidePanelTip();
-      panelShownAt = 0;
-      setNativesHidden(false);
-      panelEl.style.pointerEvents = 'none';
-      panelEl.style.transition = 'transform 0.14s cubic-bezier(0.5, 0, 0.8, 0.4), opacity 0.1s ease-in';
-      panelEl.style.opacity = '0';
-      panelEl.style.transform = 'translateY(' + hiddenY + 'px)';
-      if (_hideTimer) clearTimeout(_hideTimer);
-      _hideTimer = setTimeout(() => {
-        _hideTimer = null;
-        if (!overlay || overlay.mode === 'original') { stopPositionTracking(); if (panelEl) panelEl.remove(); }
-      }, 220);
-    }
-
-    // The hold started by hidePanel(graceMs) is over before its timer: it is
-    // now known that the new track is not swapped, so the panel and the
-    // renamed top player must not sit over a track that is already playing.
-    function endPanelGrace() {
-      if (!panelGrace) return;
-      restoreTopPlayer();
-      hidePanel();
     }
 
     // VK's volume (0..1, 0 = muted) drives the overlay, whoever changed it
@@ -5410,43 +4919,101 @@
       if (a.muted) a.muted = false;
     }
 
-    function updatePanel() {
-      if (!panelCtl || !overlay) return;
-      followVkVolume();
-      const a = overlay.audioEl;
-      const cur = a.currentTime;
-      const dur = a.duration;
-      if (panelCtl.progressBar && isFinite(dur) && dur > 0) {
-        const fills = panelCtl.progressBar.querySelectorAll('div[style*="width"]');
-        if (fills[1]) fills[1].style.width = (cur / dur * 100) + '%';
-      }
-      if (panelCtl.progressTime) {
-        // a click on the timer switches elapsed ↔ remaining
-        const txt = clockRemaining && isFinite(dur) && dur > 0 ? '-' + fmtTime(Math.max(0, dur - cur)) : fmtTime(cur);
-        if (panelCtl.progressTime.textContent !== txt) panelCtl.progressTime.textContent = txt;
-      }
-      if (panelCtl.volumeBar) {
-        const fill = panelCtl.volumeBar.querySelector('div[style*="width"]');
-        // the same logarithmic position as VK's slider shows
-        if (fill) fill.style.width = (a.muted ? 0 : Math.log(1 + 34 * a.volume) / Math.log(35) * 100) + '%';
-      }
-      updatePanelPlayIcon(!a.paused);
-      updateTopPopup();
-      updateRowBars();
+    const nativePanelValues = new Map();
+
+    // VK can rewrite these values during rendering. Restore only values
+    // that still belong to us, and retain the last value written by VK.
+    function writeNativePanelValue(node, key, value, read, write) {
+      const current = read(node, key);
+      const previous = nativePanelValues.get(node);
+      if (!previous && current === value) return;
+      const original = previous && previous.value === current ? previous.original : current;
+      nativePanelValues.set(node, { key, value, original, read, write });
+      if (current !== value) write(node, key, value);
     }
 
-    // --- original <-> community version -------------------------------------
-    // «original» hands the (still muted, still paused) native element back to
-    // VK for real and slides the copy away, so VK's own panel is fully in
-    // charge; the same toggle button is injected into VK's panel to come back.
+    function restoreNativePanel() {
+      for (const [node, { key, value, original, read, write }] of nativePanelValues) {
+        if (node.isConnected && read(node, key) === value) write(node, key, original);
+      }
+      nativePanelValues.clear();
+    }
+
+    const readPanelText = node => node.data;
+    const writePanelText = (node, key, value) => { node.data = value; };
+    const readPanelStyle = (node, key) => node.style[key];
+    const writePanelStyle = (node, key, value) => { node.style[key] = value; };
+
+    function updateNativePanel() {
+      const { audioEl, match } = overlay;
+      const { currentTime, duration } = audioEl;
+      for (const [node] of nativePanelValues) {
+        if (!node.isConnected) nativePanelValues.delete(node);
+      }
+      for (const panel of document.querySelectorAll(NATIVE_PANEL_SELECTOR)) {
+        for (const [selector, label] of [[SEL_TITLE, match.title], [SEL_EXTRA, match.artist]]) {
+          const nodes = popTextNodes(panel.querySelector(selector));
+          const first = nodes.find(node => node.data.trim());
+          if (!first) continue;
+          for (const node of nodes) {
+            writeNativePanelValue(node, "data", node === first ? decodeEntities(label || "") : "", readPanelText, writePanelText);
+          }
+        }
+        const badge = panel.querySelector(SEL_NOTICE);
+        if (badge) writeNativePanelValue(badge, "display", "none", readPanelStyle, writePanelStyle);
+        const clock = popTextNodes(panel.querySelector(SEL_PROGRESSTIME)).find(node => /^-?\d+:\d\d(?::\d\d)?$/.test(node.data.trim()));
+        const bar = panel.querySelector(SEL_PROGRESS);
+        if (!(duration > 0 && Number.isFinite(duration))) continue;
+        if (clock) {
+          const remaining = clock.data.trim().startsWith("-");
+          const time = remaining ? "-" + fmtTime(duration - currentTime) : fmtTime(currentTime);
+          writeNativePanelValue(clock, "data", time, readPanelText, writePanelText);
+        }
+        const fills = bar?.querySelectorAll('div[style*="width"]');
+        if (fills?.[1]) {
+          const percent = Math.max(0, Math.min(100, currentTime / duration * 100));
+          const played = Number(percent.toFixed(4)) + "%";
+          writeNativePanelValue(fills[1], "width", played, readPanelStyle, writePanelStyle);
+        }
+      }
+    }
+
+    function updatePanel() {
+      if (!overlayIsSource()) return;
+      followVkVolume();
+      updateNativePanel();
+      applyTopPlayer(overlay.match);
+      updateTopPopup();
+      updateRowBars();
+      try {
+        if (ourMediaMetadata && navigator.mediaSession.metadata !== ourMediaMetadata) navigator.mediaSession.metadata = ourMediaMetadata;
+      } catch {}
+    }
+
+    // The only extra button selects which stream the native UI controls.
     let nativeSwapTimer = null;
     function ensureNativeSwapButton() {
+      if (!overlay || overlay.forSlotKey !== currentSlotKey()) return;
       const native = getVisibleNativePanel();
       const share = native && native.querySelector(SEL_SHARE);
       if (!share || !share.parentNode) return;
-      if (share.parentNode.querySelector('[data-vmu-swap-native]')) return;
-      const b = makeSwapButton(native, 'Включить версию сообщества', 'data-vmu-swap-native', true);
-      b.addEventListener('click', e => { e.stopPropagation(); e.preventDefault(); switchToCommunity(); }, true);
+      const existing = share.parentNode.querySelector('[data-vmu-swap-native]');
+      const title = overlayIsSource() ? 'Включить оригинал' : 'Включить версию сообщества';
+      if (existing) {
+        if (existing.title !== title) {
+          existing.title = title;
+          existing.setAttribute('aria-label', title);
+        }
+        return;
+      }
+      const b = makeSwapButton(native, title, 'data-vmu-swap-native', true);
+      b.addEventListener('click', e => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (overlay?.forSlotKey !== currentSlotKey()) return;
+        if (overlayIsSource()) switchToOriginal();
+        else if (overlay?.mode === 'original') switchToCommunity();
+      }, true);
       share.parentNode.insertBefore(b, share);
     }
     function startNativeSwapButton() {
@@ -5465,7 +5032,7 @@
       overlay.mode = 'original';
       if (overlay.keepAlive) { clearInterval(overlay.keepAlive); overlay.keepAlive = null; }
       try { overlay.audioEl.pause(); } catch {}
-      hidePanel();
+      restoreNativePanel();
       applyMediaSession(false);
       restoreTopPlayer();
       startNativeSwapButton();
@@ -5580,11 +5147,12 @@
         try { nat.muted = true; } catch {}
       }
       overlay.mode = 'community';
+      overlay.userPaused = false;
       applyMediaSession(true);
-      removeNativeSwapButton();
+      startNativeSwapButton();
       overlay.audioEl.play().catch(() => {});
       startNativeKeepAlive(overlay);
-      showPanel(overlay.match);
+      updatePanel();
       console.info('[vmu] preview-swap: switched to the community version');
     }
 
@@ -5599,13 +5167,23 @@
     let origSetActionHandler = null;
     let savedMediaMetadata = null;
     let ourMediaMetadata = null;
-    function overlayIsSource() { return !!(overlay && overlay.mode === 'community'); }
+    function overlayIsSource() {
+      return !!(overlay && overlay.mode === 'community' && overlay.forSlotKey === currentSlotKey());
+    }
+    function setReplacementPlaying(playing) {
+      const source = overlay;
+      source.userPaused = !playing;
+      if (playing) source.audioEl.play().catch(() => {});
+      else {
+        source.audioEl.pause();
+        syncVkPlayState(false);
+      }
+      updatePanel();
+    }
     function mediaDispatcher(action) {
       return details => {
         if (overlayIsSource()) {
-          const a = overlay.audioEl;
-          if (action === 'play') a.play().catch(() => {}); else a.pause();
-          updatePanel();
+          setReplacementPlaying(action === 'play');
           return;
         }
         const h = vkMediaHandlers[action];
@@ -5701,8 +5279,12 @@
           }
           if (curSlot === overlay.forSlotKey) {
             overlay.nativeEl = this;
-            try { overlay.audioEl.play().catch(() => {}); } catch {}
-            signalNativePlaying(this);
+            // VK retries play on its silent element even after a user pause.
+            // A retry must neither restart the replacement nor emit a new
+            // playing event to the same provider.
+            if (overlay.userPaused) return Promise.resolve();
+            if (overlay.audioEl.paused) overlay.audioEl.play().catch(() => {});
+            signalNativePlaying(overlay);
             return Promise.resolve();
           }
         }
@@ -5776,6 +5358,72 @@
       if (overlay) overlay.failSwallowed = true;
       console.info('[vmu] preview-swap: VK player failure on the original ignored — the community version is covering it');
     }
+    function installPlaybackControls() {
+      // Catch activation of the real buttons, including keyboard clicks.
+      // Internal VK pause/play calls still handle queue transitions.
+      if (!document.__vmuStateBtnHook) {
+        document.__vmuStateBtnHook = true;
+        document.addEventListener('click', ev => {
+          const btn = ev.target?.closest?.(SEL_PLAY + "," + SEL_POP_PLAY);
+          if (!btn) return;
+          if (!overlayIsSource()) {
+            if (pendingSwapSlot) pauseRequestedSlot = pendingSwapSlot;
+            return;
+          }
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+          setReplacementPlaying(overlay.audioEl.paused);
+        }, true);
+      }
+
+      // Intercept seek input before React changes the silent native audio.
+      if (!document.__vmuPopSeekHook) {
+        document.__vmuPopSeekHook = true;
+        let popDrag = null;
+        const seekFromPointer = (clientX, bar) => {
+          if (!overlayIsSource() || !bar.isConnected) return;
+          const rect = bar.getBoundingClientRect();
+          const dur = overlay.audioEl.duration;
+          if (!(rect.width > 0) || !isFinite(dur) || dur <= 0) return;
+          const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+          try { overlay.audioEl.currentTime = ratio * dur; } catch {}
+          updatePanel();
+        };
+        document.addEventListener('pointerdown', ev => {
+          if (!overlayIsSource() || ev.button !== 0) return;
+          const bar = swapSeekBar(ev.target);
+          if (!bar) return;
+          // VK's own handler is on pointerdown and takes the pointer capture
+          // with it — it must not reach React, or it would seek the muted
+          // original standing still behind the swap
+          ev.stopPropagation(); ev.preventDefault();
+          popDrag = { pointerId: ev.pointerId, bar, source: overlay };
+          seekFromPointer(ev.clientX, bar);
+        }, true);
+        window.addEventListener('pointermove', ev => {
+          if (popDrag?.pointerId === ev.pointerId && popDrag.source === overlay) {
+            seekFromPointer(ev.clientX, popDrag.bar);
+          }
+        });
+        const stopDrag = ev => { if (popDrag?.pointerId === ev.pointerId) popDrag = null; };
+        window.addEventListener('pointerup', stopDrag);
+        window.addEventListener('pointercancel', stopDrag);
+        document.addEventListener('keydown', ev => {
+          if (!overlayIsSource() || !swapSeekBar(ev.target)) return;
+          const audio = overlay.audioEl;
+          const duration = audio.duration;
+          if (!Number.isFinite(duration) || duration <= 0) return;
+          const positions = { ArrowLeft: audio.currentTime - 5, ArrowRight: audio.currentTime + 5, Home: 0, End: duration };
+          if (!Object.hasOwn(positions, ev.key)) return;
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+          audio.currentTime = Math.max(0, Math.min(duration, positions[ev.key]));
+          updatePanel();
+        }, true);
+      }
+    }
+    installPlaybackControls();
+
     function installFailGuard() {
       const ap = window.ap;
       if (!ap || ap.__vmuFailGuard || typeof ap._sendPlayerErrorStats !== 'function') return;
@@ -5830,78 +5478,15 @@
         const origPause = ap[name];
         if (typeof origPause !== 'function') continue;
         ap[name] = function (...a) {
-          try { if (overlayIsSource()) { overlay.audioEl.pause(); updatePanel(); } } catch {}
+          try { if (overlayIsSource()) setReplacementPlaying(false); } catch {}
           return origPause.apply(this, a);
         };
       }
-      // VK's own play/pause button. Up to the build of 2026-11-16 it went
-      // through pauseByButton / playByButton, which the two hooks above cover.
-      // The build of the 17th calls the generic ap.pause() / ap.play() instead
-      // — confirmed live: pressing the button logs «pause» and never
-      // «pauseByButton», both with and without a swap running. Those two are
-      // what VK's own internals use as well (failure handling, switching
-      // tracks), so hooking them by name would break the swap. The press
-      // itself is unambiguous, so it is read from the DOM instead.
-      if (!document.__vmuStateBtnHook) {
-        document.__vmuStateBtnHook = true;
-        document.addEventListener('pointerdown', ev => {
-          const t = ev.target;
-          if (!t || !t.closest) return;
-          const btn = t.closest(SEL_PLAY + ',' + SEL_POP_PLAY);
-          if (!btn) return;
-          // the swap panel is a copy of the player block with its own handlers
-          if (panelEl && panelEl.contains(btn)) return;
-          if (!overlayIsSource()) {
-            // the swap is still fetching its stream URL and there is nothing to
-            // pause yet — remember the press so startOverlay does not start
-            // playing a moment later
-            if (pendingSwapSlot) pauseRequestedSlot = pendingSwapSlot;
-            return;
-          }
-          try {
-            if (overlay.audioEl.paused) overlay.audioEl.play().catch(() => {});
-            else overlay.audioEl.pause();
-            updatePanel();
-          } catch {}
-        }, true);
-      }
-
-      // The drop-down's timeline: VK would seek the muted original standing
-      // still behind the swap, so the community version is seeked instead.
-      // (the panel over the bottom block does the same with its own copy)
-      if (!document.__vmuPopSeekHook) {
-        document.__vmuPopSeekHook = true;
-        let popDrag = null;
-        const popSeek = (clientX, bar) => {
-          if (!overlay || overlay.mode !== 'community' || !bar || !bar.isConnected) return;
-          const rect = bar.getBoundingClientRect();
-          const dur = overlay.audioEl.duration;
-          if (!(rect.width > 0) || !isFinite(dur) || dur <= 0) return;
-          const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-          try { overlay.audioEl.currentTime = ratio * dur; } catch {}
-          updatePanel();
-        };
-        document.addEventListener('pointerdown', ev => {
-          if (!overlay || overlay.mode !== 'community') return;
-          const bar = swapSeekBar(ev.target);
-          if (!bar) return;
-          // VK's own handler is on pointerdown and takes the pointer capture
-          // with it — it must not reach React, or it would seek the muted
-          // original standing still behind the swap
-          ev.stopPropagation(); ev.preventDefault();
-          popDrag = bar;
-          popSeek(ev.clientX, bar);
-        }, true);
-        window.addEventListener('pointermove', ev => { if (popDrag) popSeek(ev.clientX, popDrag); });
-        window.addEventListener('pointerup', () => { popDrag = null; });
-        window.addEventListener('pointercancel', () => { popDrag = null; });
-      }
-
       // The play button resumes a paused overlay.
       const origPlayByButton = ap.playByButton;
       if (typeof origPlayByButton === 'function') {
         ap.playByButton = function (...a) {
-          try { if (overlayIsSource() && overlay.audioEl.paused) { overlay.audioEl.play().catch(() => {}); updatePanel(); } } catch {}
+          try { if (overlayIsSource() && overlay.audioEl.paused) setReplacementPlaying(true); } catch {}
           return origPlayByButton.apply(this, a);
         };
       }
@@ -5951,8 +5536,10 @@
     // by hand that playback started. Verified live: without these events VK
     // jumped to the next track exactly 20 s into every substituted one; with
     // them it stays on the track (no further play() calls come back).
-    function signalNativePlaying(el) {
-      if (!el) return;
+    function signalNativePlaying(source) {
+      const el = source.nativeEl;
+      if (!el || source.signalledNative === el || source.userPaused) return;
+      source.signalledNative = el;
       try {
         el.dispatchEvent(new Event('play'));
         el.dispatchEvent(new Event('playing'));
@@ -5975,11 +5562,16 @@
       } catch {}
     }
     function startNativeKeepAlive(ov) {
-      signalNativePlaying(ov.nativeEl);
+      signalNativePlaying(ov);
       ov.keepAlive = setInterval(() => {
         if (overlay !== ov) return;
-        try { ov.nativeEl && ov.nativeEl.dispatchEvent(new Event('timeupdate')); } catch {}
-        if (ov.mode === 'community' && !ov.audioEl.paused) syncVkPlayState(true);
+        if (ov.mode === 'community') {
+          if (!ov.userPaused && !ov.audioEl.paused) {
+            try { ov.nativeEl?.dispatchEvent(new Event('timeupdate')); } catch {}
+            syncVkPlayState(true);
+          }
+          updatePanel();
+        }
       }, 500);
     }
 
@@ -5999,12 +5591,9 @@
       removeNativeSwapButton();
       overlay = null; // clear BEFORE calling play to avoid re-entrant hook swallowing it
       applyMediaSession(false);
-      // slot change / natural end: the next track may be swapped as well — keep
-      // the panel and the header text for a moment instead of flashing them away
-      const keepPanel = !mode || mode === 'next';
-      if (!keepPanel) restoreTopPlayer();
-      console.info('[vmu] preview-swap: overlay closed —', reason || (mode ? String(mode) : 'slot changed'));
-      hidePanel(keepPanel ? 1300 : 0);
+      restoreNativePanel();
+      restoreTopPlayer();
+      console.info('[vmu] preview-swap: replacement closed', reason || mode || 'slot changed');
       try { oAudio.pause(); oAudio.removeAttribute('src'); oAudio.load(); } catch {}
       if (mode === 'next') {
         if (oNative) { try { oNative.muted = false; } catch {} }
@@ -6028,17 +5617,6 @@
       if (overlay && overlay.forSlotKey !== slotKey) teardownOverlay(false);
       if (pendingSwapSlot && pendingSwapSlot !== slotKey) pendingSwapSlot = null;
       if (pauseRequestedSlot && pauseRequestedSlot !== slotKey) pauseRequestedSlot = null;
-      // The panel is kept for a moment after a slot change in case the next
-      // track is swapped as well. The moment it is clear that it is not, the
-      // hold ends — measured live: without this the panel and the renamed top
-      // player stayed ~1.3 s over the next track, which was already playing.
-      // The match is looked up before the «VK is playing» guard below on
-      // purpose: knowing there is no counterpart starts nothing by itself.
-      if (panelGrace && !overlay && pendingSwapSlot !== slotKey) {
-        const gTitle = ca[3], gArtist = ca[4];
-        if (curOwner === ownerId || typeof gTitle !== 'string' || typeof gArtist !== 'string'
-          || !findMatch(gArtist, gTitle)) endPanelGrace();
-      }
       if (curOwner === ownerId) { lastSlotKey = slotKey; return false; }
       if (overlay) return overlay.forSlotKey === slotKey;
       if (pendingSwapSlot === slotKey) return true; // async URL fetch in progress
@@ -6152,7 +5730,13 @@
         teardownOverlay('native', 'stream error ' + code);
       });
       audioEl.addEventListener('ended', () => {
-        if (overlay && overlay.audioEl === audioEl) teardownOverlay('next', 'track ended');
+        if (!overlayIsSource() || overlay.audioEl !== audioEl) return;
+        if (window.ap?.isRepeatCurrentAudio?.()) {
+          audioEl.currentTime = 0;
+          audioEl.play().catch(() => teardownOverlay('next', 'repeat failed'));
+          return;
+        }
+        teardownOverlay('next', 'track ended');
       });
       // Panel updates driven by overlay audio events
       audioEl.addEventListener('timeupdate', updatePanel);
@@ -6161,21 +5745,18 @@
       audioEl.addEventListener('loadedmetadata', updatePanel);
       audioEl.addEventListener('durationchange', updatePanel);
       // Set overlay BEFORE play so the hook recognizes our element
-      overlay = { audioEl, nativeEl, forSlotKey: slotKey, mode: 'community', match };
+      overlay = { audioEl, nativeEl, forSlotKey: slotKey, mode: 'community', match, userPaused: false };
       audioEl.addEventListener('play', () => { if (overlay && overlay.audioEl === audioEl && overlayIsSource()) syncVkPlayState(true); });
       audioEl.addEventListener('pause', () => { if (overlay && overlay.audioEl === audioEl && overlayIsSource() && !audioEl.ended) syncVkPlayState(false); });
       audioEl.addEventListener('timeupdate', syncMediaPosition);
       audioEl.addEventListener('durationchange', syncMediaPosition);
       applyMediaSession(true);
       startNativeKeepAlive(overlay);
-      showPanel(match);
+      startNativeSwapButton();
+      updatePanel();
       audioEl.play().catch(err => console.warn('[vmu] preview-swap: overlay play failed:', err));
       window.postMessage({ type: 'VKD_PREVIEW_SWAP_DONE', artist: match.artist, title: match.title }, '*');
     }
-
-    // Remember both play/pause icon states of the native block as it shows
-    // them, so the copy can render either one at any moment.
-    setInterval(cacheNativeIcon, 1000);
 
     // Backstop for whatever the .play() hook misses (autoplay that never
     // calls .play() directly, or _currentAudio updating after it) — cheap

@@ -228,6 +228,12 @@ html.vmu-theme-light {
   font-weight: 500;
 }
 .vmu-pl-sort-row .vmu-toggle { margin: 0; }
+.vmu-covered-triggers {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
 /* Either/or source switch — same visual language as .vmu-fx-ab-switch
    (A/B compare), just auto-width text buttons instead of fixed-width
    letters, since "Как файлы"/"Genius" replaced two independent toggle
@@ -373,17 +379,22 @@ html.vmu-theme-light {
 
 /* ── Drop zone ────────────────────────────────────────────────────────────── */
 #vmu-dropzone {
-  margin: 10px 0;
-  border: 1.5px dashed rgba(var(--vmu-ov),0.13);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  margin: 8px 0 12px;
+  border: 1px dashed rgba(var(--vmu-ov),0.2);
   border-radius: 10px;
-  padding: 22px 16px 18px;
-  text-align: center;
+  padding: 16px;
   transition: border-color .15s, background .15s;
   flex-shrink: 0;
 }
 #vmu-dropzone.vmu-over { border-color: #2688eb; background: rgba(38,136,235,0.07); }
-.vmu-dz-label  { font-size: 14px; font-weight: 500; color: var(--vmu-text); margin-bottom: 4px; }
-.vmu-dz-hint   { font-size: 12px; color: var(--vmu-text-dim); margin-bottom: 14px; }
+.vmu-dz-copy { flex: 1 1 180px; min-width: 0; }
+.vmu-dz-label { font-size: 14px; font-weight: 600; color: var(--vmu-text); margin-bottom: 4px; }
+.vmu-dz-hint { font-size: 12px; line-height: 1.45; color: var(--vmu-text-muted); }
 .vmu-pick-btn {
   display: inline-flex;
   align-items: center;
@@ -401,7 +412,18 @@ html.vmu-theme-light {
 }
 .vmu-pick-btn:hover { background: #1a7ad4; }
 .vmu-pick-btn:active { background: #1567b5; }
+.vmu-pick-btn:disabled { opacity: .6; cursor: default; }
 #vmu-input { display: none; }
+
+.vmu-track-error-tip {
+  border: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+}
+.vmu-track-error-tip:focus-visible,
+.vmu-pick-btn:focus-visible { outline: 2px solid #71aaeb; outline-offset: 2px; }
+.vmu-track-error-tip + .vmu-info .vmu-errmsg { white-space: normal; overflow-wrap: anywhere; }
 
 /* ── "Очистить" in the embedded footer ────────────────────────────────────── */
 .vmu-clear-native {
@@ -1303,6 +1325,11 @@ html.vmu-theme-light {
 html.vmu-pinmode div.vmu-pb-wrap-fixed {
   display: none !important;
 }
+/* The hidden duplicate can sit inside a separate fixed VK container.
+   Its transparent box must let clicks reach the visible player. */
+html.vmu-pinmode .vmu-pb-fixed-host {
+  pointer-events: none !important;
+}
 /* the in-flow copy, once merged: held fixed under the top bar (content.js sets
    left/width to the catalog column's rect each pass; top comes from --vmu-topbar-h,
    set in that same pass) */
@@ -1339,26 +1366,6 @@ html.vmu-pinmode.vmu-merged section[data-testid="AudioPage_PlayerBlock"] {
     inset 1px 0 0 0 var(--vmu-pin-border, rgb(54, 55, 56)),
     inset -1px 0 0 0 var(--vmu-pin-border, rgb(54, 55, 56)) !important;
 }
-/* The swapped-track panel (injected.js, #vmu-overlay-panel) is put right after the
-   player block inside the same wrapper. In this mode it simply covers the block from
-   there — it moves with the pinned wrapper for free instead of being re-positioned by
-   script — and takes the same two looks from the same class. */
-html.vmu-pinmode div.vmu-pb-wrap-pinned > #vmu-overlay-panel {
-  position: absolute !important;
-  top: 0 !important;
-  left: 0 !important;
-  width: 100% !important;
-  border-radius: 12px !important;
-  box-shadow: inset 0 0 0 1px var(--vmu-pin-border, rgb(54, 55, 56)) !important;
-}
-html.vmu-pinmode.vmu-merged div.vmu-pb-wrap-pinned > #vmu-overlay-panel {
-  border-radius: 0 !important;
-  box-shadow:
-    inset 0 1px 0 0 var(--vmu-pin-border, rgb(54, 55, 56)),
-    inset 1px 0 0 0 var(--vmu-pin-border, rgb(54, 55, 56)),
-    inset -1px 0 0 0 var(--vmu-pin-border, rgb(54, 55, 56)) !important;
-}
-
 /* Our pinned tabs+search bar gets the border back on its own outer edges,
    rounded at the bottom — reads as a panel hanging from the multimedia card
    above it. Color is borrowed live from that same card (--vmu-pin-border set
@@ -2173,6 +2180,22 @@ html.vmu-pinmode.vmu-merged div.vmu-pb-wrap-pinned > #vmu-overlay-panel {
 [class*="vkitInternalModalBox"]:has(input[accept*="audio"]),
 [class*="vkitInternalModalBox"]:has([data-testid="UploadAudio_SelectFileButton"]) {
   width: 500px !important;
+  max-width: calc(100vw - 32px) !important;
+}
+
+/* Keep VK's own close control in the upload dialog header. */
+[data-vmu-injected] [data-testid="modalheader"] :has(> [data-testid="modal-close-button"]) {
+  flex: none;
+}
+[data-vmu-injected] [data-testid="modalheader"] [data-testid="modal-close-button"] {
+  position: relative;
+  inset: auto;
+  width: 36px;
+  height: 36px;
+  padding: 8px;
+}
+[data-vmu-injected] [data-testid="modalheader"] [data-testid="modal-close-button"]::before {
+  inset: 4px;
 }
 
 /* ── Audio FX: toggle button (inline in VK's native player bar) + panel ───── */
@@ -2193,6 +2216,7 @@ html.vmu-pinmode.vmu-merged div.vmu-pb-wrap-pinned > #vmu-overlay-panel {
    already tracks that same muted shade in both themes, so use it directly
    instead. */
 #vmu-plmake-btn svg,
+#vmu-bulkalb-btn svg,
 #vmu-bulkops-btn svg,
 #vmu-toolbar-settings-btn svg,
 #vmu-toolbar-sc-btn svg { display: block; color: var(--vmu-text-hint); }
@@ -3213,7 +3237,7 @@ html.vmu-theme-light .vmu-notice { border: 1px solid rgba(0,0,0,0.1); }
 }
 
 /* ── Playlists catalog page: "TITLE - link" collector ─────────────────────── */
-.vmu-plcollect-row { padding: 2px 12px 12px; }
+.vmu-plcollect-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 12px 12px; }
 .vmu-plcollect-btn {
   background: none;
   border: 0;
@@ -3228,6 +3252,8 @@ html.vmu-theme-light .vmu-notice { border: 1px solid rgba(0,0,0,0.1); }
 .vmu-plcollect-btn:hover { text-decoration: underline; }
 .vmu-plcollect-btn:disabled { opacity: 0.5; cursor: default; text-decoration: none; }
 .vmu-plcollect-modal { width: 640px; max-width: calc(100vw - 48px); }
+#vmu-puerrito-status { white-space: pre-line; }
+#vmu-puerrito-panel button[hidden] { display: none; }
 .vmu-plcollect-body { display: flex; flex-direction: column; gap: 10px; padding: 10px 12px; }
 .vmu-plcollect-text {
   width: 100%;

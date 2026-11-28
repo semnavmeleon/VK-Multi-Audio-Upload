@@ -9,7 +9,9 @@
     "https://*.soundcloud.com/*",
     "https://snd.sc/*",
     "https://*.sndcdn.com/*",
-    "https://*.genius.com/*"
+    "https://*.genius.com/*",
+    "https://*.userapi.com/*",
+    "https://*.vkuserphoto.ru/*"
   ],
   "action": {
     "default_title": "VK Multi Audio Upload"

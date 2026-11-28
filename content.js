@@ -139,6 +139,7 @@
   // keyed by filename instead of a single global callback/item.
   const uploadDoneCallbacks = new Map();   // fileName -> (data) => void
   const uploadingItemsByName = new Map();  // fileName -> queue item
+  let nativeUploadTracker = null;
   // autoPlaylistClaimed: synchronous "am I the one tracking THIS upload
   // call towards auto-playlist" claim, set/checked with no `await` in
   // between (see handoffFilesNatively) so two near-simultaneous calls for
@@ -164,6 +165,7 @@
 
   window.addEventListener('message', (e) => {
     if (e.source !== window) return;
+    updateNativeUploadTracker(e.data);
     if (e.data?.type === 'VK_UPLOAD_DONE') {
       const fn = e.data.fileName;
       const cb = fn ? uploadDoneCallbacks.get(fn) : null;
@@ -208,7 +210,7 @@
     // static dropzone out for VK's own dialog content so its real progress
     // bar and success/error state show instead of our UI sitting frozen on
     // top of it.
-    if (e.data?.type === 'VK_HANDOFF_DISPATCHED' && e.data.ok) {
+    if (e.data?.type === 'VK_HANDOFF_DISPATCHED' && e.data.ok && !e.data.batchId) {
       revealNativeUploadUI();
     }
     // Preview-swap actually replaced what's streaming — the mini-player's own
@@ -1366,7 +1368,7 @@
     //   - shrunk to a small icon-only chip (default — keeps it usable but
     //     stops it from grabbing clicks past x=40)
     if (settings.hideScrollToTop) {
-      parts.push(`#stl_left { display: none !important; }`);
+      parts.push(`#stl_left, #stl_side { display: none !important; }`);
     } else {
       // Constrain outer #stl_left (click area) to a 40px rail and stretch
       // inner #stl_bg to the rail's full height so the hover highlight
@@ -1375,7 +1377,7 @@
       // — they pushed the arrow off-center. The "Наверх" text is hidden via
       // font-size:0 on #stl_text (SVG keeps its pixel width/height
       // attributes so the arrow icon stays visible).
-      parts.push(`#stl_left { width: 40px !important; }`);
+      parts.push(`#stl_left, #stl_side { width: 40px !important; }`);
       parts.push(`#stl_bg { width: 40px !important; height: calc(100% - 60px) !important; padding: 0 !important; margin: 60px 0 0 !important; overflow: hidden !important; display: flex !important; align-items: flex-start !important; justify-content: center !important; }`);
       parts.push(`#stl_text { font-size: 0 !important; margin: 0 !important; display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; height: 40px !important; flex: none !important; }`);
       parts.push(`#stl_text svg { width: 20px !important; height: 20px !important; margin: 0 !important; }`);
@@ -1389,7 +1391,7 @@
     // immediately after it to collapse back to a single gap.
     if (settings.hideFriendsMusic) {
       parts.push(`[data-testid="AudioCatalog_SectionFriendsMusic"] { display: none !important; }`);
-      parts.push(`[data-testid="AudioCatalog_SectionFriendsMusic"] + div { display: none !important; }`);
+      parts.push(`[data-testid="AudioCatalog_SectionFriendsMusic"] + div:empty:not([id], [role], [data-testid]) { display: none !important; }`);
     }
 
     if (settings.optimizeBigPlaylists) {
@@ -2658,8 +2660,8 @@
   // have that ceiling, but needs the sticky threshold reimplemented by hand
   // (engage only once scrolled past the natural position — otherwise it'd be
   // permanently glued to the top, leaving a dead gap where it used to sit)
-  // and the space it vacates reserved (padding-top on the section) only
-  // while engaged, so content doesn't jump.
+  // and reserve the space it vacates while engaged. The section's padding
+  // must reach the bottom of the pinned rows at the merge point.
   // applyTabsBarPin runs on every scroll event, and its three document-wide
   // attribute queries (one of them a substring match over every element's
   // class) were a large part of its ~1.5 ms. The page structure it looks up
@@ -2675,8 +2677,8 @@
     return v;
   }
   // (The page-background notch of applyAudioHeaderSplit must NOT be moved when the bar is
-  // pinned / released: the padding takes exactly the bar's place, the content below does
-  // not move. Shifting it by the padding difference put it ~92 px off, over the tabs.)
+  // pinned / released by hand: applyAudioHeaderSplit measures the gap from the
+  // content below the bar. A second offset would move the notch over the tabs.)
   // Writes that change nothing are skipped: classList.add / a style assignment produce a
   // mutation record even when the value is the same, and this function runs from the
   // mutation watcher — so it kept waking itself (and every other observer on the page).
@@ -2718,7 +2720,8 @@
     let topBarBottom = 48;
     let mmCard = null;
     let playerBlocks = [];
-    let mergeNow = null; // null: no player block on the page, fall back to the tabs' own position
+    let flowWrap = null;
+    let playerDistanceToMerge = null; // Without a player, the tabs set the threshold.
     if (needLayout) {
       const topBar = document.querySelector('[class*="vkuiFixedLayout"]');
       topBarBottom = topBar ? topBar.getBoundingClientRect().bottom : 48;
@@ -2736,15 +2739,15 @@
       // all matches always lands on whichever is actually visible.
       let playerBottom = 0;
       let visiblePlayerBlock = null;
-      let minTop = Infinity, playerH = 0;
+      let playerH = 0;
       // fresh on every call (not cached): the appearance of VK's second, pinned copy is
       // exactly the event the merge has to catch
       playerBlocks = [...document.querySelectorAll('[data-testid="AudioPage_PlayerBlock"]')];
       for (const pb of playerBlocks) {
         markPlayerBlockWrap(pb);
+        if (pb.parentElement?.classList.contains('vmu-pb-wrap-flow')) flowWrap ||= pb.parentElement;
         const r = pb.getBoundingClientRect();
         if (r.bottom > playerBottom) { playerBottom = r.bottom; visiblePlayerBlock = pb; }
-        if (r.top < minTop) minTop = r.top;
         if (r.height > playerH) playerH = r.height;
       }
       // The anchor is where VK's PINNED player copy sits — the top bar's bottom
@@ -2757,15 +2760,19 @@
       // top bar), not later when the tabs happen to scroll up to the anchor — that
       // delay was what made the player's corners flatten first and the tabs and
       // the search box follow one after another a bit further down the scroll.
-      // Decided by where the in-flow copy (the first one in the document) is, and
-      // by nothing else. The presence of VK's second, pinned copy used to count as
+      // While pinned, the spacer tracks the player's natural position as the page
+      // scrolls. The fixed wrapper's viewport position is constant. VK's duplicate
+      // must not determine when to release the bar: it used to count as
       // well — but VK adds it a little after the merge point on the way down and
       // removes it a little after on the way up, so on the way up the bar stayed
       // pinned until VK had finished (and if scrolling stopped just there, until
       // some later mutation): the player was back to rounded corners while the tabs
       // were still merged to it.
       // (no player block at all — nothing has been played yet: null, the tabs' own rule)
-      mergeNow = playerBlocks.length > 0 ? playerBlocks[0].getBoundingClientRect().top <= topBarBottom + 0.5 : null;
+      if (flowWrap) {
+        const flowSlot = _pinPlayerSpacer?.nextElementSibling === flowWrap ? _pinPlayerSpacer : flowWrap;
+        playerDistanceToMerge = flowSlot.getBoundingClientRect().top - topBarBottom;
+      }
 
       // The multimedia card (AudioPage_PlayerBlock's own vkitInternalGroupCard
       // wrapper) draws its "border" via a uniform inset box-shadow on ::before,
@@ -2802,92 +2809,67 @@
     for (const section of sections) {
       const tabs = section.querySelector(':scope > [data-testid="headerlayout"]');
       const search = section.children[1];
-      const isSearchWrap = search && search !== tabs && search.querySelector('[class*="vkuiSearch"]');
-      if (!tabs) continue;
-
+      const searchWrap = search && search !== tabs && search.querySelector('[class*="vkuiSearch"]') ? search : null;
+      let layout = section.__vmuPinnedLayout;
       const unpin = () => {
-        for (const el of [tabs, isSearchWrap ? search : null]) {
-          if (!el || !el.classList.contains('vmu-tabs-pinned')) continue;
+        if (!layout) return;
+        for (const el of [layout.tabs, layout.search]) {
+          if (!el) continue;
           el.classList.remove('vmu-tabs-pinned', 'vmu-pin-top', 'vmu-pin-bottom');
           el.style.top = el.style.left = el.style.width = el.style.background = '';
         }
-        if (section.style.paddingTop) section.style.paddingTop = '';
+        section.style.paddingTop = layout.inlinePadding;
+        delete section.__vmuPinnedLayout;
+        layout = null;
       };
 
-      if (!settings.pinTabsBar) { unpin(); continue; }
+      if (!settings.pinTabsBar || !tabs) { unpin(); continue; }
+      if (layout && (layout.tabs !== tabs || layout.search !== searchWrap)) unpin();
 
-      // Capture tabs' natural (in-flow) offset from the section's top exactly
-      // once, before we ever touch its position — section.getBoundingClientRect().top
-      // stays valid as an anchor even once pinned (a fixed child doesn't move
-      // its parent), but tabs' own rect no longer reflects "where it would be"
-      // once it's position:fixed, so the offset has to be cached up front.
-      if (section.dataset.vmuTabsOffset === undefined) {
-        section.dataset.vmuTabsOffset = String(tabs.getBoundingClientRect().top - section.getBoundingClientRect().top);
-        section.dataset.vmuBasePadTop = String(parseFloat(getComputedStyle(section).paddingTop) || 0);
+      const sRect = section.getBoundingClientRect();
+      const tabsRect = layout ? null : tabs.getBoundingClientRect();
+      const tabsOffset = layout ? layout.tabsOffset : tabsRect.top - sRect.top;
+      const distanceToMerge = playerDistanceToMerge ?? (sRect.top + tabsOffset - anchor);
+      if (distanceToMerge > (playerDistanceToMerge === null ? 0 : 0.5)) { unpin(); continue; }
+
+      if (!layout) {
+        const searchRect = searchWrap?.getBoundingClientRect();
+        layout = section.__vmuPinnedLayout = {
+          tabs,
+          search: searchWrap,
+          tabsOffset,
+          inlinePadding: section.style.paddingTop,
+          // Preserve the native spacing around the rows as well as their heights.
+          flowSpacing: (searchRect || tabsRect).bottom - sRect.top - section.clientTop
+            - tabsRect.height - (searchRect?.height || 0),
+        };
       }
-      const tabsOffset = Number(section.dataset.vmuTabsOffset) || 0;
-      const naturalTabsViewportTop = section.getBoundingClientRect().top + tabsOffset;
 
-      // With a player block the merge follows VK's own switch; without one the
-      // old rule (the tabs reached the anchor while scrolling) applies.
-      if (mergeNow === null ? naturalTabsViewportTop > anchor : !mergeNow) { unpin(); continue; }
-
-      const basePad = Number(section.dataset.vmuBasePadTop) || 0;
       const nowBg = performance.now();
       if (!section.__vmuBgAt || nowBg - section.__vmuBgAt > 2000) {
         section.__vmuBgAt = nowBg;
         section.__vmuBg = getComputedStyle(section).backgroundColor;
       }
-      const bg = section.__vmuBg;
-      const sRect = section.getBoundingClientRect(); // already reflects any active content-offset shift
-
-      // The heights of the tabs row and the search box are measured while they
-      // are still in the flow (re-measured at most once a second), so that the
-      // moment they get pinned there is nothing left to READ: all the style
-      // writes below land together and the browser lays the page out once, in
-      // that frame. Reading a height after writing the position (as before) forced
-      // a full layout of the whole page between the writes — twice.
-      if (!tabs.classList.contains('vmu-tabs-pinned')) {
-        const nowH = performance.now();
-        if (section.__vmuTabsH === undefined || nowH - (section.__vmuHAt || 0) > 1000) {
-          section.__vmuHAt = nowH;
-          section.__vmuTabsH = tabs.getBoundingClientRect().height;
-          section.__vmuSearchH = isSearchWrap ? search.getBoundingClientRect().height : 0;
-        }
-      }
-      let tabsH = section.__vmuTabsH;
-      let searchH = section.__vmuSearchH || 0;
-      const measured = tabsH !== undefined;
 
       anyEngaged = true;
       engagedRect = sRect;
-      pinAddCls(tabs, 'vmu-tabs-pinned', 'vmu-pin-top');
-      pinSetStyle(tabs, 'left', sRect.left + 'px');
-      pinSetStyle(tabs, 'width', sRect.width + 'px');
-      pinSetStyle(tabs, 'top', anchor + 'px');
-      pinSetStyle(tabs, 'background', bg);
-      if (!measured) tabsH = tabs.getBoundingClientRect().height; // first time ever: no cached height yet
-
-      if (isSearchWrap) {
-        pinAddCls(search, 'vmu-tabs-pinned', 'vmu-pin-bottom');
-        pinSetStyle(search, 'left', sRect.left + 'px');
-        pinSetStyle(search, 'width', sRect.width + 'px');
-        pinSetStyle(search, 'top', (anchor + tabsH) + 'px');
-        pinSetStyle(search, 'background', bg);
-        if (!measured) searchH = search.getBoundingClientRect().height;
-      } else {
-        // No separate search wrapper on this tab — tabs is the last piece,
-        // so it needs the bottom rounding+border itself.
-        pinAddCls(tabs, 'vmu-pin-bottom');
+      for (const row of searchWrap ? [tabs, searchWrap] : [tabs]) {
+        pinAddCls(row, 'vmu-tabs-pinned', row === tabs ? 'vmu-pin-top' : 'vmu-pin-bottom');
+        pinSetStyle(row, 'left', sRect.left + 'px');
+        pinSetStyle(row, 'width', sRect.width + 'px');
+        pinSetStyle(row, 'background', section.__vmuBg);
       }
-      // (heights read while already pinned include the border — not cached; the next unpinned pass measures the natural ones)
+      if (!searchWrap) pinAddCls(tabs, 'vmu-pin-bottom');
+      pinSetStyle(tabs, 'top', anchor + 'px');
 
-      // Exactly what the bar occupied in the flow (the unpinned heights), so the content
-      // below does not move by even a pixel at the moment of the merge. (The pinned bar is
-      // 1 px taller — its bottom border — which just overlaps the notch gap below it; heights
-      // read while already pinned include that pixel, hence the -1 in that rare path.)
-      const newPad = basePad + tabsH + searchH - (measured ? 0 : 1);
-      pinSetStyle(section, 'paddingTop', newPad + 'px');
+      // A resize or a search state change can change the height of a pinned row.
+      // Use its current height to position the search and reserve room below it.
+      const tabsBottom = tabs.getBoundingClientRect().bottom;
+      if (searchWrap) pinSetStyle(searchWrap, 'top', tabsBottom + 'px');
+      const headerBottom = searchWrap ? searchWrap.getBoundingClientRect().bottom : tabsBottom;
+      const sectionTopAtMerge = sRect.top - distanceToMerge + section.clientTop;
+      const padding = Math.max(headerBottom - anchor + layout.flowSpacing, headerBottom - sectionTopAtMerge);
+      pinSetStyle(section, 'paddingTop', padding + 'px');
     }
 
     // The player block's own wrapper gets the same treatment, once per pass rather than
@@ -2899,18 +2881,28 @@
     // sticky element anywhere to stick to. --vmu-topbar-h (set above) supplies the top
     // offset from CSS; only left/width (the catalog column's own, ever-changing rect)
     // need setting here, exactly like the tabs just above.
-    const flowWrap = document.querySelector('div.vmu-pb-wrap-flow');
-    const fixedWrap = document.querySelector('div.vmu-pb-wrap-fixed');
-    if (fixedWrap) pinSetStyle(fixedWrap, 'display', needLayout ? 'none' : '');
-    if (flowWrap) {
-      if (anyEngaged && engagedRect) {
-        pinAddCls(flowWrap, 'vmu-pb-wrap-pinned');
-        pinSetStyle(flowWrap, 'left', engagedRect.left + 'px');
-        pinSetStyle(flowWrap, 'width', engagedRect.width + 'px');
-      } else if (flowWrap.classList.contains('vmu-pb-wrap-pinned')) {
-        flowWrap.classList.remove('vmu-pb-wrap-pinned');
-        flowWrap.style.left = flowWrap.style.width = '';
+    const pinnedPlayer = anyEngaged ? flowWrap : null;
+    if (_pinPlayerWrap !== pinnedPlayer) {
+      if (_pinPlayerWrap) {
+        _pinPlayerWrap.classList.remove('vmu-pb-wrap-pinned');
+        _pinPlayerWrap.style.left = _pinPlayerWrap.style.width = '';
+        _pinPlayerSpacer.remove();
       }
+      _pinPlayerWrap = pinnedPlayer;
+      _pinPlayerSpacer = null;
+    }
+    if (pinnedPlayer) {
+      if (_pinPlayerSpacer?.nextElementSibling !== pinnedPlayer) {
+        _pinPlayerSpacer?.remove();
+        const height = pinnedPlayer.getBoundingClientRect().height;
+        _pinPlayerSpacer = document.createElement('div');
+        _pinPlayerSpacer.setAttribute('aria-hidden', 'true');
+        _pinPlayerSpacer.style.height = height + 'px';
+        pinnedPlayer.before(_pinPlayerSpacer);
+      }
+      pinAddCls(pinnedPlayer, 'vmu-pb-wrap-pinned');
+      pinSetStyle(pinnedPlayer, 'left', engagedRect.left + 'px');
+      pinSetStyle(pinnedPlayer, 'width', engagedRect.width + 'px');
     }
 
     _pinEngagedState = anyEngaged;
@@ -2921,11 +2913,13 @@
     //   vmu-merged  — the tabs are pinned under the player right now: flat corners, no
     //                 outline between the two. Same pass, same frame as the pin itself.
     const root = document.documentElement;
-    if (root.classList.contains('vmu-pinmode') !== needLayout) root.classList.toggle('vmu-pinmode', needLayout);
+    const replaceVkPlayer = !!flowWrap;
+    if (root.classList.contains('vmu-pinmode') !== replaceVkPlayer) root.classList.toggle('vmu-pinmode', replaceVkPlayer);
     if (root.classList.contains('vmu-merged') !== anyEngaged) root.classList.toggle('vmu-merged', anyEngaged);
   }
 
   var _pinBorderEl = null, _pinBorderAt = 0; // var: applyTabsBarPin can run before this line is reached
+  var _pinPlayerWrap = null, _pinPlayerSpacer = null;
   function applyAudioCatalogLayout() {
     applyAudioHeaderSplit();
     applyTabsBarPin();
@@ -3124,26 +3118,26 @@
   // panel's default params — Impact/176/outline 3/red-on-white/center/
   // 37°/115% — so the auto-playlist cover matches what the manual editor
   // produces instead of the old separate Georgia/-45°/no-outline look.
-  function makePerezalitoCover(coverDataUrl) {
+  function makePerezalitoCover(coverDataUrl, preset = VMU_COVER_DEFAULTS) {
     return new Promise(resolve => {
       const canvas = document.createElement('canvas');
       canvas.width = 1000; canvas.height = 1000;
       const ctx = canvas.getContext('2d');
       const img = new Image();
       img.onload = () => {
-        ctx.drawImage(img, 0, 0, 1000, 1000);
-        const layer = vmuBuildTextLayerPipeline({
-          text: 'перезалито',
-          fontFamily: 'Impact',
-          fontSize: 176,
-          textColor: [255, 0, 0],
-          outlineColor: [255, 255, 255],
-          outlineWidth: 3,
-          opacity: 255,
-        }, 115, 37);
-        const [px, py] = vmuComputePosition([1000, 1000], [layer.width, layer.height], 'center');
-        ctx.drawImage(layer, px, py);
-        canvas.toBlob(resolve, 'image/jpeg', 0.92);
+        try {
+          ctx.drawImage(img, 0, 0, 1000, 1000);
+          const layer = vmuBuildTextLayerPipeline({
+            ...preset,
+            textColor: vmuHexToRgb(preset.textColor),
+            outlineColor: vmuHexToRgb(preset.outlineColor),
+          }, preset.scale, preset.rotation);
+          const [px, py] = vmuComputePosition([1000, 1000], [layer.width, layer.height], preset.position, [preset.x, preset.y]);
+          ctx.drawImage(layer, px, py);
+          canvas.toBlob(resolve, 'image/jpeg', 0.92);
+        } catch {
+          resolve(null);
+        }
       };
       img.onerror = () => resolve(null);
       img.src = coverDataUrl;
@@ -3495,6 +3489,10 @@
           .catch(err => sendResponse({ ok: false, error: err?.message || String(err) }));
         return true;
       }
+      if (msg?.type === 'VMU_PUERRITO_READY') {
+        sendResponse({ ok: true });
+        return false;
+      }
       return false;
     });
   }
@@ -3585,13 +3583,14 @@
   // which callers treat as "upload didn't really go through, don't create a
   // playlist for nothing".
   function waitForTrackCountIncrease(startCount, expected, timeoutMs, onTick) {
-    timeoutMs = timeoutMs || Math.max(20000, expected * 8000);
+    const target = typeof expected === 'function' ? expected : () => expected;
+    timeoutMs = timeoutMs || Math.max(20000, target() * 8000);
     return new Promise(resolve => {
       const deadline = Date.now() + timeoutMs;
       const tick = () => {
         const now = getPageTrackCount();
         const gained = now == null ? 0 : Math.max(0, now - startCount);
-        if (gained >= expected || Date.now() >= deadline) { resolve(gained); return; }
+        if (gained >= target() || Date.now() >= deadline) { resolve(gained); return; }
         // A batch of a dozen files buys itself a minute and a half of this
         // wait; without a visible countdown it reads as a page that simply
         // stopped doing anything.
@@ -4124,18 +4123,23 @@
   // actually close — VK closes it only once the save request succeeds, so a
   // still-open dialog after the timeout means the save failed and the
   // caller must NOT reload.
-  async function saveEditPlaylistDialog(box) {
-    const current = () => (isEditPlaylistBoxOpen(box) ? box : getEditPlaylistBox());
+  async function saveEditPlaylistDialog(box, { coverChanged = true, strictBox = false } = {}) {
+    const current = () => (isEditPlaylistBoxOpen(box) ? box : strictBox ? null : getEditPlaylistBox());
     const coverBusy = b => !!b.querySelector('.ape_cover [class*="progress"], .ape_cover [class*="loading"], .ape_cover [class*="pinner"]');
 
     let deadline = Date.now() + 10000;
-    while (Date.now() < deadline) {
-      const b = current();
-      if (!b) throw new Error('Диалог плейлиста был закрыт до сохранения обложки');
-      if (b.querySelector('.ape_cover img, .ape_cover [style*="background"]') && !coverBusy(b)) break;
-      await sleep(300);
+    if (coverChanged) {
+      let coverReady = false;
+      while (Date.now() < deadline) {
+        const b = current();
+        if (!b) throw new Error('Диалог плейлиста был закрыт до сохранения обложки');
+        coverReady = !!b.querySelector('.ape_cover img, .ape_cover [style*="background"]') && !coverBusy(b);
+        if (coverReady) break;
+        await sleep(300);
+      }
+      if (!coverReady && strictBox) throw new Error('Загрузка обложки не завершилась');
+      await sleep(500); // Let VK register the finished upload before Save reads it.
     }
-    await sleep(500); // settle: let VK's own form state register the finished upload before Save reads it
 
     let saveBtn = null;
     deadline = Date.now() + 10000;
@@ -4449,6 +4453,64 @@
     });
   }
 
+  // Keep the artist in shortened queries when the catalog title separates it.
+  function geniusCoverQueries(title) {
+    const { name, artist, year } = plcParseTitle(title);
+    const clean = value => value.replace(/\s+/g, ' ').trim();
+    const nameWithoutSuffix = clean(name.replace(/(?:\s*\([^()]*\)|\s*\[[^\[\]]*\])+\s*$/, ''));
+    const shortName = nameWithoutSuffix || name;
+    const words = shortName.split(' ');
+    const minWords = artist ? 1 : 2;
+    const query = name => clean([name, artist].filter(Boolean).join(' '));
+    const options = [
+      { query: clean(parseGeniusQueryFromTitle(title).query), name },
+      { query: query(shortName), name: shortName },
+      ...[1, 2, 3].map(n => {
+        const shortened = words.length - n >= minWords ? words.slice(0, -n).join(' ') : '';
+        return { query: shortened ? query(shortened) : '', name: shortened };
+      }),
+    ];
+    const seen = new Set();
+    return options.filter(option => {
+      const key = option.query.toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 4).map(option => ({ ...option, artist, year }));
+  }
+
+  function matchGeniusCoverAlbums(albums, { name, artist, year }) {
+    const key = value => normalizeNamePart(value).replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    const nameKey = key(name);
+    const artistKey = key(artist);
+    if (!nameKey) return [];
+    const matches = albums.filter(album => {
+      const albumName = key(album.name);
+      const albumArtist = key(stripGeniusTranslation(album.artist));
+      if (artistKey) return albumName === nameKey && albumArtist === artistKey;
+      return [albumName, `${albumName} ${albumArtist}`, `${albumArtist} ${albumName}`].includes(nameKey);
+    });
+    const byYear = year ? matches.filter(album => album.release?.match(/\b\d{4}\b/)?.[0] === String(year)) : [];
+    const candidates = byYear.length ? byYear : matches;
+    return candidates.length === 1 ? candidates : [];
+  }
+
+  async function searchGeniusCoverAlbums(title, select = albums => albums, stopped = () => false) {
+    let error = 'Подходящая обложка на Genius не найдена';
+    for (const attempt of geniusCoverQueries(title)) {
+      if (stopped()) break;
+      const result = await geniusMsg('VKD_GENIUS_SEARCH', { query: attempt.query });
+      if (!result?.ok) {
+        error = result?.error || 'Не удалось получить ответ Genius';
+        continue;
+      }
+      const albums = select((result.albums || []).filter(album => album.coverFull || album.cover), attempt);
+      if (albums.length) return { ok: true, albums };
+      error = 'Подходящая обложка на Genius не найдена';
+    }
+    return { ok: false, error };
+  }
+
   async function applyPlaylistSortFromGeniusAlbum(box, album) {
     const res = await geniusMsg('VKD_GENIUS_TRACKS', { albumId: album.id, albumUrl: album.url });
     if (!res?.ok) { showToast('Genius: ' + (res?.error || 'не удалось получить треклист'), true); return; }
@@ -4587,6 +4649,30 @@
   }
 
   // ─── cover text-overlay editor: panel ───────────────────────────────────────────
+  const VMU_COVER_DEFAULTS = {
+    text: 'перезалито',
+    fontFamily: 'Impact',
+    fontSize: 176,
+    outlineWidth: 3,
+    textColor: '#ff0000',
+    outlineColor: '#ffffff',
+    position: 'center',
+    x: 500,
+    y: 500,
+    rotation: 37,
+    scale: 115,
+    opacity: 255,
+  };
+
+  const VMU_PUERRITO_COVER_PRESET = {
+    ...VMU_COVER_DEFAULTS,
+    text: 'перезалито\nмагазином чая\nпуэррито',
+    fontSize: 150,
+    position: 'custom',
+    x: 475,
+    y: 530,
+  };
+
   // Small reusable "label + slider + live readout + reset" row — identical
   // markup/classes to buildAudioFxPanel's limiterRow, so no new CSS is needed.
   function vmuCoveredSliderRow(id, label, min, max, step, value, unit) {
@@ -4618,11 +4704,17 @@
     wrap.innerHTML = `
       <div class="vmu-pl-sort-row">
         <span class="vmu-pl-sort-label">Обложка с текстом${helpIcon('Подтянуть обложку альбома с Genius или выбрать файл, наложить текст (шрифт, цвет, обводка, позиция, поворот — как в отдельном редакторе обложек) и сразу поставить результат обложкой этого плейлиста.')}</span>
-        <button type="button" id="vmu-covered-open" class="vmu-pick-btn">Открыть</button>
+        <div class="vmu-covered-triggers">
+          <button type="button" id="vmu-covered-open" class="vmu-pick-btn">Открыть</button>
+          <button type="button" id="vmu-covered-puerrito" class="vmu-pick-btn">ПУЭРРИТО</button>
+        </div>
       </div>
     `;
     anchor.insertAdjacentElement('afterend', wrap);
     wrap.querySelector('#vmu-covered-open').addEventListener('click', () => openCoverEditorPanel(box));
+    wrap.querySelector('#vmu-covered-puerrito').addEventListener('click', () => {
+      openCoverEditorPanel(box, VMU_PUERRITO_COVER_PRESET);
+    });
   }
 
   // Adds the "Добавить с Genius" trigger row into the edit-playlist dialog,
@@ -4856,7 +4948,8 @@
   // on its own, then saveEditPlaylistDialog clicks the edit dialog's own
   // Save. That's what makes "Применить" end with the cover persisted, no
   // manual file dialog or Save click.
-  function openCoverEditorPanel(box) {
+  function openCoverEditorPanel(box, preset = VMU_COVER_DEFAULTS) {
+    const { text, fontFamily, fontSize, outlineWidth, textColor, outlineColor, position, x, y, rotation, scale, opacity } = preset;
     document.getElementById('vmu-covered-panel')?.remove();
 
     const panel = document.createElement('div');
@@ -4900,7 +4993,7 @@
             <span class="vmu-covered-canvas-hint">Клик по обложке — своя позиция текста</span>
           </div>
 
-          <textarea id="vmu-covered-text" class="vmu-covered-text" rows="2" placeholder="Текст на обложке">перезалито</textarea>
+          <textarea id="vmu-covered-text" class="vmu-covered-text" rows="${Math.max(2, text.split('\n').length)}" placeholder="Текст на обложке"></textarea>
 
           <div class="vmu-setting-row">
             <span class="vmu-setting-label">Шрифт</span>
@@ -4909,19 +5002,19 @@
             </select>
           </div>
 
-          ${vmuCoveredSliderRow('vmu-covered-fontsize', 'Размер шрифта', 10, 300, 1, 176, '')}
-          ${vmuCoveredSliderRow('vmu-covered-outlinewidth', 'Толщина обводки', 0, 10, 1, 3, '')}
+          ${vmuCoveredSliderRow('vmu-covered-fontsize', 'Размер шрифта', 10, 300, 1, fontSize, '')}
+          ${vmuCoveredSliderRow('vmu-covered-outlinewidth', 'Толщина обводки', 0, 10, 1, outlineWidth, '')}
 
           <div class="vmu-setting-row">
             <span class="vmu-setting-label">Цвет текста</span>
             <div class="vmu-covered-color-cell">
-              <input type="color" id="vmu-covered-textcolor" value="#ff0000">
+              <input type="color" id="vmu-covered-textcolor" value="${textColor}">
               <button type="button" id="vmu-covered-random" class="vmu-slider-reset" title="Случайный цвет">🎲</button>
             </div>
           </div>
           <div class="vmu-setting-row">
             <span class="vmu-setting-label">Цвет обводки</span>
-            <input type="color" id="vmu-covered-outlinecolor" value="#ffffff">
+            <input type="color" id="vmu-covered-outlinecolor" value="${outlineColor}">
           </div>
 
           <div class="vmu-setting-row">
@@ -4933,14 +5026,14 @@
           <div class="vmu-setting-row" id="vmu-covered-custom-row" style="display:none">
             <span class="vmu-setting-label">Коорд. X / Y</span>
             <div class="vmu-covered-xy">
-              <input type="number" id="vmu-covered-x" value="500">
-              <input type="number" id="vmu-covered-y" value="500">
+              <input type="number" id="vmu-covered-x" value="${x}">
+              <input type="number" id="vmu-covered-y" value="${y}">
             </div>
           </div>
 
-          ${vmuCoveredSliderRow('vmu-covered-rotation', 'Поворот, °', -180, 180, 1, 37, '')}
-          ${vmuCoveredSliderRow('vmu-covered-scale', 'Масштаб, %', 10, 500, 1, 115, '')}
-          ${vmuCoveredSliderRow('vmu-covered-opacity', 'Прозрачность', 0, 255, 1, 255, '')}
+          ${vmuCoveredSliderRow('vmu-covered-rotation', 'Поворот, °', -180, 180, 1, rotation, '')}
+          ${vmuCoveredSliderRow('vmu-covered-scale', 'Масштаб, %', 10, 500, 1, scale, '')}
+          ${vmuCoveredSliderRow('vmu-covered-opacity', 'Прозрачность', 0, 255, 1, opacity, '')}
 
           <div class="vmu-covered-actions">
             <span class="vmu-covered-status" id="vmu-covered-status"></span>
@@ -4956,7 +5049,7 @@
     panel.querySelector('#vmu-covered-close').addEventListener('click', () => panel.remove());
 
     const BASE = 1000;
-    const state = { baseCanvas: null, resultCanvas: null, customX: 500, customY: 500, renderTimer: null };
+    const state = { baseCanvas: null, resultCanvas: null, customX: x, customY: y, renderTimer: null };
 
     const canvas = panel.querySelector('#vmu-covered-canvas');
     const cctx = canvas.getContext('2d');
@@ -4982,11 +5075,15 @@
       download: panel.querySelector('#vmu-covered-download'),
       status: panel.querySelector('#vmu-covered-status'),
     };
+    els.text.value = text;
+    els.font.value = fontFamily;
+    els.position.value = position;
+    els.customRow.style.display = position === 'custom' ? '' : 'none';
     panel.querySelectorAll('select.vmu-covered-select').forEach(s => vmuEnhanceSelect(s));
 
     for (const [id, def, unit] of [
-      ['vmu-covered-fontsize', 176, ''], ['vmu-covered-outlinewidth', 3, ''],
-      ['vmu-covered-rotation', 37, '°'], ['vmu-covered-scale', 115, '%'], ['vmu-covered-opacity', 255, ''],
+      ['vmu-covered-fontsize', fontSize, ''], ['vmu-covered-outlinewidth', outlineWidth, ''],
+      ['vmu-covered-rotation', rotation, '°'], ['vmu-covered-scale', scale, '%'], ['vmu-covered-opacity', opacity, ''],
     ]) {
       const input = panel.querySelector('#' + id);
       const val = panel.querySelector('#' + id + '-val');
@@ -5114,13 +5211,19 @@
     const gGo = panel.querySelector('#vmu-covered-genius-go');
     const gResults = panel.querySelector('#vmu-covered-genius-results');
     const titleInput = box?.querySelector('input.ape_pl_input');
-    if (titleInput?.value) gInput.value = parseGeniusQueryFromTitle(titleInput.value).query;
+    const playlistTitle = titleInput?.value || '';
+    const initialQuery = parseGeniusQueryFromTitle(playlistTitle).query;
+    gInput.value = initialQuery;
+    let searchId = 0;
 
     async function runGeniusSearch() {
       const raw = gInput.value.trim();
       if (!raw) return;
+      const id = ++searchId;
       gResults.innerHTML = `<div class="vmu-pl-genius-status">Ищем на Genius…</div>`;
-      const res = await geniusMsg('VKD_GENIUS_SEARCH', { query: raw });
+      const isStale = () => id !== searchId || !panel.isConnected;
+      const res = await searchGeniusCoverAlbums(raw === initialQuery ? playlistTitle : raw, undefined, isStale);
+      if (isStale()) return;
       if (!res?.ok) { gResults.innerHTML = `<div class="vmu-pl-genius-status">${escHtml(res?.error || 'ничего не найдено')}</div>`; return; }
       gResults.innerHTML = res.albums.map((a, i) => `
         <div class="vmu-pl-genius-result" data-idx="${i}">
@@ -6350,6 +6453,7 @@
     if (hideFriendsMusicToggle) {
       hideFriendsMusicToggle.addEventListener('change', () => {
         settings.hideFriendsMusic = hideFriendsMusicToggle.checked;
+        if (settings.hideFriendsMusic) vmuStampFriendsMusicSection();
         saveSettings();
         applyLayoutCustomizations();
       });
@@ -7001,6 +7105,19 @@
   // pending again via the catch in processQueue once the abort comes back);
   // if it's queued/done/error, just drop it from the queue.
   function cancelOne(idx) {
+    const tracker = nativeUploadTracker;
+    if (tracker?.view.isConnected) {
+      const row = tracker.rows[idx];
+      if (!row || !NATIVE_UPLOAD_CANCELLABLE.has(row.state) || row.cancelRequested) return;
+      if (tracker.handedOff) {
+        row.cancelRequested = true;
+        window.postMessage({ type: 'VMU_CANCEL_UPLOAD', trackId: row.id }, '*');
+      } else {
+        row.state = 'cancelled';
+      }
+      renderNativeUploadTracker(tracker);
+      return;
+    }
     const item = fileQueue[idx];
     if (!item) return;
     if (item.status === 'uploading') {
@@ -7058,6 +7175,10 @@
   function renderQueue() {
     const list = document.getElementById('vmu-list');
     if (!list) return;
+    if (nativeUploadTracker?.list === list) {
+      renderNativeUploadTracker(nativeUploadTracker);
+      return;
+    }
 
     list.innerHTML = fileQueue.map((item, idx) => {
       const raw = item.file.name.replace(/\.mp3$/i, '');
@@ -7133,6 +7254,237 @@
   // to re-enable the rich queue if a reliable per-file signal is found
   // again; the old code is untouched below, just unreachable.
   const NATIVE_HANDOFF_ONLY = true;
+
+  const NATIVE_UPLOAD_ACTIVE = new Set(['preparing', 'waiting', 'uploading', 'saving']);
+  const NATIVE_UPLOAD_CANCELLABLE = new Set(['preparing', 'waiting', 'uploading']);
+
+  function startNativeUploadTracker(files) {
+    const box = getUploadDialog();
+    const view = box?.querySelector('#vmu-embedded');
+    const list = view?.querySelector('#vmu-list');
+    if (!list) return null;
+    if (nativeUploadTracker) releaseNativeUploadTracker(nativeUploadTracker);
+    const tracker = {
+      id: crypto.randomUUID(),
+      box,
+      view,
+      list,
+      rows: files.map((file, index) => ({ file, index, state: 'waiting', progress: null, reason: '' })),
+      timer: null,
+      observer: null,
+      preparing: true,
+      handedOff: false,
+    };
+    list.replaceChildren();
+    list.setAttribute('aria-label', 'Очередь загрузки');
+    for (const row of tracker.rows) {
+      row.id = `${tracker.id}:${row.index}`;
+      row.element = document.createElement('div');
+      list.append(row.element);
+    }
+    tracker.observer = new MutationObserver(() => {
+      if (!box.isConnected) {
+        if (box.dataset.vmuTrackedUpload === tracker.id) setBlockAudioHide(false, tracker.id);
+        releaseNativeUploadTracker(tracker);
+        return;
+      }
+      if (!view.isConnected) {
+        const footer = box.querySelector('[data-testid="modalfooter"], [class*="vkitModalFooter"]');
+        if (footer?.parentElement === box) box.insertBefore(view, footer);
+        else box.append(view);
+      }
+    });
+    nativeUploadTracker = tracker;
+    tracker.observer.observe(document.body, { childList: true, subtree: true });
+    renderNativeUploadTracker(tracker);
+    return tracker;
+  }
+
+  function releaseNativeUploadTracker(tracker) {
+    clearTimeout(tracker.timer);
+    tracker.observer.disconnect();
+    if (nativeUploadTracker === tracker) nativeUploadTracker = null;
+  }
+
+  function renderNativeUploadTracker(tracker) {
+    const states = {
+      preparing: 'Подготовка', waiting: 'В очереди', uploading: 'Загружается',
+      saving: 'ВК сохраняет', done: 'Загружен', error: 'Ошибка', unconfirmed: 'Нет подтверждения',
+      cancelled: 'Отменён',
+    };
+    for (const row of tracker.rows) {
+      const el = row.element;
+      const cancelling = String(!!row.cancelRequested);
+      if (el.dataset.state !== row.state || el.dataset.reason !== row.reason || el.dataset.cancelling !== cancelling) {
+        el.dataset.state = row.state;
+        el.dataset.reason = row.reason;
+        el.dataset.cancelling = cancelling;
+        const iconState = row.state === 'saving' ? 'uploading' :
+          Object.hasOwn(STATUS_ICON, row.state) ? row.state : 'pending';
+        el.className = `vmu-item vmu-${iconState}`;
+        el.innerHTML = `<span class="vmu-icon"></span><span class="vmu-info">
+          <span class="vmu-name"></span></span><span class="vmu-sz"></span>`;
+        const icon = el.querySelector('.vmu-icon');
+        const name = el.querySelector('.vmu-name');
+        name.textContent = row.file.name.replace(/\.mp3$/i, '');
+        name.title = row.file.name;
+        const status = el.querySelector('.vmu-sz');
+        status.textContent = row.cancelRequested ? 'Отмена…' : states[row.state];
+        if (row.reason) status.title = row.reason;
+        if (row.state === 'error') {
+          const marker = document.createElement('button');
+          marker.type = 'button';
+          marker.className = 'vmu-icon vmu-track-error-tip';
+          marker.innerHTML = STATUS_ICON.error;
+          marker.dataset.vmuTip = row.reason;
+          marker.setAttribute('aria-label', `Ошибка: ${row.reason}`);
+          const reason = document.createElement('span');
+          reason.className = 'vmu-errmsg';
+          reason.id = `vmu-upload-reason-${row.id.replace(':', '-')}`;
+          reason.textContent = row.reason;
+          reason.hidden = true;
+          marker.setAttribute('aria-expanded', 'false');
+          marker.setAttribute('aria-controls', reason.id);
+          marker.addEventListener('mouseenter', () => showDlTooltip(marker));
+          marker.addEventListener('mouseleave', hideDlTooltip);
+          marker.addEventListener('focus', () => showDlTooltip(marker));
+          marker.addEventListener('blur', hideDlTooltip);
+          marker.addEventListener('click', () => {
+            reason.hidden = !reason.hidden;
+            marker.setAttribute('aria-expanded', String(!reason.hidden));
+          });
+          icon.replaceWith(marker);
+          name.after(reason);
+        } else {
+          icon.innerHTML = STATUS_ICON[iconState];
+          icon.setAttribute('aria-hidden', 'true');
+        }
+        if (NATIVE_UPLOAD_CANCELLABLE.has(row.state)) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'vmu-cancel-btn';
+          button.dataset.idx = row.index;
+          button.textContent = '✕';
+          button.title = 'Отменить загрузку';
+          button.setAttribute('aria-label', `Отменить загрузку файла ${row.file.name}`);
+          button.disabled = !!row.cancelRequested;
+          el.append(button);
+        }
+        if (iconState === 'uploading') {
+          const bar = document.createElement('span');
+          bar.className = 'vmu-progress';
+          bar.setAttribute('role', 'progressbar');
+          bar.setAttribute('aria-label', row.file.name);
+          el.append(bar);
+        }
+      }
+      const bar = el.querySelector('.vmu-progress');
+      if (bar) {
+        const progress = row.progress == null ? null : Math.round(row.progress * 100);
+        bar.style.width = `${progress ?? 0}%`;
+        if (progress == null) bar.removeAttribute('aria-valuenow');
+        else bar.setAttribute('aria-valuenow', String(progress));
+      }
+    }
+    const active = tracker.rows.filter(row => NATIVE_UPLOAD_ACTIVE.has(row.state)).length;
+    const done = tracker.rows.filter(row => row.state === 'done').length;
+    const errors = tracker.rows.filter(row => row.state === 'error').length;
+    const cancelled = tracker.rows.filter(row => row.state === 'cancelled').length;
+    const unknown = tracker.rows.length - active - done - errors - cancelled;
+    const parts = [`Файлов: ${tracker.rows.length}`];
+    if (done) parts.push(`загружено: ${done}`);
+    if (errors) parts.push(`ошибок: ${errors}`);
+    if (cancelled) parts.push(`отменено: ${cancelled}`);
+    if (unknown) parts.push(`без подтверждения: ${unknown}`);
+    const summary = tracker.view.querySelector('#vmu-status');
+    const label = parts.join(' · ');
+    if (summary.textContent !== label) summary.textContent = label;
+    tracker.list.setAttribute('aria-busy', String(active > 0));
+    const picker = document.getElementById('vmu-input');
+    if (picker) picker.disabled = tracker.preparing || active > 0;
+    const pickerButton = document.getElementById('vmu-pick-open');
+    if (pickerButton) pickerButton.disabled = tracker.preparing || active > 0;
+    const clearButton = tracker.box.querySelector('#vmu-clear');
+    if (clearButton) clearButton.style.display = tracker.preparing || active ? 'none' : '';
+    if (!active) clearTimeout(tracker.timer);
+  }
+
+  function resetUploadTrackerDeadline(tracker) {
+    clearTimeout(tracker.timer);
+    tracker.timer = setTimeout(() => {
+      if (nativeUploadTracker !== tracker) return;
+      for (const row of tracker.rows) {
+        if (!NATIVE_UPLOAD_ACTIVE.has(row.state)) continue;
+        row.state = 'unconfirmed';
+        row.cancelRequested = false;
+        row.reason = 'ВК не прислал результат для этого файла.';
+      }
+      renderNativeUploadTracker(tracker);
+    }, 120_000);
+  }
+
+  function updateNativeUploadTracker(data) {
+    const tracker = nativeUploadTracker;
+    if (!tracker || !data) return;
+    if (data.type === 'VK_UPLOAD_CANCEL_RESULT') {
+      const row = tracker.rows.find(entry => entry.id === data.trackId);
+      if (!row?.cancelRequested) return;
+      row.cancelRequested = false;
+      if (data.ok) {
+        row.state = 'cancelled';
+        row.reason = '';
+      } else if (NATIVE_UPLOAD_CANCELLABLE.has(row.state)) {
+        row.state = 'saving';
+        row.reason = 'Файл уже передан ВК. Ожидаем результат.';
+      }
+      renderNativeUploadTracker(tracker);
+      return;
+    }
+    if (data.type === 'VK_HANDOFF_DISPATCHED') {
+      if (data.batchId !== tracker.id) return;
+      resetUploadTrackerDeadline(tracker);
+      const single = tracker.rows.filter(row => row.state !== 'error' && row.state !== 'cancelled').length === 1;
+      for (const row of tracker.rows) {
+        if (row.state !== 'waiting') continue;
+        if (!data.ok) {
+          row.state = 'error';
+          row.reason = 'Не удалось передать файл в окно загрузки ВК.';
+        } else if (single) {
+          // With a single file its identity is known as soon as VK receives it.
+          row.state = 'uploading';
+        }
+      }
+      renderNativeUploadTracker(tracker);
+      return;
+    }
+    if (!['VK_UPLOAD_STARTED', 'VK_UPLOAD_PROGRESS', 'VK_UPLOAD_SAVING', 'VK_UPLOAD_DONE'].includes(data.type)) return;
+    const matching = data.trackId ? tracker.rows.filter(row => row.id === data.trackId) :
+      data.fileName ? tracker.rows.filter(row => row.transferName === data.fileName) : [];
+    if (matching.length !== 1) return;
+    const [row] = matching;
+    if (!NATIVE_UPLOAD_ACTIVE.has(row.state) && !(row.state === 'unconfirmed' && data.type === 'VK_UPLOAD_DONE')) return;
+    if (data.type === 'VK_UPLOAD_SAVING') {
+      row.state = 'saving';
+      row.progress = 1;
+    } else if (data.type === 'VK_UPLOAD_DONE') {
+      row.cancelRequested = false;
+      row.state = data.error ? 'error' : data.confirmed ? 'done' : 'unconfirmed';
+      if (data.error) {
+        row.reason = Number(data.errorCode) === 270
+          ? 'Запись удалена по требованию правообладателя. ВК запрещает её повторную загрузку.'
+          : typeof data.errorMsg === 'string' && data.errorMsg.trim()
+            ? data.errorMsg.trim().slice(0, 500)
+            : data.aborted ? 'Загрузка прервана.' : 'ВК не сообщил причину ошибки.';
+      } else if (!data.confirmed) row.reason = 'ВК не подтвердил сохранение записи.';
+    } else if (row.state !== 'saving') {
+      row.state = 'uploading';
+      if (data.type === 'VK_UPLOAD_PROGRESS' && data.total > 0) {
+        row.progress = Math.max(0, Math.min(1, data.loaded / data.total));
+      }
+    }
+    resetUploadTrackerDeadline(tracker);
+    renderNativeUploadTracker(tracker);
+  }
 
   // Un-hides VK's own dialog content (see the `vmuNativeMiddle` hide in
   // injectIntoVkDialog) and drops our own dropzone UI, so VK's real
@@ -7542,6 +7894,10 @@
   // hidden native file input (see VK_HANDOFF_FILES in injected.js) and lets
   // VK's own dialog do the rest — no progress/status tracking on our side.
   async function handoffFilesNatively(files) {
+    if (nativeUploadTracker?.preparing || nativeUploadTracker?.rows.some(row => NATIVE_UPLOAD_ACTIVE.has(row.state))) return;
+    const tracker = startNativeUploadTracker(files);
+    if (!tracker) return;
+    const uploadLocation = location.href;
     // Claim the auto-playlist slot synchronously, before any `await` below —
     // if addFiles() ever fires twice for what's really one upload action
     // (observed live: two near-identical empty playlists both created from
@@ -7574,26 +7930,40 @@
     // have failed (VK's own "не удалось загрузить" rejection, e.g. a
     // duplicate) from the auto-playlist search instead of scrolling the
     // whole community catalog to the bottom hunting for it.
-    const failedNames = new Set();
+    const failedTrackIds = new Set();
     const onUploadDone = (e) => {
       if (e.source !== window || e.data?.type !== 'VK_UPLOAD_DONE') return;
-      if (e.data.error && e.data.fileName) failedNames.add(e.data.fileName);
+      if (!e.data.error) return;
+      const rows = e.data.trackId ? tracker.rows.filter(row => row.id === e.data.trackId) :
+        e.data.fileName ? tracker.rows.filter(row => row.transferName === e.data.fileName) : [];
+      if (rows.length === 1) failedTrackIds.add(rows[0].id);
     };
     if (startCountEarly != null) window.addEventListener('message', onUploadDone);
 
-    const items = [];
-    const batchItems = [];
+    let items = [];
+    let batchItems = [];
     const slimActive = settings.slimEnabled;
-    if (slimActive) showProcessingUI(files.length);
     let slimIdx = 0;
     for (const f of files) {
+      if (!tracker.box.isConnected) break;
       let file = f;
+      const row = tracker.rows[slimIdx];
       slimIdx++;
+      if (row.state === 'cancelled') continue;
+      if (!isMP3(f) || !f.size || f.size > 200 * 1024 * 1024) {
+        row.state = 'error';
+        row.reason = !isMP3(f) ? 'Выберите файл MP3.' : !f.size ? 'Файл пуст.' : 'Размер файла превышает 200 МБ.';
+        renderNativeUploadTracker(tracker);
+        continue;
+      }
+      row.state = 'preparing';
+      renderNativeUploadTracker(tracker);
       // Read unconditionally (not just under autoMeta) — auto-playlist needs
       // these tags for its title/description/track-order logic below even
       // when the user doesn't want tags rewritten into the file itself.
       let tags = {};
       try { tags = await readID3(f); } catch {}
+      if (row.state === 'cancelled') continue;
       if (settings.autoMeta) {
         try {
           const artistSplit = splitTrailingTagJunk(tags.TPE1 || tags.TPE2);
@@ -7620,33 +7990,63 @@
           }
         } catch {}
       }
+      if (row.state === 'cancelled') continue;
       if (slimActive) {
         try {
-          updateProcessingUI(file.name, slimIdx, files.length, 0);
-          file = await applyAudioProcessing(file, pct => {
-            updateProcessingUI(file.name, slimIdx, files.length, pct);
-          });
+          file = await applyAudioProcessing(file);
         } catch (e) { console.error('[VMU Slim] processing error:', e); }
       }
-      const buffer = await file.arrayBuffer();
-      items.push({ name: file.name, mimeType: file.type || 'audio/mpeg', buffer });
-      batchItems.push({ file, tags, status: 'done' });
+      if (row.state === 'cancelled') continue;
+      try {
+        const buffer = await file.arrayBuffer();
+        if (row.state === 'cancelled') continue;
+        items.push({ name: file.name, mimeType: file.type || 'audio/mpeg', buffer, trackId: row.id });
+        row.transferName = file.name;
+        row.state = 'waiting';
+        batchItems.push({ file, tags, status: 'done', row });
+      } catch {
+        if (row.state === 'cancelled') continue;
+        row.state = 'error';
+        row.reason = 'Не удалось прочитать файл.';
+      }
+      renderNativeUploadTracker(tracker);
     }
-    if (slimActive) hideProcessingUI();
+    tracker.preparing = false;
+    batchItems = batchItems.filter(item => item.row.state !== 'cancelled');
+    const selected = new Set(batchItems.map(item => item.row.id));
+    items = items.filter(item => selected.has(item.trackId));
+    renderNativeUploadTracker(tracker);
+    if (!items.length || location.href !== uploadLocation || !tracker.box.isConnected) {
+      if (items.length) {
+        updateNativeUploadTracker({ type: 'VK_HANDOFF_DISPATCHED', batchId: tracker.id, ok: false });
+      }
+      if (shouldTrackPlaylist) autoPlaylistClaimed = false;
+      window.removeEventListener('message', onUploadDone);
+      return;
+    }
     // Optimistic count — without per-file confirmation from VK we can't know
     // exactly how many actually landed, only how many we handed off. Close
     // enough for the "you're approaching VK's 70/day cap" warning this is for.
     for (let i = 0; i < items.length; i++) bumpTodayUploadCount();
 
-    window.postMessage({ type: 'VK_HANDOFF_FILES', items }, '*', items.map(i => i.buffer));
+    resetUploadTrackerDeadline(tracker);
+    tracker.handedOff = true;
+    tracker.box.dataset.vmuTrackedUpload = tracker.id;
+    setBlockAudioHide(true, tracker.id);
+    window.postMessage({ type: 'VK_HANDOFF_FILES', batchId: tracker.id, items }, '*', items.map(i => i.buffer));
 
     const startCount = startCountEarly;
     if (startCount != null) {
       showProgressToast('Ждём подтверждения загрузки…', { id: 'vmu-autoplaylist' });
-      waitForTrackCountIncrease(startCount, items.length)
+      const eligible = () => batchItems.filter(item => item.row.state !== 'cancelled' && !failedTrackIds.has(item.row.id));
+      waitForTrackCountIncrease(startCount, () => batchItems.filter(item => item.row.state !== 'cancelled').length)
         .then(gained => {
           autoPlaylistClaimed = false; // decided — a new upload can claim the next slot now
           window.removeEventListener('message', onUploadDone);
+          if (batchItems.every(item => item.row.state === 'cancelled')) {
+            showProgressToast('Загрузка отменена', { id: 'vmu-autoplaylist', kind: 'done' });
+            return;
+          }
           if (gained <= 0) {
             showProgressToast('Ошибка: загрузка не подтвердилась, плейлист не создан', { id: 'vmu-autoplaylist', kind: 'error' });
             return;
@@ -7660,7 +8060,7 @@
             // tell WHICH ones are missing, and searching for all of them
             // would scroll the whole catalog hunting for tracks that were
             // never actually added.
-            const survivors = batchItems.filter(b => !failedNames.has(b.file.name));
+            const survivors = eligible();
             if (survivors.length === gained) {
               showProgressToast(`${items.length - gained} из ${items.length} не загрузились — пропускаем их и добавляем остальные…`, { id: 'vmu-autoplaylist' });
               enqueueAutoPlaylist(survivors);
@@ -7669,7 +8069,7 @@
             showProgressToast(`Загружено ${gained} из ${items.length} — часть треков не удалось загрузить, плейлист не создан автоматически`, { id: 'vmu-autoplaylist', kind: 'error' });
             return;
           }
-          enqueueAutoPlaylist(batchItems);
+          enqueueAutoPlaylist(eligible());
         })
         .catch(err => {
           autoPlaylistClaimed = false;
@@ -11556,6 +11956,31 @@
   }
 
   // ─── helpers to find VK's upload dialog (new and old VK) ────────────────────
+  const UPLOAD_MODAL_BOX = '[class*="vkitInternalModalBox"], .audio_add_box';
+  const UPLOAD_MODAL_INPUT = 'input[type="file"][accept*="audio"], input[type="file"][accept*="mp3"], [data-testid="UploadAudio_SelectFileButton"]';
+
+  function mountNewUploadDialog(mutations) {
+    const boxes = new Set();
+    for (const { target, addedNodes } of mutations) {
+      if (!addedNodes.length) continue;
+      const parentBox = target.closest?.(UPLOAD_MODAL_BOX);
+      if (parentBox) boxes.add(parentBox);
+      for (const node of addedNodes) {
+        if (node.nodeType !== Node.ELEMENT_NODE) continue;
+        if (node.matches(UPLOAD_MODAL_BOX)) boxes.add(node);
+        else for (const box of node.querySelectorAll(UPLOAD_MODAL_BOX)) boxes.add(box);
+      }
+    }
+
+    for (const box of boxes) {
+      if (!box.isConnected || box.dataset.vmuInjected || !box.querySelector(UPLOAD_MODAL_INPUT) ||
+          !box.checkVisibility() || isPlaylistDialog(box)) continue;
+      vmuStampUploadDialog([box]);
+      injectIntoVkDialog(box);
+      return;
+    }
+  }
+
   function getUploadDialog() {
     // Protected zombie: injected.js kept this element alive while our flag is
     // set. VK may have replaced the body with a success screen AND started a
@@ -11571,8 +11996,7 @@
     // New VK: vkitInternalModalBox containing audio file input
     const newDlg = modalBoxes
       .find(m => m.getBoundingClientRect().width > 0 &&
-                 (m.querySelector('input[accept*="audio"], input[accept*="mp3"]') ||
-                  m.querySelector('[data-testid="UploadAudio_SelectFileButton"]')) &&
+                 m.querySelector(UPLOAD_MODAL_INPUT) &&
                  !isPlaylistDialog(m));
     if (newDlg) return newDlg;
     // Old VK fallback
@@ -11614,11 +12038,12 @@
   // attaches its window-level drag/drop listeners, so ours fire first regardless
   // of same-node listener order. It forwards matches here via a custom event.
   window.addEventListener('vmu-files-dropped', e => {
-    addFiles([...e.detail.files].filter(isMP3));
+    const files = [...e.detail.files];
+    addFiles(settings.workMode === 'check' ? files.filter(isMP3) : files);
   });
 
-  function setBlockAudioHide(block) {
-    window.postMessage({ type: 'VMU_BLOCK_AUDIO_HIDE', block }, '*');
+  function setBlockAudioHide(block, batchId) {
+    window.postMessage({ type: 'VMU_BLOCK_AUDIO_HIDE', block, batchId }, '*');
   }
 
   // Patches ID3 tags from the filename when Auto-metadata is on and either
@@ -11832,8 +12257,8 @@
     const wrap = document.createElement('div');
     wrap.id = 'vmu-embedded';
     const isCheck = settings.workMode === 'check';
-    const dzLabel = isCheck ? 'Перетащите MP3 для проверки' : 'Перетащите MP3 файлы сюда';
-    const dzHint = isCheck ? 'имена файлов будут сверены с треками на странице' : 'не более 200 МБ каждый';
+    const dzLabel = isCheck ? 'Перетащите MP3 для проверки' : 'Файлы для загрузки';
+    const dzHint = isCheck ? 'Имена файлов будут сверены с треками на странице' : 'Перетащите MP3 сюда. До 200 МБ на файл.';
     // Own header (title + ✕) is only rendered when the dialog has no native
     // header we could keep — otherwise the native title and close button
     // stay as-is. Settings/SoundCloud used to live here too (gear + SC icon
@@ -11849,19 +12274,21 @@
       ${ownHeader}
 
       <div id="vmu-dropzone">
-        <div class="vmu-dz-label">${dzLabel}</div>
-        <div class="vmu-dz-hint">${dzHint}</div>
-        <label class="vmu-pick-btn">
+        <div class="vmu-dz-copy">
+          <div class="vmu-dz-label">${dzLabel}</div>
+          <div class="vmu-dz-hint">${dzHint}</div>
+        </div>
+        <button type="button" id="vmu-pick-open" class="vmu-pick-btn">
           ${ICON_UPLOAD}
           Выбрать файлы
-          <input type="file" id="vmu-input" accept=".mp3,audio/mpeg" multiple>
-        </label>
+        </button>
+        <input type="file" id="vmu-input" accept=".mp3,audio/mpeg" multiple>
       </div>
 
       <div id="vmu-list"></div>
 
       <div id="vmu-footer">
-        <span id="vmu-status"></span>
+        <span id="vmu-status" role="status"></span>
         <button type="button" id="vmu-clear" class="vmu-clear-native" style="display:none">Очистить</button>
       </div>
     `;
@@ -12023,14 +12450,21 @@
   }
 
   function attachEmbeddedHandlers() {
+    document.getElementById('vmu-pick-open')?.addEventListener('click', () => {
+      document.getElementById('vmu-input')?.click();
+    });
     document.getElementById('vmu-close-btn')?.addEventListener('click', closeUploadModal);
     document.getElementById('vmu-clear')?.addEventListener('click', () => {
+      if (nativeUploadTracker && !nativeUploadTracker.rows.some(row => NATIVE_UPLOAD_ACTIVE.has(row.state))) {
+        releaseNativeUploadTracker(nativeUploadTracker);
+      }
       fileQueue = fileQueue.filter(f => f.status === 'uploading' || f.status === 'pending');
       renderQueue();
     });
 
     document.getElementById('vmu-input')?.addEventListener('change', e => {
-      addFiles([...e.target.files].filter(isMP3));
+      const files = [...e.target.files];
+      addFiles(settings.workMode === 'check' ? files.filter(isMP3) : files);
       e.target.value = '';
     });
 
@@ -13455,7 +13889,22 @@
     document.getElementById('vmu-plcollect-modal')?.remove();
   }
 
-  async function collectCatalogPlaylists(onCount, shouldStop) {
+  function findPlaylistCatalogList(pathname = location.pathname) {
+    const nativeList = document.querySelector(PL_LIST_BLOCK_SEL);
+    if (nativeList) return nativeList;
+    if (!pathname.startsWith('/music/catalog/')) return null;
+    const [first, second] = document.querySelectorAll(PL_CELL_SEL);
+    if (!first) return null;
+    const catalog = first.closest('main, [role="main"]') || document.body;
+    let list = first.parentElement;
+    if (!list || list === catalog) return first;
+    while (second && !list.contains(second) && list.parentElement && list.parentElement !== catalog) {
+      list = list.parentElement;
+    }
+    return list;
+  }
+
+  async function collectCatalogPlaylists(onCount, shouldStop, onPlaysProgress) {
     await waitForElement(PL_CELL_SEL, 10000);
     const cells = () => (document.querySelector(PL_LIST_BLOCK_SEL) || document).querySelectorAll(PL_CELL_SEL);
     await scrollUntilCountStable(() => cells().length, {
@@ -13463,26 +13912,92 @@
     });
     const seen = new Set();
     const out = [];
-    for (const cell of cells()) {
+    const cards = [...cells()];
+    for (const [index, cell] of cards.entries()) {
+      if (shouldStop?.()) break;
       const id = cell.getAttribute('data-id') || '';
       const title = (cell.querySelector(PL_TITLE_SEL)?.textContent || '').replace(/\s+/g, ' ').trim();
       if (!id || !title || seen.has(id)) continue;
       seen.add(id);
-      out.push({ id, title, url: `${location.origin}/music/playlist/${id}`, count: plcCellTrackCount(cell) });
+      const counters = plcCellCounters(cell);
+      const tracks = counters[0]?.value;
+      const count = tracks && !tracks.approximate ? tracks.count : null;
+      const item = { id, title, url: `${location.origin}/music/playlist/${id}`, count };
+      if (onPlaysProgress) {
+        onPlaysProgress(index + 1, cards.length);
+        const credits = cell.querySelectorAll(
+          '[data-testid*="playlistitem_artist" i], [data-testid*="playlistitem_performer" i], a[href^="/artist/"], a[href^="/music/artist/"]',
+        );
+        item.artist = [...new Set([...credits].map(el => el.textContent.trim()).filter(Boolean))].join(', ');
+        item.plays = await plcReadCardPlays(cell, counters[1], shouldStop);
+      }
+      out.push(item);
     }
     return out;
   }
 
-  // The card's own track total: the first bare-number text on it (the second
-  // is the play count — verified against audio.get counts on 10 playlists).
-  // Used only to judge whether a scan came back complete, never as the data.
-  function plcCellTrackCount(cell) {
+  // VK shows the track count first and the play count second on catalog cards.
+  function plcCellCounters(cell) {
+    const counters = [];
     for (const el of cell.querySelectorAll('span')) {
       if (el.children.length || el.closest(PL_TITLE_SEL) || el.closest('a')) continue;
-      const t = (el.textContent || '').trim();
-      if (/^\d[\d\s ]*$/.test(t)) return parseInt(t.replace(/[\s ]/g, ''), 10);
+      const value = plcParsePlayCount(el.textContent);
+      if (value) counters.push({ el, value });
+      if (counters.length === 2) break;
     }
-    return null;
+    return counters;
+  }
+
+  function plcReadPlayTooltip(cell, counter) {
+    const candidates = [];
+    const labels = ['title', 'data-vmu-tip', 'aria-label', 'data-tooltip'];
+    const elements = [cell, ...cell.querySelectorAll('[title], [data-vmu-tip], [aria-label], [data-tooltip], [aria-describedby]')];
+    for (const el of elements) {
+      const related = (el.getAttribute('aria-describedby') || '').split(/\s+/)
+        .map(id => id && document.getElementById(id)?.textContent);
+      const knownCounter = !!counter && (el === counter.el || (el !== cell && el.contains(counter.el)));
+      for (const label of [...labels.map(attr => el.getAttribute(attr)), ...related]) {
+        const value = plcParsePlayCount(label, true) || (knownCounter && plcParsePlayCount(label));
+        if (value) candidates.push(value);
+      }
+    }
+    for (const el of cell.querySelectorAll('[role="tooltip"], [data-testid*="playcount" i], [data-testid*="listencount" i], span')) {
+      if (el.children.length || el.closest(PL_TITLE_SEL) || el.closest('a')) continue;
+      const value = plcParsePlayCount(el.textContent, el.matches('span, [role="tooltip"]'));
+      if (value) candidates.push(value);
+    }
+    return candidates.find(value => !value.approximate) || candidates[0] || null;
+  }
+
+  async function plcReadCardPlays(cell, counter, shouldStop) {
+    const tip = plcReadPlayTooltip(cell, counter);
+    if (tip && !tip.approximate) return tip;
+    if (counter && !counter.value.approximate) return counter.value;
+    // VK can mount the tooltip outside the card when it first receives a hover.
+    const target = counter?.el || cell;
+    if (target.isConnected && !shouldStop?.()) {
+      const tooltips = () => [...document.querySelectorAll('[role="tooltip"]')]
+        .filter(el => el.getClientRects().length);
+      const alreadyOpen = new Set(tooltips());
+      target.dispatchEvent(new PointerEvent('pointerover', { bubbles: true, pointerType: 'mouse' }));
+      target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      try {
+        for (let i = 0; i < 4 && !shouldStop?.(); i++) {
+          await sleep(125);
+          const hovered = plcReadPlayTooltip(cell, counter);
+          if (hovered && !hovered.approximate) return hovered;
+          for (const el of tooltips()) {
+            if (alreadyOpen.has(el)) continue;
+            const value = plcParsePlayCount(el.textContent, true);
+            if (value && !value.approximate) return value;
+          }
+        }
+      } finally {
+        target.dispatchEvent(new MouseEvent('mouseout', { bubbles: true }));
+        target.dispatchEvent(new PointerEvent('pointerout', { bubbles: true, pointerType: 'mouse' }));
+      }
+    }
+    return tip || counter?.value || null;
   }
 
   // ─── Playlist collector: data layer ──────────────────────────────────────────
@@ -13495,6 +14010,12 @@
   // span several playlists.
   // PLC-PURE-BEGIN
   const PLC_COLLATOR = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' });
+  const PLC_NUMBER_FORMAT = new Intl.NumberFormat('ru-RU');
+  const PLC_PLAY_NUMBER = '(\\d{1,3}(?: \\d{3})+|\\d+)(?:[.,](\\d+))? *(тыс\\.?|млн\\.?|млрд\\.?|[kкmb])?';
+  const PLC_PLAY_LABEL = 'прослушивани[а-яё]*';
+  const PLC_PLAY_ONLY = new RegExp(`^${PLC_PLAY_NUMBER}$`, 'i');
+  const PLC_PLAY_BEFORE_LABEL = new RegExp(`${PLC_PLAY_NUMBER} *${PLC_PLAY_LABEL}`, 'i');
+  const PLC_PLAY_AFTER_LABEL = new RegExp(`${PLC_PLAY_LABEL} *[:—-]? *${PLC_PLAY_NUMBER}`, 'i');
 
   const PLC_DEFAULT_VIEW = {
     query: '', yearFrom: null, yearTo: null, minTracks: null, maxTracks: null,
@@ -13503,6 +14024,20 @@
     group: 'none',        // none | year | letter
     showTracks: true, showLinks: true, marks: true, dupeWhere: true, numbering: true,
   };
+
+  function plcParsePlayCount(text, labeled = false) {
+    const value = String(text ?? '').trim().replace(/\s+/g, ' ');
+    const match = labeled
+      ? value.match(PLC_PLAY_BEFORE_LABEL) || value.match(PLC_PLAY_AFTER_LABEL)
+      : value.match(PLC_PLAY_ONLY);
+    if (!match) return null;
+    const [, integer, fraction, rawUnit] = match;
+    const unit = rawUnit?.toLowerCase().replace(/\.$/, '');
+    const scale = { тыс: 1000, k: 1000, к: 1000, млн: 1000000, m: 1000000, млрд: 1000000000, b: 1000000000 }[unit];
+    if (fraction && !scale) return null;
+    const amount = Math.round(Number(integer.replace(/ /g, '') + (fraction ? '.' + fraction : '')) * (scale || 1));
+    return Number.isSafeInteger(amount) ? { count: amount, approximate: !!scale } : null;
+  }
 
   function plcPlural(n, one, few, many) {
     const m10 = n % 10, m100 = n % 100;
@@ -13541,10 +14076,12 @@
 
   function plcMakePlaylist(raw, index) {
     const p = plcParseTitle(raw.title);
+    const artist = raw.artist || p.artist || raw.title?.match(/^(.+?)\s+[-—–]\s+\S/)?.[1] || '';
     return {
       id: raw.id || '', title: raw.title, url: raw.url, index,
-      year: p.year, name: p.name || raw.title, artist: p.artist,
+      year: p.year, name: p.name || raw.title, artist,
       declared: Number.isFinite(raw.count) ? raw.count : null,
+      plays: raw.plays || null,
       tracks: null, scanSource: null, scanError: null, tried: null,
     };
   }
@@ -13629,8 +14166,12 @@
     return String(s || '').replace(/^[^\p{L}\p{N}]+/u, '').toLowerCase().replace(/ё/g, 'е');
   }
 
+  function plcLeadArtist(credit) {
+    return String(credit || '').split(/[,;]|\s+[&+×xх]\s+|\s+\(?\s*(?:feat\.?|ft\.?|featuring|при участии)\s+/i)[0].trim();
+  }
+
   function plcFirstArtistKey(pl) {
-    return plcSortKey(String(pl.artist || '').split(/[,;&]/)[0]);
+    return plcSortKey(plcLeadArtist(pl.artist));
   }
 
   function plcLetterKey(name) {
@@ -13711,8 +14252,7 @@
 
     // Whether ANY playlist has scan data at all — plcBuildText only flags a
     // single unscanned playlist once there's scan data to contrast it with
-    // (before a scan, every playlist is "unscanned" and the text must stay the
-    // plain title-and-link list).
+    // (before a scan, the output only includes the playlist-level details).
     const anyScanned = playlists.some(p => !!p.tracks);
     if (view.group !== 'year' && view.group !== 'letter') return { items, groups: null, anyScanned };
     const buckets = new Map();
@@ -13758,8 +14298,65 @@
     return line;
   }
 
-  // Builds the copy-ready text. With tracks off and no grouping this is
-  // exactly the original "НАЗВАНИЕ - ссылка" one-per-line output.
+  function plcPlayLabel(plays) {
+    if (!plays) return 'нет данных о прослушиваниях';
+    const { count, approximate } = plays;
+    return `${approximate ? '≈ ' : ''}${PLC_NUMBER_FORMAT.format(count)} ${plcPlural(count, 'прослушивание', 'прослушивания', 'прослушиваний')}`;
+  }
+
+  function plcPlaySummary(items) {
+    const authors = new Map();
+    const unresolved = [];
+    const total = { count: 0, approximate: false, known: 0, unknown: 0 };
+    const artistKey = name => name.normalize('NFC').toLowerCase();
+    const add = (stats, plays) => {
+      if (plays) {
+        stats.count += plays.count;
+        stats.approximate ||= plays.approximate;
+        stats.known++;
+      } else {
+        stats.unknown++;
+      }
+    };
+    for (const { pl } of items) {
+      add(total, pl.plays);
+      let artist = plcLeadArtist(pl.artist);
+      if (!artist && pl.tracks?.length && !plcIsIncomplete(pl)) {
+        const first = plcLeadArtist(pl.tracks[0].artist);
+        const key = artistKey(first);
+        if (key && pl.tracks.every(track => artistKey(plcLeadArtist(track.artist)) === key)) {
+          artist = first;
+        }
+      }
+      if (!artist) {
+        unresolved.push(pl);
+        continue;
+      }
+      const key = artistKey(artist);
+      if (!authors.has(key)) authors.set(key, { name: artist, count: 0, approximate: false, known: 0, unknown: 0 });
+      add(authors.get(key), pl.plays);
+    }
+    const describe = stats => {
+      if (!stats.known) return 'нет данных о прослушиваниях';
+      const missing = stats.unknown ? ` (без данных: ${PLC_NUMBER_FORMAT.format(stats.unknown)})` : '';
+      return plcPlayLabel(stats) + missing;
+    };
+    const ranked = [...authors.values()].sort((a, b) =>
+      (b.known > 0) - (a.known > 0) || b.count - a.count || PLC_COLLATOR.compare(a.name, b.name));
+    return [
+      '=== Прослушивания по основным артистам ===',
+      ...ranked.map(stats => `${stats.name} — ${describe(stats)}`),
+      ...(unresolved.length ? [
+        '',
+        `Не удалось определить автора (${PLC_NUMBER_FORMAT.format(unresolved.length)})`,
+        ...unresolved.map(pl => `  ${pl.title} — ${plcPlayLabel(pl.plays)}`),
+      ] : []),
+      '',
+      `Всего по списку — ${describe(total)}`,
+    ];
+  }
+
+  // Builds the preview and the shared text for copy and download.
   function plcBuildText(selection, view) {
     const lines = [];
     let trackCount = 0;
@@ -13778,7 +14375,7 @@
         }
       }
       if (body.length) blockGap();
-      lines.push(view.showLinks ? `${pl.title} - ${pl.url}` : pl.title);
+      lines.push(`${pl.title} — ${plcPlayLabel(pl.plays)}${view.showLinks ? ` - ${pl.url}` : ''}`);
       if (body.length) lines.push(...body, '');
     };
     if (selection.groups) {
@@ -13791,6 +14388,7 @@
       for (const it of selection.items) renderItem(it);
     }
     while (lines.length && lines[lines.length - 1] === '') lines.pop();
+    if (selection.items.length) lines.push('', ...plcPlaySummary(selection.items));
     return { text: lines.join('\n'), playlistCount: selection.items.length, trackCount };
   }
   // PLC-PURE-END
@@ -13917,10 +14515,8 @@
   }
 
   // The collector panel: the original copy-ready "НАЗВАНИЕ - ссылка" list, now
-  // with an optional deep scan that reads every playlist's tracks (plus their
-  // blocked / duplicated-in-other-playlists state) and a filter/sort/format
-  // bar that rebuilds the text live. Until a scan is run the default view is
-  // byte-for-byte the old plain list.
+  // with playlist listen totals and an optional track scan. Filters, sorting
+  // and grouping rebuild the preview and export together.
   function showPlaylistCollectPanel(playlistsRaw) {
     syncVmuTheme();
     closePlaylistCollectPanel();
@@ -14246,7 +14842,12 @@
     try {
       const playlists = await collectCatalogPlaylists(
         n => showProgressToast(`Собираем плейлисты… найдено ${n}`, { id: PL_COLLECT_TOAST_ID }),
-        navigatedAway
+        navigatedAway,
+        (done, total) => {
+          if (done === 1 || done === total || done % 10 === 0) {
+            showProgressToast(`Собираем прослушивания… ${done} из ${total}`, { id: PL_COLLECT_TOAST_ID });
+          }
+        }
       );
       if (navigatedAway()) {
         document.getElementById(PL_COLLECT_TOAST_ID)?.remove();
@@ -14265,10 +14866,496 @@
     }
   }
 
+  // ─── ПУЭРРИТО: обновление плейлистов каталога ──────────────────────────────────
+  function insertPuerritoTag(description) {
+    if (/\[vk\.com\/puerrito\]/i.test(description)) return description;
+    const marker = /\[\[vk\.com\/reuploadunder\]\(https?:\/\/vk\.com\/reuploadunder\)\]|\[vk\.com\/reuploadunder\](?:\(https?:\/\/vk\.com\/reuploadunder\))?/i;
+    return description.replace(marker, '$& [vk.com/puerrito]');
+  }
+
+  const PUERRITO_CHECK_SIZE = 384;
+  let puerritoCoverSamples;
+
+  function puerritoRed(data, i) {
+    return data[i] > 135 && data[i] - Math.max(data[i + 1], data[i + 2]) > 65;
+  }
+
+  function puerritoWhite(data, i) {
+    return Math.min(data[i], data[i + 1], data[i + 2]) > 155;
+  }
+
+  function getPuerritoCoverSamples() {
+    if (puerritoCoverSamples) return puerritoCoverSamples;
+    const preset = VMU_PUERRITO_COVER_PRESET;
+    const layer = vmuBuildTextLayerPipeline({
+      ...preset,
+      textColor: vmuHexToRgb(preset.textColor),
+      outlineColor: vmuHexToRgb(preset.outlineColor),
+    }, preset.scale, preset.rotation);
+    const size = PUERRITO_CHECK_SIZE;
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const [x, y] = vmuComputePosition([1000, 1000], [layer.width, layer.height], preset.position, [preset.x, preset.y]);
+    const scale = size / 1000;
+    ctx.drawImage(layer, x * scale, y * scale, layer.width * scale, layer.height * scale);
+    const { data } = ctx.getImageData(0, 0, size, size);
+    const red = [], white = [], edge = [];
+    const solidRed = i => data[i * 4 + 3] > 235 && puerritoRed(data, i * 4);
+    for (let y = 6; y < size - 6; y += 2) {
+      for (let x = 6; x < size - 6; x += 2) {
+        const i = y * size + x;
+        if ([i, i - 1, i + 1, i - size, i + size].every(solidRed)) {
+          red.push(i);
+        } else if (data[i * 4 + 3] > 160 && puerritoWhite(data, i * 4)) {
+          white.push(i);
+        } else if (data[i * 4 + 3] < 10 &&
+            [i - 4, i + 4, i - 4 * size, i + 4 * size].some(solidRed)) {
+          edge.push(i);
+        }
+      }
+    }
+    puerritoCoverSamples = { red, white, edge };
+    return puerritoCoverSamples;
+  }
+
+  function matchesPuerritoCover(image) {
+    const size = PUERRITO_CHECK_SIZE;
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(image, 0, 0, size, size);
+    const { data } = ctx.getImageData(0, 0, size, size);
+    const { red, white, edge } = getPuerritoCoverSamples();
+    const proportion = (points, offset, check) =>
+      points.reduce((sum, i) => sum + Number(check(data, (i + offset) * 4)), 0) / (points.length || 1);
+    for (const dy of [0, -2, 2]) {
+      for (const dx of [0, -2, 2]) {
+        const offset = dy * size + dx;
+        const fill = proportion(red, offset, puerritoRed);
+        if (fill < 0.80) continue;
+        if (fill - proportion(edge, offset, puerritoRed) > 0.32) return true;
+        const outline = proportion(white, offset, puerritoWhite);
+        if (outline > 0.30 && outline - proportion(edge, offset, puerritoWhite) > 0.20) return true;
+      }
+    }
+    return false;
+  }
+
+  async function readPuerritoCoverImage(url) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (response.ok) return await createImageBitmap(await response.blob());
+    } catch {}
+    if (!/^https:\/\/[^/]*\b(?:userapi\.com|vkuserphoto\.ru)\//i.test(url)) return null;
+    const image = await geniusMsg('VMU_PUERRITO_READ_COVER', { url });
+    if (!image?.ok) return null;
+    try {
+      const response = await fetch(image.dataUrl);
+      return await createImageBitmap(await response.blob());
+    } catch {
+      return null;
+    }
+  }
+
+  async function checkPuerritoCover(box, stopped) {
+    for (let attempt = 0; attempt < 6 && !stopped(); attempt++) {
+      const cover = box.querySelector('.ape_cover, ._ape_cover');
+      if (cover) {
+        const urls = new Set();
+        for (const img of cover.querySelectorAll('img')) {
+          if (img.currentSrc) urls.add(img.currentSrc);
+          if (img.getAttribute('src')) urls.add(img.src);
+        }
+        for (const el of [cover, ...cover.querySelectorAll('[style*="background"], [class*="ape_cover"]')]) {
+          const background = getComputedStyle(el).backgroundImage;
+          for (const [, quoted, singleQuoted, bare] of background.matchAll(/url\((?:"([^"]*)"|'([^']*)'|([^)]*))\)/g)) {
+            const url = quoted || singleQuoted || bare?.trim();
+            if (url) urls.add(url);
+          }
+        }
+        let checked = false;
+        for (const url of urls) {
+          if (stopped()) return null;
+          const image = await readPuerritoCoverImage(url);
+          if (!image) continue;
+          try {
+            if (Math.min(image.width, image.height) >= 80) {
+              if (matchesPuerritoCover(image)) return true;
+              checked = true;
+            }
+          } finally {
+            image.close();
+          }
+        }
+        if (checked) return false;
+        if (urls.size) return null;
+        if (cover.querySelector('input[type="file"]')) return false;
+      }
+      await sleep(200);
+    }
+    return null;
+  }
+
+  async function findPuerritoCover(title, stopped) {
+    const result = await searchGeniusCoverAlbums(title, matchGeniusCoverAlbums, stopped);
+    if (!result.ok) return { error: result.error };
+    const [album] = result.albums;
+    for (const url of new Set([album.coverFull, album.cover])) {
+      if (stopped()) break;
+      if (!url) continue;
+      const image = await geniusMsg('VKD_FETCH_IMAGE', { url });
+      if (!image?.ok) continue;
+      const blob = await makePerezalitoCover(image.dataUrl, VMU_PUERRITO_COVER_PRESET);
+      if (blob) return { blob };
+    }
+    return { error: 'Не удалось загрузить обложку с Genius' };
+  }
+
+  async function updatePuerritoPlaylist(playlist, stopped) {
+    const [ownerId, playlistId] = playlist.id.split('_');
+    if (getEditPlaylistBox()) throw new Error('Закрой открытый диалог редактирования');
+    lastEditPlaylistIds = null;
+    const opened = await pageCall('VKD_OPEN_PLAYLIST_EDITOR', 'VKD_PLAYLIST_EDITOR_OPENED', {
+      ownerId, playlistId, reqId: crypto.randomUUID(),
+    }, 12000, 'reqId');
+    if (opened?.unavailable === 'card') return { cardUnavailable: true, error: 'карточка плейлиста не подгрузилась' };
+    if (opened?.unavailable === 'pencil') return { error: 'на карточке не найдена кнопка редактирования' };
+    if (opened?.unavailable === 'viewer') return { viewerOpened: true, error: 'VK открыл просмотр вместо редактора' };
+    const box = getEditPlaylistBox();
+    if (!box) throw new Error('Диалог редактирования закрылся');
+    const ids = lastEditPlaylistIds;
+    if (ids && (String(ids.ownerId) !== ownerId || String(ids.playlistId) !== playlistId)) {
+      throw new Error('Открылся диалог другого плейлиста');
+    }
+
+    try {
+      if (stopped()) return null;
+      const branded = await checkPuerritoCover(box, stopped);
+      if (stopped()) return null;
+      if (branded === true) return { alreadyBranded: true };
+      if (branded === null) return { coverError: 'не удалось проверить текущую обложку' };
+      if (getEditPlaylistBox() !== box) throw new Error('Диалог закрылся во время проверки обложки');
+      const { blob: cover, error: coverError } = await findPuerritoCover(playlist.title, stopped);
+      if (stopped()) return null;
+      if (getEditPlaylistBox() !== box) throw new Error('Диалог закрылся во время поиска обложки');
+      const field = box.querySelector('#ape_pl_description, textarea.ape_pl_input');
+      let descriptionChanged = false;
+      let descriptionError = '';
+      if (field) {
+        const description = insertPuerritoTag(field.value);
+        const limit = field.maxLength >= 0 ? field.maxLength : 1000;
+        descriptionChanged = description !== field.value && description.length <= limit;
+        if (description.length > limit && description !== field.value) {
+          descriptionError = 'тег не помещается в описание';
+        } else if (!/\[vk\.com\/puerrito\]/i.test(description)) {
+          descriptionError = 'в описании отсутствует [vk.com/reuploadunder]';
+        }
+        if (descriptionChanged) {
+          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+          setter.call(field, description);
+          field.dispatchEvent(new Event('input', { bubbles: true }));
+          field.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      } else {
+        descriptionError = 'поле описания недоступно';
+      }
+
+      if (cover) await uploadCoverViaDialog(cover);
+      if (cover || descriptionChanged) {
+        await saveEditPlaylistDialog(box, { coverChanged: !!cover, strictBox: true });
+      }
+      return { coverChanged: !!cover, coverError, descriptionChanged, descriptionError };
+    } finally {
+      if (isEditPlaylistBoxOpen(box)) {
+        box.querySelector('.box_x_button, ._box_x_button, .popup_box_close')?.click();
+      }
+    }
+  }
+
+  const puerritoPage = () => location.pathname.replace(/\/$/, '');
+
+  async function loadPuerritoCatalogCards(playlists, stopped) {
+    const mountedIds = () => new Set(
+      [...document.querySelectorAll(PL_CELL_SEL)].map(cell => cell.getAttribute('data-id')),
+    );
+    let mounted = mountedIds();
+    const ready = () => playlists.every(playlist => mounted.has(playlist.id));
+    if (ready() || stopped()) return;
+    await waitForElement(PL_CELL_SEL, 8000);
+    await scrollUntilCountStable(() => {
+      mounted = mountedIds();
+      return mounted.size;
+    }, { sleepMs: 600, stableLimit: 5, maxIter: 100, shouldStop: () => ready() || stopped() });
+  }
+
+  async function processPuerritoQueue(playlists, { cancelled, onProgress, onResult, loadCards = false }) {
+    let processed = 0;
+    const route = puerritoPage();
+    const stopped = () => cancelled() || puerritoPage() !== route;
+    if (loadCards) await loadPuerritoCatalogCards(playlists, stopped);
+    for (const playlist of playlists) {
+      if (stopped()) break;
+      onProgress(playlist.title);
+      try {
+        const result = await updatePuerritoPlaylist(playlist, stopped);
+        if (!result) break;
+        onResult(playlist.title, result, playlist.id);
+        if (result.viewerOpened) return { processed: processed + 1, error: result.error };
+      } catch (err) {
+        onResult(playlist.title, { error: err.message }, playlist.id);
+        if (getEditPlaylistBox()) {
+          return { processed: processed + 1, error: 'Остался открыт диалог редактирования' };
+        }
+      }
+      processed++;
+    }
+    return { processed, stopped: stopped() };
+  }
+
+  if (typeof chrome !== 'undefined' && chrome.runtime?.onConnect) {
+    chrome.runtime.onConnect.addListener(port => {
+      if (port.name !== 'vmu-puerrito-worker') return;
+      let started = false;
+      let cancelled = false;
+      let connected = true;
+      const send = data => {
+        if (connected) {
+          try { port.postMessage(data); } catch { connected = false; }
+        }
+      };
+      port.onDisconnect.addListener(() => { connected = false; });
+      port.onMessage.addListener(message => {
+        if (message.type === 'stop') cancelled = true;
+        if (message.type !== 'start' || started) return;
+        started = true;
+        void processPuerritoQueue(message.playlists, {
+          cancelled: () => cancelled || !connected,
+          loadCards: true,
+          onProgress: title => send({ type: 'progress', title }),
+          onResult: (title, result, id) => send({ type: 'result', title, result, id }),
+        }).then(result => send({ type: 'done', ...result }),
+          err => send({ type: 'done', error: err.message }));
+      });
+    });
+  }
+
+  function processPuerritoBackgroundQueue(playlists, signal, onProgress, onResult) {
+    return new Promise(resolve => {
+      let port;
+      let heartbeat;
+      let startedCount = 0;
+      let completedCount = 0;
+      let finished = false;
+      const finish = result => {
+        if (finished) return;
+        finished = true;
+        signal.removeEventListener('abort', stop);
+        clearInterval(heartbeat);
+        try { port?.disconnect(); } catch {}
+        resolve({ ...result, startedCount, completedCount });
+      };
+      const send = message => {
+        try { port.postMessage(message); }
+        catch (err) { finish({ error: err.message }); }
+      };
+      const stop = () => send({ type: 'stop' });
+      if (signal.aborted) { finish({ stopped: true }); return; }
+      try {
+        port = chrome.runtime.connect({ name: 'vmu-puerrito-queue' });
+        port.onDisconnect.addListener(() => finish({
+          error: chrome.runtime.lastError?.message || 'Связь с фоновой вкладкой потеряна',
+        }));
+        port.onMessage.addListener(message => {
+          if (message.type === 'progress') {
+            startedCount++;
+            onProgress(message.title);
+          } else if (message.type === 'result') {
+            completedCount++;
+            onResult(message.title, message.result, message.id);
+          } else if (message.type === 'done') {
+            finish(message);
+          }
+        });
+        signal.addEventListener('abort', stop, { once: true });
+        // A live port alone does not keep the extension service worker awake.
+        heartbeat = setInterval(() => send({ type: 'ping' }), 15000);
+        send({ type: 'start', playlists });
+      } catch (err) {
+        finish({ error: err.message });
+      }
+    });
+  }
+
+  function openPuerritoCatalogPanel() {
+    const existing = document.getElementById('vmu-puerrito-panel');
+    if (existing?.dataset.running) return;
+    if (getEditPlaylistBox()) {
+      showToast('Сначала закрой открытый диалог редактирования', true);
+      return;
+    }
+    existing?.remove();
+    syncVmuTheme();
+    const panel = document.createElement('div');
+    panel.id = 'vmu-puerrito-panel';
+    panel.className = 'vmu-bulkops-panel vmu-plcollect-modal';
+    panel.innerHTML = `
+      <div class="vmu-bulkops-head">
+        <span class="vmu-bulkops-title">ПУЭРРИТО · плейлисты</span>
+        <button type="button" class="vmu-check-close" title="Закрыть">${ICON_CLOSE}</button>
+      </div>
+      <div class="vmu-bulkops-body vmu-plcollect-body">
+        <div class="vmu-plc-status" id="vmu-puerrito-status" role="status"></div>
+        <textarea class="vmu-plcollect-text" aria-label="Результаты обновления" rows="6" readonly></textarea>
+        <div class="vmu-plc-actions">
+          <label class="vmu-plc-label">Потоков
+            <select class="vmu-covered-select" id="vmu-puerrito-threads">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+          <button type="button" class="vmu-pick-btn" id="vmu-puerrito-start">Обновить плейлисты</button>
+          <button type="button" class="vmu-pick-btn" id="vmu-puerrito-stop" hidden>Остановить</button>
+        </div>
+      </div>`;
+    document.body.appendChild(panel);
+    makePanelDraggable(panel, panel.querySelector('.vmu-bulkops-head'));
+    const status = panel.querySelector('#vmu-puerrito-status');
+    const report = panel.querySelector('textarea');
+    const stop = panel.querySelector('#vmu-puerrito-stop');
+    const start = panel.querySelector('#vmu-puerrito-start');
+    const threads = panel.querySelector('#vmu-puerrito-threads');
+    const close = panel.querySelector('.vmu-check-close');
+    const initialPage = puerritoPage();
+    const controller = new AbortController();
+    const stopRun = () => {
+      controller.abort();
+      stop.disabled = true;
+      status.textContent = 'Останавливаем обработку…';
+    };
+    stop.addEventListener('click', stopRun);
+    close.addEventListener('click', () => {
+      if (panel.dataset.running) stopRun();
+      else panel.remove();
+    });
+
+    start.addEventListener('click', async () => {
+      if (panel.dataset.running) return;
+      if (puerritoPage() !== initialPage) {
+        status.textContent = 'Вернись к списку плейлистов, чтобы начать';
+        return;
+      }
+      if (getEditPlaylistBox()) {
+        status.textContent = 'Сначала закрой открытый диалог редактирования';
+        return;
+      }
+      panel.dataset.running = '1';
+      threads.disabled = true;
+      start.hidden = true;
+      stop.hidden = false;
+      const cancelled = () => controller.signal.aborted;
+      const collectionStopped = () => cancelled() || puerritoPage() !== initialPage;
+      try {
+        status.textContent = 'Собираем плейлисты…';
+        const playlists = await collectCatalogPlaylists(n => {
+          if (!collectionStopped()) status.textContent = `Собираем плейлисты… найдено ${n}`;
+        }, collectionStopped);
+        if (!playlists.length || collectionStopped()) {
+          status.textContent = collectionStopped() ? 'Обработка остановлена' : 'Плейлисты не найдены';
+          return;
+        }
+        const count = Math.min(playlists.length, Math.max(1, Math.min(4, Number(threads.value) || 1)));
+        const queues = Array.from({ length: count }, () => []);
+        playlists.forEach((playlist, index) => queues[index % count].push(playlist));
+        let done = 0;
+        let covers = 0;
+        let branded = 0;
+        let tags = 0;
+        const active = Array(count).fill('');
+        const summary = () => `обработано ${done}/${playlists.length} · обложек: ${covers} · тегов: ${tags} · уже ПУЭРРИТО: ${branded}`;
+        const renderStatus = () => {
+          if (!cancelled()) status.textContent = [summary(), ...active.filter(Boolean)].join('\n');
+        };
+        const progress = (index, title) => {
+          active[index] = title ? `Поток ${index + 1} · ${title}` : '';
+          renderStatus();
+        };
+        const record = (title, result) => {
+          done++;
+          if (result.coverChanged) covers++;
+          if (result.descriptionChanged) tags++;
+          if (result.alreadyBranded) branded++;
+          const details = result.error || [
+            result.alreadyBranded ? 'фирменная обложка уже стоит' :
+              result.coverChanged ? 'обложка обновлена' : result.coverError,
+            result.descriptionChanged ? 'тег добавлен' : result.descriptionError,
+          ].filter(Boolean).join(', ');
+          if (details) report.value += `${title} — ${details}\n`;
+          renderStatus();
+        };
+        const recover = new Set();
+        const deferOrRecord = (title, result, id) => {
+          if (result.cardUnavailable && id) recover.add(id);
+          else record(title, result);
+        };
+        const runLocal = (queue, retry = false) => processPuerritoQueue(queue, {
+          cancelled, loadCards: retry, onProgress: title => progress(0, title),
+          onResult: retry ? record : deferOrRecord,
+        }).then(result => {
+          if (result.error) report.value += `Поток 1 — ${result.error}\n`;
+          if (result.stopped) controller.abort();
+          progress(0, '');
+          return result;
+        });
+        renderStatus();
+        const [local] = await Promise.all([
+          runLocal(queues[0]),
+          ...queues.slice(1).map(async (queue, index) => {
+            progress(index + 1, 'открываем вкладку…');
+            const result = await processPuerritoBackgroundQueue(
+              queue, controller.signal, title => progress(index + 1, title), deferOrRecord,
+            );
+            progress(index + 1, '');
+            if (result.error || (result.stopped && !cancelled())) {
+              report.value += `Поток ${index + 2} — ${result.error || 'обработка прервана'}\n`;
+              if (!cancelled()) {
+                if (result.startedCount > result.completedCount) {
+                  record(queue[result.completedCount].title, { error: 'результат сохранения неизвестен' });
+                }
+                for (const playlist of queue.slice(result.startedCount)) recover.add(playlist.id);
+              }
+            }
+          }),
+        ]);
+        if (recover.size && !cancelled() && !local.error) {
+          report.value += 'Продолжаем в текущей вкладке с плейлистами, до которых не дошли другие потоки.\n';
+          await runLocal(playlists.filter(playlist => recover.has(playlist.id)), true);
+        }
+        const outcome = cancelled() ? 'Остановлено' : done < playlists.length ? 'Завершено частично' : 'Готово';
+        status.textContent = `${outcome} · ${summary()}`;
+      } catch (err) {
+        controller.abort();
+        status.textContent = `Ошибка: ${err.message}`;
+      } finally {
+        delete panel.dataset.running;
+        stop.remove();
+      }
+    });
+  }
+
   function injectPlaylistCollectButton() {
-    if (document.getElementById('vmu-plcollect-btn')) return;
-    const list = document.querySelector(PL_LIST_BLOCK_SEL);
-    if (!list?.parentElement) return;
+    const list = findPlaylistCatalogList();
+    const existing = document.getElementById('vmu-plcollect-btn')?.closest('.vmu-plcollect-row');
+    if (!list?.parentElement) {
+      existing?.remove();
+      return;
+    }
+    if (existing) {
+      if (existing.nextElementSibling !== list) list.before(existing);
+      return;
+    }
     const row = document.createElement('div');
     row.className = 'vmu-plcollect-row';
     const btn = document.createElement('button');
@@ -14277,7 +15364,12 @@
     btn.className = 'vmu-plcollect-btn';
     btn.textContent = 'Собрать список плейлистов';
     btn.addEventListener('click', e => { e.stopPropagation(); runPlaylistCollect(); });
-    row.appendChild(btn);
+    const puerrito = document.createElement('button');
+    puerrito.type = 'button';
+    puerrito.className = 'vmu-plcollect-btn';
+    puerrito.textContent = 'Обновить все плейлисты · ПУЭРРИТО';
+    puerrito.addEventListener('click', e => { e.stopPropagation(); openPuerritoCatalogPanel(); });
+    row.append(btn, puerrito);
     list.parentElement.insertBefore(row, list);
   }
 
@@ -14330,12 +15422,13 @@
   function markPlayerBlockWrap(sec) {
     const wrap = sec.parentElement;
     if (!wrap || wrap.classList.contains('vmu-pb-wrap-flow') || wrap.classList.contains('vmu-pb-wrap-fixed')) return;
-    let anc = wrap, isFixed = false;
+    let anc = wrap, fixedHost = null;
     for (let d = 0; d < 4 && anc; d++) {
-      if (getComputedStyle(anc).position === 'fixed') { isFixed = true; break; }
+      if (getComputedStyle(anc).position === 'fixed') { fixedHost = anc; break; }
       anc = anc.parentElement;
     }
-    wrap.classList.add(isFixed ? 'vmu-pb-wrap-fixed' : 'vmu-pb-wrap-flow');
+    if (fixedHost && fixedHost !== wrap) fixedHost.classList.add('vmu-pb-fixed-host');
+    wrap.classList.add(fixedHost ? 'vmu-pb-wrap-fixed' : 'vmu-pb-wrap-flow');
   }
 
   function vmuStampPlayerBlocks() {
@@ -14617,8 +15710,8 @@
   // our dropzone. The layout itself is unchanged — [header, body, footer] —
   // and the footer is the one row holding VK's real «Закрыть» <button>, while
   // the header's own close control is a role="button" with the same name.
-  function vmuStampUploadDialog() {
-    for (const box of document.querySelectorAll('[role="dialog"]')) {
+  function vmuStampUploadDialog(boxes = document.querySelectorAll('[role="dialog"]')) {
+    for (const box of boxes) {
       if (vmuInOverlay(box)) continue;
       if (!String(box.className || '').includes('vkitInternalModalBox')) continue;
       if (box.querySelector('[data-testid="modalfooter"]')) continue;
@@ -14657,7 +15750,8 @@
       if (vmuInOverlay(cell)) continue;
       if (!/^-?\d+_\d+$/.test(cell.getAttribute('data-id') || '')) continue;
       if (cell.hasAttribute('data-audio-id')) continue;
-      if (!/Редактировать|Слушать/.test(cell.textContent || '')) continue;
+      const action = cell.querySelector('[aria-label="Редактировать"], [aria-label="Слушать"], [title="Редактировать"]');
+      if (!action && !/Редактировать|Слушать/.test(cell.textContent || '')) continue;
       vmuStamp(cell, 'MusicPlaylistItem_Cell');
       // the title sits inside the cell's own «Открыть» control
       let open = cell.querySelector('[role="button"][aria-label="Открыть"]');
@@ -14679,11 +15773,23 @@
     }
   }
 
+  function vmuStampFriendsMusicSection() {
+    const catalog = document.getElementById('spa_layout_content');
+    if (!catalog || catalog.querySelector('[data-testid="AudioCatalog_SectionFriendsMusic"]')) return;
+    for (const heading of catalog.querySelectorAll('section > :is([role="heading"], h2, h3)')) {
+      if (vmuLabel(heading) !== 'Музыка друзей' &&
+          heading.firstElementChild?.textContent.trim() !== 'Музыка друзей') continue;
+      vmuStamp(heading.parentElement, 'AudioCatalog_SectionFriendsMusic');
+      return;
+    }
+  }
+
   let _vmuStampAt = 0, _vmuNativeAt = -1e9, _vmuNative = false;
   function restoreVkTestIds(force) {
     const now = performance.now();
     if (!force && now - _vmuStampAt < 60) return;
     _vmuStampAt = now;
+    if (settings.hideFriendsMusic) vmuStampFriendsMusicSection();
     // A build that still marks its own music UI: leave the page alone (asking
     // for VK's own ids, not just any — another extension's data-testid must not
     // look like VK's). Which build this is cannot change while the page is
@@ -14721,7 +15827,8 @@
   restoreVkTestIds(true);
   // a stamp of which build of this file the browser actually loaded, so a
   // page check can tell a reloaded extension from a stale one
-  document.documentElement.setAttribute('data-vmu-build', '2026-11-18-bulkalbums5');
+  document.documentElement.setAttribute('data-vmu-build', '2026-11-26-puerrito-catalog');
+  injectPlaylistCollectButton();
 
   function onPageMutated() {
     restoreVkTestIds(true);
@@ -14779,14 +15886,13 @@
     clearTimeout(_dupesDialogTimer);
     _dupesDialogTimer = setTimeout(tryInjectDupesIntoEditDialog, 300);
 
+    injectPlaylistCollectButton();
     if (hasAudio) {
       // Inject single-track download buttons
       scanAndInjectDlBtns();
 
       // Keep the audio catalog header split/pin in sync with VK's re-renders
       applyAudioCatalogLayout();
-
-      injectPlaylistCollectButton();
 
       // Restore the audio FX button/panel if VK re-rendered over them
       ensureAudioFxUI();
@@ -14810,6 +15916,9 @@
     return false;
   };
   new MutationObserver(muts => {
+    // The initial upload UI must mount in this mutation batch, before a paint.
+    // Catalog updates and reinjection after upload can remain throttled.
+    try { mountNewUploadDialog(muts); } catch (err) { console.warn('[VK Multi Upload] upload dialog:', err); }
     // before the throttle: every selector below depends on the ids being there
     restoreVkTestIds();
     if (_mutScheduled) return;
