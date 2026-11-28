@@ -356,12 +356,7 @@
   const isMP3 = (f) => f.type === 'audio/mpeg' || f.name.toLowerCase().endsWith('.mp3');
   const fmtSize = (b) => b < 1048576 ? (b / 1024).toFixed(0) + ' KB' : (b / 1048576).toFixed(1) + ' MB';
   const escHtml = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  // Small "?" badge with a native title tooltip — used throughout the audio-FX
-  // panel to explain what a control actually does. Native `title` rather than
-  // a custom CSS tooltip deliberately: it's rendered by the browser/OS, so it
-  // always has readable contrast regardless of VK's theme, and several of
-  // these icons sit inside the panel's own scrolling body where a CSS-based
-  // popover would risk being clipped by overflow:auto.
+  // Small "?" badge with a shared tooltip, used throughout the audio-FX panel.
   const helpIcon = (text) => ` <span class="vmu-help-icon" title="${escHtml(text)}">?</span>`;
 
   function waitForElement(sel, ms) {
@@ -2072,8 +2067,6 @@
       btn.className = anchor.className + ' vmu-audiofx-btn';
       btn.setAttribute('data-vmu-tip', 'Эквалайзер');
       btn.innerHTML = ICON_AUDIOFX;
-      btn.addEventListener('mouseenter', () => showDlTooltip(btn));
-      btn.addEventListener('mouseleave', hideDlTooltip);
       btn.addEventListener('click', () => { hideDlTooltip(); toggleAudioFxPanel(); });
       anchor.parentElement.insertBefore(btn, anchor);
     });
@@ -3504,11 +3497,12 @@
       btn_create_playlist_not_found: 'Кнопка "Создать плейлист" не найдена. Перейдите на страницу своей музыки (/audios) и попробуйте снова.',
       dialog_not_opened: 'Диалог плейлиста не открылся.',
       save_btn_not_found: 'Кнопка "Сохранить" не найдена в диалоге.',
-      save_playlist_timeout: 'Плейлист не был сохранён за 20 секунд.',
+      save_playlist_timeout: 'ВК не закрыл редактор после сохранения плейлиста.',
       playlist_id_not_found: 'Не удалось получить ID созданного плейлиста.',
       edit_button_not_found: 'Не нашёл плейлист на открытой странице (нужна его кнопка «Редактировать»). Открой страницу, где плейлист виден, и повтори.',
       add_audios_btn_not_found: 'В диалоге плейлиста нет кнопки «Добавить аудиозаписи».',
       audio_item_list_not_found: 'Список «Добавить аудиозаписи» не открылся.',
+      no_matching_tracks: 'Загруженные треки не найдены в редакторе плейлиста.',
     };
     return map[msg] || msg;
   }
@@ -3584,14 +3578,15 @@
   // Returns however many net new tracks actually showed up — 0 if none did,
   // which callers treat as "upload didn't really go through, don't create a
   // playlist for nothing".
-  function waitForTrackCountIncrease(startCount, expected, timeoutMs, onTick) {
+  function waitForTrackCountIncrease(startCount, expected, timeoutMs, onTick, confirmedCount = () => 0) {
     const target = typeof expected === 'function' ? expected : () => expected;
     timeoutMs = timeoutMs || Math.max(20000, target() * 8000);
     return new Promise(resolve => {
       const deadline = Date.now() + timeoutMs;
       const tick = () => {
         const now = getPageTrackCount();
-        const gained = now == null ? 0 : Math.max(0, now - startCount);
+        const countIncrease = now == null || startCount == null ? 0 : now - startCount;
+        const gained = Math.max(confirmedCount(), countIncrease);
         if (gained >= target() || Date.now() >= deadline) { resolve(gained); return; }
         // A batch of a dozen files buys itself a minute and a half of this
         // wait; without a visible countdown it reads as a page that simply
@@ -4015,9 +4010,9 @@
       const body = scope.querySelector('[data-testid="MusicPlaylistModal_Body"], [class*="vkitModalBody__container"]')
         || [...scope.children].find(el => el !== header && el.querySelector('[data-audio-id], [data-testid$="MusicTrackRow"]'));
       const oldGroup = header.querySelector('[class*="vkuiButtonGroup__stretch"]');
-      const playback = header.querySelector('button:has(svg:is([class~="vkuiIcon--play_24"], [class~="vkuiIcon--pause_24"]))');
+      const action = header.querySelector('button:has(svg:is([class~="vkuiIcon--play_24"], [class~="vkuiIcon--pause_24"], [class~="vkuiIcon--pen_outline_24"]))');
       const controls = oldGroup?.closest('[class*="vkuiFlex__host"]')
-        || playback?.closest('[role="group"]')?.parentElement?.parentElement || header;
+        || action?.closest('[role="group"]')?.parentElement?.parentElement || header;
       return { scope, header, body, title, controls };
     }
     return null;
@@ -7322,6 +7317,7 @@
       list,
       rows: files.map((file, index) => ({ file, index, state: 'waiting', progress: null, reason: '' })),
       timer: null,
+      closeTimer: null,
       observer: null,
       preparing: true,
       handedOff: false,
@@ -7353,6 +7349,7 @@
 
   function releaseNativeUploadTracker(tracker) {
     clearTimeout(tracker.timer);
+    clearTimeout(tracker.closeTimer);
     tracker.observer.disconnect();
     if (nativeUploadTracker === tracker) nativeUploadTracker = null;
   }
@@ -7396,10 +7393,6 @@
           reason.hidden = true;
           marker.setAttribute('aria-expanded', 'false');
           marker.setAttribute('aria-controls', reason.id);
-          marker.addEventListener('mouseenter', () => showDlTooltip(marker));
-          marker.addEventListener('mouseleave', hideDlTooltip);
-          marker.addEventListener('focus', () => showDlTooltip(marker));
-          marker.addEventListener('blur', hideDlTooltip);
           marker.addEventListener('click', () => {
             reason.hidden = !reason.hidden;
             marker.setAttribute('aria-expanded', String(!reason.hidden));
@@ -7458,6 +7451,22 @@
     const clearButton = tracker.box.querySelector('#vmu-clear');
     if (clearButton) clearButton.style.display = tracker.preparing || active ? 'none' : '';
     if (!active) clearTimeout(tracker.timer);
+    if (tracker.handedOff && done === tracker.rows.length && !tracker.closeTimer) {
+      tracker.closeTimer = setTimeout(() => {
+        if (nativeUploadTracker === tracker && tracker.box.isConnected) closeUploadModal(tracker.box);
+      }, 900);
+    }
+  }
+
+  async function waitForTrackedUploadToClose(tracker) {
+    clearTimeout(tracker.closeTimer);
+    if (!tracker.box.isConnected || !tracker.box.checkVisibility()) return;
+    closeUploadModal(tracker.box);
+    for (let i = 0; i < 30; i++) {
+      if (!tracker.box.isConnected || !tracker.box.checkVisibility()) return;
+      await sleep(100);
+    }
+    throw new Error('Не удалось закрыть окно загрузки ВК');
   }
 
   function resetUploadTrackerDeadline(tracker) {
@@ -7989,7 +7998,7 @@
         e.data.fileName ? tracker.rows.filter(row => row.transferName === e.data.fileName) : [];
       if (rows.length === 1) failedTrackIds.add(rows[0].id);
     };
-    if (startCountEarly != null) window.addEventListener('message', onUploadDone);
+    if (shouldTrackPlaylist) window.addEventListener('message', onUploadDone);
 
     let items = [];
     let batchItems = [];
@@ -8086,12 +8095,12 @@
     setBlockAudioHide(true, tracker.id);
     window.postMessage({ type: 'VK_HANDOFF_FILES', batchId: tracker.id, items }, '*', items.map(i => i.buffer));
 
-    const startCount = startCountEarly;
-    if (startCount != null) {
+    if (shouldTrackPlaylist) {
       showProgressToast('Ждём подтверждения загрузки…', { id: 'vmu-autoplaylist' });
-      const eligible = () => batchItems.filter(item => item.row.state !== 'cancelled' && !failedTrackIds.has(item.row.id));
-      waitForTrackCountIncrease(startCount, () => batchItems.filter(item => item.row.state !== 'cancelled').length)
-        .then(gained => {
+      const eligible = () => batchItems.filter(item => !['cancelled', 'error'].includes(item.row.state) && !failedTrackIds.has(item.row.id));
+      const confirmed = () => batchItems.filter(item => item.row.state === 'done').length;
+      waitForTrackCountIncrease(startCountEarly, () => eligible().length, null, null, confirmed)
+        .then(async gained => {
           autoPlaylistClaimed = false; // decided — a new upload can claim the next slot now
           window.removeEventListener('message', onUploadDone);
           if (batchItems.every(item => item.row.state === 'cancelled')) {
@@ -8114,12 +8123,14 @@
             const survivors = eligible();
             if (survivors.length === gained) {
               showProgressToast(`${items.length - gained} из ${items.length} не загрузились — пропускаем их и добавляем остальные…`, { id: 'vmu-autoplaylist' });
+              await waitForTrackedUploadToClose(tracker);
               enqueueAutoPlaylist(survivors);
               return;
             }
             showProgressToast(`Загружено ${gained} из ${items.length} — часть треков не удалось загрузить, плейлист не создан автоматически`, { id: 'vmu-autoplaylist', kind: 'error' });
             return;
           }
+          await waitForTrackedUploadToClose(tracker);
           enqueueAutoPlaylist(eligible());
         })
         .catch(err => {
@@ -8240,10 +8251,9 @@
   // Close the upload dialog through VK's own controls — the native close /
   // cancel buttons are the only path that tears down both the modal and its
   // dim overlay (Escape is ignored by this modal, verified live).
-  function closeUploadModal() {
-    setBlockAudioHide(false);
-    const box = getUploadDialog();
+  function closeUploadModal(box = getUploadDialog()) {
     if (!box) return;
+    setBlockAudioHide(false, box.dataset.vmuTrackedUpload);
     // Native controls (kept intact by injectIntoVkDialog)
     const native = box.querySelector('[data-testid="UploadAudio_CancelButton"]')
                 || box.querySelector('[data-testid="modal-close-button"]');
@@ -8825,14 +8835,8 @@
     btn.className = uploadBtn.className;
     matchNativeButtonBox(btn, uploadBtn);
     btn.setAttribute('aria-label', 'Массовые операции');
-    // Native title swapped for the same custom vkit-style bubble the other
-    // toolbar-injected buttons (.vmu-audiofx-btn) use — see showDlTooltip's
-    // isNewVk check — so it looks like one of VK's own tooltips instead of
-    // the browser's default one.
     btn.setAttribute('data-vmu-tip', 'Массовые операции');
     btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h14M3 10h10M3 14h6"/></svg>`;
-    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
-    btn.addEventListener('mouseleave', hideDlTooltip);
     btn.addEventListener('click', async () => {
       hideDlTooltip();
       if (document.getElementById('vmu-massop-confirm')) return;
@@ -8864,8 +8868,6 @@
     gearBtn.setAttribute('aria-label', 'Настройки');
     gearBtn.setAttribute('data-vmu-tip', 'Настройки');
     gearBtn.innerHTML = ICON_SETTINGS;
-    gearBtn.addEventListener('mouseenter', () => showDlTooltip(gearBtn));
-    gearBtn.addEventListener('mouseleave', hideDlTooltip);
     gearBtn.addEventListener('click', () => { hideDlTooltip(); toggleSettings(); });
     group.insertBefore(gearBtn, uploadBtn);
     }
@@ -8879,8 +8881,6 @@
     scBtn.setAttribute('aria-label', 'Скачать с SoundCloud');
     scBtn.setAttribute('data-vmu-tip', 'Скачать с SoundCloud');
     scBtn.innerHTML = ICON_SOUNDCLOUD;
-    scBtn.addEventListener('mouseenter', () => showDlTooltip(scBtn));
-    scBtn.addEventListener('mouseleave', hideDlTooltip);
     scBtn.addEventListener('click', () => { hideDlTooltip(); toggleSoundCloud(); });
     group.insertBefore(scBtn, gearBtn);
   }
@@ -8992,8 +8992,6 @@
     btn.setAttribute('aria-label', 'Плейлист из файлов');
     btn.setAttribute('data-vmu-tip', 'Плейлист из файлов');
     btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 9h10M3 13h6"/><path d="M15 11v5M12.5 13.5h5"/></svg>`;
-    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
-    btn.addEventListener('mouseleave', hideDlTooltip);
     btn.addEventListener('click', () => { hideDlTooltip(); openPlaylistMakerPanel(); });
     group.insertBefore(btn, document.getElementById('vmu-bulkops-btn') || uploadBtn);
   }
@@ -9694,8 +9692,6 @@
     btn.setAttribute('aria-label', 'Альбомы с диска');
     btn.setAttribute('data-vmu-tip', 'Альбомы с диска');
     btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.5V15a1.5 1.5 0 0 0 1.5 1.5h12A1.5 1.5 0 0 0 17.5 15V7.5a1.5 1.5 0 0 0-1.5-1.5H9.5L8 4H4a1.5 1.5 0 0 0-1.5 1.5z"/><path d="M10 13.5V9M8 11l2-2 2 2"/></svg>`;
-    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
-    btn.addEventListener('mouseleave', hideDlTooltip);
     btn.addEventListener('click', () => { hideDlTooltip(); openBulkAlbumsPanel(); });
     group.insertBefore(btn, document.getElementById('vmu-plmake-btn') || uploadBtn);
   }
@@ -10546,8 +10542,6 @@
     btn.setAttribute('aria-label', 'Порядок плейлистов');
     btn.setAttribute('data-vmu-tip', 'Порядок плейлистов');
     btn.innerHTML = `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v14M3.5 5.5L6 3l2.5 2.5M3.5 14.5L6 17l2.5-2.5"/><path d="M12 6h5M12 10h5M12 14h5"/></svg>`;
-    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
-    btn.addEventListener('mouseleave', hideDlTooltip);
     btn.addEventListener('click', () => { hideDlTooltip(); openPlaylistOrderPanel(); });
     group.insertBefore(btn, document.getElementById('vmu-plmake-btn') || document.getElementById('vmu-bulkops-btn') || uploadBtn);
   }
@@ -12504,7 +12498,7 @@
     document.getElementById('vmu-pick-open')?.addEventListener('click', () => {
       document.getElementById('vmu-input')?.click();
     });
-    document.getElementById('vmu-close-btn')?.addEventListener('click', closeUploadModal);
+    document.getElementById('vmu-close-btn')?.addEventListener('click', () => closeUploadModal());
     document.getElementById('vmu-clear')?.addEventListener('click', () => {
       if (nativeUploadTracker && !nativeUploadTracker.rows.some(row => NATIVE_UPLOAD_ACTIVE.has(row.state))) {
         releaseNativeUploadTracker(nativeUploadTracker);
@@ -12747,6 +12741,7 @@
     btn.className = 'vmu-dupes-dialog-btn';
     btn.setAttribute('data-vmu-dupes-dialog', '1');
     btn.setAttribute('data-vmu-tip', 'Проверить на дубликаты');
+    btn.setAttribute('aria-label', 'Проверить на дубликаты');
     btn.innerHTML = ICON_DUPES_SCAN;
     let cancelToken = null;
     btn.addEventListener('click', e => {
@@ -12763,6 +12758,7 @@
       btn.innerHTML = ICON_DUPES_STOP;
       btn.classList.add('vmu-dupes-dialog-btn-scanning');
       btn.setAttribute('data-vmu-tip', 'Остановить поиск');
+      btn.setAttribute('aria-label', 'Остановить поиск');
       scanForDuplicates(plInfo, (msg, isError) => {
         showToast(msg, isError);
       }, cancelToken).finally(() => {
@@ -12771,6 +12767,7 @@
         btn.innerHTML = ICON_DUPES_SCAN;
         btn.classList.remove('vmu-dupes-dialog-btn-scanning');
         btn.setAttribute('data-vmu-tip', 'Проверить на дубликаты');
+        btn.setAttribute('aria-label', 'Проверить на дубликаты');
       });
     });
     return btn;
@@ -12783,7 +12780,9 @@
     const btn = document.createElement('button');
     btn.className = 'vmu-dl-dialog-btn vmu-dl-dialog-btn-' + mode;
     btn.setAttribute('data-vmu-dl-dialog', mode);
-    btn.setAttribute('data-vmu-tip', isZip ? 'Скачать ZIP' : 'Скачать треками');
+    const label = isZip ? 'Скачать ZIP' : 'Скачать треками';
+    btn.setAttribute('data-vmu-tip', label);
+    btn.setAttribute('aria-label', label);
     btn.innerHTML = isZip
       ? `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 6.5L5 4h10l1.5 2.5v9a1 1 0 0 1-1 1H4.5a1 1 0 0 1-1-1v-9z"/><path d="M3.5 7h13"/><path d="M10 10v4M8 12.2l2 2 2-2"/></svg>`
       : `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v10M7 10l3 3 3-3"/><path d="M3 15h14"/></svg>`;
@@ -12804,8 +12803,10 @@
     const plInfo = (modal && modal.title?.href && getPlaylistInfoFromUrl(modal.title.href)) || urlInfo || _pendingDupesPlaylist;
     if (!plInfo) return;
     const key = plInfo.ownerId + "_" + plInfo.playlistId + "_" + (plInfo.accessHash || "");
+    const surface = modal ? 'modal' : 'page';
     const existing = view.scope.querySelector("[data-vmu-playlist-actions]");
     if (existing?.dataset.vmuPlaylistActions === key) {
+      if (existing.dataset.vmuPlaylistSurface !== surface) existing.dataset.vmuPlaylistSurface = surface;
       if (view.controls.nextElementSibling !== existing) view.controls.after(existing);
       return;
     }
@@ -12814,6 +12815,7 @@
     const newRow = document.createElement("div");
     newRow.className = "vmu-playlist-actions";
     newRow.dataset.vmuPlaylistActions = key;
+    newRow.dataset.vmuPlaylistSurface = surface;
     const dupesBtn = makeDupesBtn(plInfo);
     newRow.appendChild(dupesBtn);
     newRow.appendChild(makeDlDialogBtn(plInfo, 'individual'));
@@ -13447,108 +13449,113 @@
     }
   }
 
-  // Single body-portal tooltip for all download buttons. CSS ::after tooltips
-  // get clipped by VK's gallery containers (ui_gallery__inner_cont has
-  // overflow: hidden) on the first row of every column; rendering the tooltip
-  // as a position:fixed element appended to body escapes any ancestor clip.
-  function getDlTooltipEl() {
-    let el = document.getElementById('vmu-tooltip');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'vmu-tooltip';
-      document.body.appendChild(el);
+  // A single body portal keeps hints clear of clipped track rows and dialogs.
+  const TOOLTIP_DELAY = 150;
+  const TOOLTIP_MOTION = 100;
+  let tooltipTarget = null;
+  let tooltipTitle = null;
+  let tooltipTimer;
+  let tooltipMotion;
+
+  function showDlTooltip() {
+    const target = tooltipTarget;
+    const text = (target?.getAttribute('data-vmu-tip') || tooltipTitle || '').trim();
+    if (!text || !target.isConnected || target.matches(':disabled, [aria-disabled="true"]') || !target.checkVisibility()) return;
+
+    let tip = document.getElementById('vmu-tooltip');
+    if (!tip) {
+      tip = document.createElement('div');
+      tip.id = 'vmu-tooltip';
+      tip.setAttribute('role', 'tooltip');
+      document.body.appendChild(tip);
     }
-    return el;
-  }
-  function showDlTooltip(btn, forceNew) {
-    const text = btn.getAttribute('data-vmu-tip');
-    if (!text) return;
-    const el = getDlTooltipEl();
-    el.textContent = text;
-    // Default flavour matches VK's old tt_w.tt_black tooltip (used across the
-    // legacy audio rows and top-bar icons). Buttons inside the new vkui
-    // playlist modal get the vkui-style tooltip via .vmu-tooltip-new.
-    // One look for every bubble of the extension: the current VK one (dark, rounded,
-    // wrapped). The legacy translucent black one (tt_black) is gone — it showed on the
-    // toolbar buttons that were not on the old «new-style» list and looked foreign.
-    const isNewVk = true;
-    el.classList.toggle('vmu-tooltip-new', isNewVk);
-    // Reset placement modifier before measuring so layout reflects the
-    // default-above tail height.
-    el.classList.remove('vmu-tooltip-below');
-    el.classList.add('vmu-tooltip-show');
-    const br = btn.getBoundingClientRect();
-    const tr = el.getBoundingClientRect();
-    // 8 px gap so the 5 px tail tip just touches the icon's edge.
-    const GAP = 8;
-    let top = br.top - tr.height - GAP;
-    if (top < 4) {
-      top = br.bottom + GAP;
-      el.classList.add('vmu-tooltip-below');
+    tooltipMotion?.cancel();
+    tip.textContent = text;
+    tip.classList.add('vmu-tooltip-show');
+    const rect = target.getBoundingClientRect();
+    const gap = 16;
+    const above = rect.top - tip.offsetHeight - gap;
+    const below = rect.bottom + gap;
+    const placeBelow = below + tip.offsetHeight <= window.innerHeight - 4 || above < 4;
+    const left = rect.left + (rect.width - tip.offsetWidth) / 2;
+    tip.classList.toggle('vmu-tooltip-below', placeBelow);
+    tip.style.top = (placeBelow ? below : above) + 'px';
+    tip.style.left = Math.max(4, Math.min(window.innerWidth - tip.offsetWidth - 4, left)) + 'px';
+    if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      tooltipMotion = tip.animate([
+        { opacity: 0, transform: 'scale(.8)' },
+        { opacity: 1, transform: 'scale(1)' },
+      ], { duration: TOOLTIP_MOTION, easing: 'ease-in' });
     }
-    let left = br.left + br.width / 2 - tr.width / 2;
-    left = Math.max(4, Math.min(window.innerWidth - tr.width - 4, left));
-    el.style.top = top + 'px';
-    el.style.left = left + 'px';
-  }
-  function hideDlTooltip() {
-    const el = document.getElementById('vmu-tooltip');
-    if (el) el.classList.remove('vmu-tooltip-show');
   }
 
-  // ─── Global bridge: native title="" → the custom #vmu-tooltip bubble ───────
-  // This project has 50+ title="..." call sites (help icons, reset buttons,
-  // EQ band labels, panel close buttons, etc.), most built via innerHTML
-  // template strings where wiring an explicit data-vmu-tip + mouseenter/
-  // mouseleave pair per element (the pattern .vmu-audiofx-btn and friends use
-  // deliberately) isn't practical. Delegating on document instead covers all
-  // of them — present now or added later — without touching those call
-  // sites: on hover, swap title for data-vmu-tip (so the browser's own
-  // tooltip doesn't also render) and show our bubble; on leave, swap back.
-  // Covers the whole page, VK's own title="" included: the browser's grey native
-  // tooltip next to our bubbles looked like two different apps. (Only the title is
-  // taken off while the pointer is over the element and put back on leave.)
-  let _vmuTitleHoverEl = null;
-  const _tipRelease = () => {
-    const el = _vmuTitleHoverEl;
-    if (!el) return;
-    const text = el.getAttribute('data-vmu-tip');
-    if (text && !el.hasAttribute('title') && el.isConnected) el.setAttribute('title', text);
-    el.removeAttribute('data-vmu-tip');
-    _vmuTitleHoverEl = null;
+  function hideDlTooltip() {
+    clearTimeout(tooltipTimer);
+    tooltipMotion?.cancel();
+    tooltipMotion = null;
+    if (tooltipTitle !== null && tooltipTarget && !tooltipTarget.hasAttribute('title')) {
+      tooltipTarget.setAttribute('title', tooltipTitle);
+    }
+    tooltipTitle = null;
+    tooltipTarget = null;
+    document.getElementById('vmu-tooltip')?.classList.remove('vmu-tooltip-show');
+  }
+
+  function fadeDlTooltip() {
+    const tip = document.getElementById('vmu-tooltip');
+    if (!tip?.classList.contains('vmu-tooltip-show') || matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      hideDlTooltip();
+      return;
+    }
+    const opacity = getComputedStyle(tip).opacity;
+    tooltipMotion?.cancel();
+    const motion = tip.animate([{ opacity }, { opacity: 0 }], {
+      duration: TOOLTIP_MOTION, easing: 'ease-out', fill: 'forwards',
+    });
+    tooltipMotion = motion;
+    motion.onfinish = () => { if (tooltipMotion === motion) hideDlTooltip(); };
+  }
+
+  function trackDlTooltip(event) {
+    if (!(event.target instanceof Element)) return;
+    const target = event.target.closest('[data-vmu-tip], [title]');
+    // A title is temporarily removed while its tooltip is managed here.
+    if (tooltipTarget?.contains(event.target) && (!target || target.contains(tooltipTarget))) {
+      if (event.relatedTarget instanceof Node && tooltipTarget.contains(event.relatedTarget)) return;
+      clearTimeout(tooltipTimer);
+      if (tooltipMotion?.playState === 'running' && tooltipMotion.effect.getTiming().fill === 'forwards') showDlTooltip();
+      else if (!document.getElementById('vmu-tooltip')?.classList.contains('vmu-tooltip-show')) {
+        tooltipTimer = setTimeout(showDlTooltip, TOOLTIP_DELAY);
+      }
+      return;
+    }
+    if (!target || target.matches(':disabled, [aria-disabled="true"]')) return;
     hideDlTooltip();
-  };
-  document.addEventListener('mouseover', e => {
-    if (!(e.target instanceof Element)) return;
-    // still inside the element whose title is currently shown (its title is already
-    // taken off, so closest('[title]') would find an ancestor instead)
-    if (_vmuTitleHoverEl && _vmuTitleHoverEl.contains(e.target)) return;
-    const el = e.target.closest('[title]');
-    if (!el || el.closest('#vmu-tooltip')) return;
-    const text = (el.getAttribute('title') || '').trim();
-    if (!text) return;
-    if (_vmuTitleHoverEl) _tipRelease();
-    _vmuTitleHoverEl = el;
-    el.setAttribute('data-vmu-tip', text);
-    el.removeAttribute('title');
-    // every title in the extension's own panels gets the current VK bubble
-    // (dark, rounded, wrapped) — the legacy black one is only for the old rows' explicit buttons
-    showDlTooltip(el, true);
+    tooltipTitle = target.getAttribute('title');
+    if (!(target.getAttribute('data-vmu-tip') || tooltipTitle || '').trim()) return;
+    tooltipTarget = target;
+    if (tooltipTitle !== null) target.removeAttribute('title');
+    tooltipTimer = setTimeout(showDlTooltip, TOOLTIP_DELAY);
+  }
+
+  function leaveDlTooltip(event) {
+    if (!tooltipTarget || !(event.target instanceof Node) || !tooltipTarget.contains(event.target)) return;
+    if (event.relatedTarget instanceof Node && tooltipTarget.contains(event.relatedTarget)) return;
+    clearTimeout(tooltipTimer);
+    tooltipTimer = setTimeout(fadeDlTooltip, TOOLTIP_DELAY);
+  }
+
+  document.addEventListener('pointerover', event => {
+    if (event.pointerType !== 'touch') trackDlTooltip(event);
   }, true);
-  document.addEventListener('mouseout', e => {
-    if (!_vmuTitleHoverEl) return;
-    // mouseout bubbles and fires on every child boundary crossing too — only
-    // actually leaving (relatedTarget outside the tracked element, or gone
-    // entirely) should hide the tooltip, not moving from the element onto
-    // its own child icon/text.
-    if (e.relatedTarget && _vmuTitleHoverEl.contains(e.relatedTarget)) return;
-    _tipRelease();
+  document.addEventListener('pointerout', leaveDlTooltip, true);
+  document.addEventListener('focusin', event => {
+    if (event.target instanceof Element && event.target.matches(':focus-visible')) trackDlTooltip(event);
   }, true);
-  // an element that is clicked, scrolled away or re-rendered under the pointer does not
-  // always get a mouseout — the bubble must not stay behind
-  document.addEventListener('mousedown', () => { if (_vmuTitleHoverEl) _tipRelease(); }, true);
-  window.addEventListener('scroll', () => { if (_vmuTitleHoverEl) _tipRelease(); }, { passive: true, capture: true });
-  setInterval(() => { if (_vmuTitleHoverEl && !_vmuTitleHoverEl.isConnected) _tipRelease(); }, 700);
+  document.addEventListener('focusout', leaveDlTooltip, true);
+  document.addEventListener('pointerdown', hideDlTooltip, true);
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') hideDlTooltip(); }, true);
+  window.addEventListener('scroll', hideDlTooltip, { passive: true, capture: true });
 
   function makeSingleDlBtn(row, extraClass) {
     const btn = document.createElement('button');
@@ -13559,8 +13566,6 @@
     for (const evt of ['mousedown', 'pointerdown', 'touchstart']) {
       btn.addEventListener(evt, e => { e.stopPropagation(); e.stopImmediatePropagation(); }, true);
     }
-    btn.addEventListener('mouseenter', () => showDlTooltip(btn));
-    btn.addEventListener('mouseleave', hideDlTooltip);
     btn.addEventListener('click', e => {
       e.preventDefault();
       e.stopPropagation();
@@ -15779,7 +15784,7 @@
   restoreVkTestIds(true);
   // a stamp of which build of this file the browser actually loaded, so a
   // page check can tell a reloaded extension from a stale one
-  document.documentElement.setAttribute('data-vmu-build', '2026-11-26-puerrito-catalog');
+  document.documentElement.setAttribute('data-vmu-build', '2026-11-28-autoplaylist');
   injectPlaylistCollectButton();
   injectPlaylistViewActions();
 
@@ -15866,6 +15871,7 @@
     return false;
   };
   new MutationObserver(muts => {
+    if (tooltipTarget && !tooltipTarget.isConnected) hideDlTooltip();
     // The initial upload UI must mount in this mutation batch, before a paint.
     // Catalog updates and reinjection after upload can remain throttled.
     try { mountNewUploadDialog(muts); } catch (err) { console.warn('[VK Multi Upload] upload dialog:', err); }

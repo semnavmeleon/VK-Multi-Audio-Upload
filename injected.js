@@ -2491,8 +2491,45 @@
 
   function getEditPlaylistBox() {
     const boxes = [...document.querySelectorAll('.popup_box_container')]
-      .filter(c => getComputedStyle(c).display !== 'none' && c.querySelector('.audio_pl_edit_box'));
+      .filter(box => box.querySelector('.audio_pl_edit_box')?.checkVisibility());
     return boxes[boxes.length - 1] || null;
+  }
+
+  async function waitForPlaylistEditor() {
+    const deadline = Date.now() + 8000;
+    do {
+      const editor = getEditPlaylistBox()?.querySelector('.audio_pl_edit_box');
+      if (editor) return editor;
+      await pause(100);
+    } while (Date.now() < deadline);
+    throw new Error('dialog_not_opened');
+  }
+
+  function findPlaylistSaveButton(editor) {
+    const box = editor.closest('.popup_box_container') || editor;
+    const controls = box.querySelector('.box_controls_buttons') || box;
+    return [...controls.querySelectorAll('button, [role="button"], input[type="submit"]')].find(button =>
+      button.checkVisibility() && /^(?:Сохранить|Создать)(?: плейлист)?$/i.test(
+        (button.getAttribute('aria-label') || button.value || button.textContent).trim()
+      )
+    );
+  }
+
+  async function savePlaylistEditor(editor) {
+    const deadline = Date.now() + 5000;
+    do {
+      const button = findPlaylistSaveButton(editor);
+      if (button && !button.disabled && button.getAttribute('aria-disabled') !== 'true') {
+        button.click();
+        while (editor.isConnected && editor.checkVisibility()) {
+          if (Date.now() >= deadline + 8000) throw new Error('save_playlist_timeout');
+          await pause(100);
+        }
+        return;
+      }
+      await pause(100);
+    } while (Date.now() < deadline);
+    throw new Error('save_btn_not_found');
   }
 
   async function loadPlaylistViaAudioGet(ownerId, playlistId, accessHash) {
@@ -2825,11 +2862,7 @@
   // given, tracks are picked by exact id instead of by name — see
   // selectTracksByAudioIds. Omitted = the original name-matching behavior.
   async function createPlaylistViaUI(title, description, trackNames, coverFile, audioIds) {
-    // Snapshot playlist cells that exist BEFORE creation — title-prefix
-    // matching below must never resolve to one of these, or an upload whose
-    // generated title happens to share a prefix with an older playlist
-    // (e.g. two different releases both titled "Легенды Про...CENTR ...")
-    // ends up dumping the new tracks into that unrelated old playlist.
+    // Exclude playlists already visible before creation, including namesakes.
     const preExistingIds = new Set(
       [...document.querySelectorAll('[data-testid="MusicPlaylistItem_Cell"][data-id]')]
         .map(c => c.getAttribute('data-id'))
@@ -2837,142 +2870,89 @@
 
     const createBtn = await waitForCreateBtn(8000);
 
-    const responseText = await new Promise((resolve, reject) => {
-      // Not seeing the save response is no longer fatal: VK's 18.11 build
-      // saves a new community playlist through a transport none of our hooks
-      // sees (checked live — the playlist appeared in the catalog while this
-      // promise sat waiting, and the whole creation then failed with
-      // save_playlist_timeout over a playlist that existed). The response is
-      // still the authoritative source of the new id when it does arrive, so
-      // it is waited for — but only briefly, and then the DOM lookup below
-      // gets its turn instead of being skipped by a throw.
-      const timeout = setTimeout(() => { __savePlaylistCapture = null; __editPlaylistCapture = null; trace('[vmu] save response not seen — falling back to the DOM'); resolve(null); }, 12000);
-      const onCapture = (text) => { clearTimeout(timeout); __savePlaylistCapture = null; __editPlaylistCapture = null; resolve(text); };
-      // The capture is armed only right before Save is clicked, NOT here.
-      // On a community page VK answers the save with act=playlists_edit_data
-      // (see the XHR hook), and OPENING this very dialog now fires the same
-      // act — checked live: one al_audio.php?act=playlists_edit_data XHR goes
-      // out the moment «Создать плейлист» is clicked. Armed up front, that
-      // request resolved this promise as if it were the save response: the
-      // flow then hunted for a playlist id that nothing had created yet and
-      // died with playlist_id_not_found, leaving VK's dialog standing open.
+    createBtn.click();
+    const dialog = await waitForPlaylistEditor();
+    const titleEl = dialog.querySelector('#ape_pl_name, input.ape_pl_input');
+    if (!titleEl) throw new Error('dialog_not_opened');
+    setVal(titleEl, title);
 
-      (async () => {
-        createBtn.click();
-        const dialog = await waitForEl('.audio_pl_edit_box', 4000);
-        if (!dialog) { clearTimeout(timeout); reject(new Error('dialog_not_opened')); return; }
-        trace('[vmu] create dialog opened');
+    const descEl = dialog.querySelector('#ape_pl_description, textarea.ape_pl_input');
+    if (descEl) setVal(descEl, description);
 
-        await pause(400);
+    if (coverFile) {
+      const coverEl = dialog.querySelector('.ape_cover, ._ape_cover');
+      if (coverEl) {
+        await new Promise((res) => {
+          const afterFileSet = existingButtons => {
+            // Wait for crop dialog and confirm it
+            let n = 0;
+            const t = setInterval(() => {
+              const cropBtn = findCropSaveBtn(existingButtons);
+              if (cropBtn) {
+                cropBtn.click();
+                clearInterval(t);
+                // Wait for crop to apply and cover thumbnail to update
+                let waitN = 0;
+                const waitT = setInterval(() => {
+                  const coverImg = dialog.querySelector('.ape_cover img, .ape_cover [style*="background"]');
+                  if (coverImg || ++waitN >= 10) { clearInterval(waitT); res(); }
+                }, 500);
+                return;
+              }
+              if (++n >= 30) { clearInterval(t); res(); }
+            }, 400);
+          };
+          const setFile = input => {
+            const existingButtons = new Set(findCropSaveBtnCandidates());
+            const dt = new DataTransfer();
+            dt.items.add(coverFile);
+            input.files = dt.files;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            afterFileSet(existingButtons);
+          };
 
-        // Fill title
-        const titleEl = dialog.querySelector('#ape_pl_name') || dialog.querySelector('input.ape_pl_input');
-        if (titleEl) setVal(titleEl, title);
+          const existingInput = coverEl.querySelector('input[type="file"]');
+          if (existingInput) { setFile(existingInput); return; }
 
-        // Fill description — use execCommand to preserve \n as real newline
-        const descEl = dialog.querySelector('#ape_pl_description') || dialog.querySelector('textarea.ape_pl_input');
-        if (descEl) {
-          descEl.focus();
-          descEl.select();
-          const inserted = document.execCommand('insertText', false, description);
-          if (!inserted || !descEl.value.includes('\n')) setVal(descEl, description);
-          descEl.blur();
-        }
+          const deleteBtn = coverEl.querySelector('button');
+          if (!deleteBtn) { res(); return; }
+          deleteBtn.click();
+          let tries = 0;
+          const waitInput = setInterval(() => {
+            const input = coverEl.querySelector('input[type="file"]');
+            if (input) { clearInterval(waitInput); setFile(input); return; }
+            if (++tries >= 20) { clearInterval(waitInput); res(); }
+          }, 200);
+        });
+        await pause(1000);
+      }
+    }
+    let responseText = null;
+    const onCapture = text => { responseText = text; };
+    __savePlaylistCapture = onCapture;
+    __editPlaylistCapture = onCapture;
+    try {
+      await savePlaylistEditor(dialog);
+    } finally {
+      if (__savePlaylistCapture === onCapture) __savePlaylistCapture = null;
+      if (__editPlaylistCapture === onCapture) __editPlaylistCapture = null;
+    }
 
-        // Inject cover via direct file-input assignment — see injectCoverFile
-        // for why: .ape_cover only mounts an <input type=file> once its slot
-        // is empty (true here, right after creating a brand-new playlist),
-        // and clicking the thumbnail itself does nothing, so the previous
-        // click-and-intercept-HTMLInputElement.prototype.click approach
-        // always timed out silently, leaving the playlist coverless.
-        if (coverFile) {
-          const coverEl = dialog.querySelector('.ape_cover, ._ape_cover');
-          if (coverEl) {
-            await new Promise((res) => {
-              const afterFileSet = () => {
-                // Wait for crop dialog and confirm it
-                let n = 0;
-                const t = setInterval(() => {
-                  const cropBtn = findCropSaveBtn();
-                  if (cropBtn) {
-                    cropBtn.click();
-                    clearInterval(t);
-                    // Wait for crop to apply and cover thumbnail to update
-                    let waitN = 0;
-                    const waitT = setInterval(() => {
-                      const coverImg = dialog.querySelector('.ape_cover img, .ape_cover [style*="background"]');
-                      if (coverImg || ++waitN >= 10) { clearInterval(waitT); res(); }
-                    }, 500);
-                    return;
-                  }
-                  if (++n >= 30) { clearInterval(t); res(); }
-                }, 400);
-              };
-              const setFile = input => {
-                const dt = new DataTransfer();
-                dt.items.add(coverFile);
-                input.files = dt.files;
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                afterFileSet();
-              };
-
-              const existingInput = coverEl.querySelector('input[type="file"]');
-              if (existingInput) { setFile(existingInput); return; }
-
-              const deleteBtn = coverEl.querySelector('button');
-              if (!deleteBtn) { res(); return; }
-              deleteBtn.click();
-              let tries = 0;
-              const waitInput = setInterval(() => {
-                const input = coverEl.querySelector('input[type="file"]');
-                if (input) { clearInterval(waitInput); setFile(input); return; }
-                if (++tries >= 20) { clearInterval(waitInput); res(); }
-              }, 200);
-            });
-            await pause(1000);
-          }
-        }
-
-        // Save playlist (no tracks yet)
-        await pause(300);
-        // Scoped to the dialog itself (falling back to dialog, never all the
-        // way out to `document`) — a page-wide '.FlatButton--primary' match
-        // could hit an unrelated button elsewhere on the page (VK reuses
-        // that class broadly), which risks clicking the wrong thing instead
-        // of just failing loudly with save_btn_not_found.
-        const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
-        const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
-        if (!saveBtn) { clearTimeout(timeout); reject(new Error('save_btn_not_found')); return; }
-        trace('[vmu] create dialog filled, saving: ' + (titleEl ? titleEl.value : '(no title field!)'));
-        __savePlaylistCapture = onCapture;
-        __editPlaylistCapture = onCapture;
-        saveBtn.click();
-      })().catch(err => { clearTimeout(timeout); reject(err); });
-    });
-
-    // Get playlist ID: primary = parse from the save-request's own network
-    // response (authoritative, immune to title collisions), fallback =
-    // find by title in DOM (data-id attr), restricted to cells that weren't
-    // already there before we started (see preExistingIds above).
-    // ~21 s of polling (was 6): with no network response to read, the only
-    // signal left is VK re-rendering its own playlist list, and on a
-    // community page with hundreds of playlists that takes its time.
     let result = null;
     for (let i = 0; i < 30; i++) {
-      result = (responseText && parsePlaylistIdFromResponse(responseText)) || findPlaylistInDOMByTitle(title, preExistingIds);
+      result = findPlaylistInDOMByTitle(title, preExistingIds);
       if (result) break;
       await pause(700);
+    }
+    if (!result && responseText) {
+      const captured = parsePlaylistIdFromResponse(responseText, title);
+      if (captured && !preExistingIds.has(captured.ownerId + '_' + captured.playlistId)) result = captured;
     }
     if (!result) throw new Error('playlist_id_not_found');
     trace('[vmu] Playlist created: ' + result.ownerId + '_' + result.playlistId);
 
     // PHASE 2: Add tracks via UI.
     if (trackNames.length > 0 || audioIds?.length) {
-      if (typeof window.nav?.reload === 'function') {
-        console.log('[vmu] SPA reload to reset APE state...');
-        window.nav.reload();
-        await pause(3000);
-      }
       const selectedCount = await addTracksViaEditDialog(title, description, result.ownerId, result.playlistId, trackNames, audioIds);
       // Extra field for callers that care how many tracks actually landed
       // (the auto-playlist caller ignores it).
@@ -3002,76 +2982,24 @@
 
   // Open edit dialog for the newly created playlist and select tracks by name
   async function addTracksViaEditDialog(playlistTitle, playlistDescription, ownerId, playlistId, trackNames, audioIds) {
-    // Wait for new playlist to appear in DOM (VK SPA updates after save)
-    let editBtn = null;
-    for (let i = 0; i < 20; i++) {
-      await pause(600);
-
-      // Primary: match by the exact playlist ID we already got back from
-      // creation — unambiguous, unlike title text which can collide with an
-      // older playlist that happens to share the same name prefix (e.g. two
-      // releases both titled "Легенды Про...CENTR ...").
-      for (const link of document.querySelectorAll('[data-id$="_' + playlistId + '"], [href*="_' + playlistId + '"]')) {
-        const cell = link.closest('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl') || link.parentElement?.parentElement;
-        const btn = findEditBtnInCell(cell);
-        if (btn) { editBtn = btn; break; }
-      }
-      if (editBtn) break;
-
-      // Fallback: match by title text (only reached if ID-based lookup found nothing)
-      for (const el of document.querySelectorAll('[data-testid="MusicPlaylistItem_Title"], .audio_pl__title, .audio_pl_item__title')) {
-        if (el.textContent?.trim().includes(playlistTitle.substring(0, 8))) {
-          const cell = el.closest('[data-testid="MusicPlaylistItem_Cell"], .audio_pl_item, .audio_pl') || el.parentElement?.parentElement;
-          const btn = findEditBtnInCell(cell);
-          if (btn) { editBtn = btn; break; }
-        }
-      }
-      if (editBtn) break;
-    }
-
-    if (!editBtn) {
-      console.warn('[vmu] addTracksViaEditDialog: edit button not found for playlist', playlistId, playlistTitle);
-      return;
-    }
-
-    console.log('[vmu] Opening edit dialog for playlist', playlistId);
-    editBtn.click();
-    const dialog = await waitForEl('.audio_pl_edit_box', 4000);
-    if (!dialog) { console.warn('[vmu] Edit dialog not opened'); return; }
-
-    // Give VK time to attach event handlers to the dialog
-    await pause(1000);
-
-    // Must click ape_add_audios_btn to reveal the ._ape_audio_item list.
-    const addAudiosBtn = dialog.querySelector('.ape_add_audios_btn');
-    if (!addAudiosBtn) { console.warn('[vmu] ape_add_audios_btn not found in edit dialog'); return; }
-    addAudiosBtn.click();
-
-    if (!await waitForEl('._ape_audio_item', 3000)) { console.warn('[vmu] add-audios item list not found'); return; }
-
+    const dialog = await openAddTracksPicker(playlistId, ownerId);
     const selectedCount = audioIds?.length
       ? await selectTracksByAudioIds(dialog, audioIds)
       : await selectTracksFromCommunityList(dialog, trackNames);
-    if (!selectedCount) console.warn('[vmu] No tracks matched in the community list for playlist', playlistId);
 
-    await pause(300);
+    if (!selectedCount) {
+      getEditPlaylistBox()?.querySelector('[data-testid="box_x_button"], .box_x_button')?.click();
+      throw new Error('no_matching_tracks');
+    }
 
-    // Set up capture for the audio.editPlaylist call that fires on save
-    const editPlaylistBody = await new Promise((resolve) => {
-      __editPlaylistCapture = (body) => resolve(body);
-      // Also set a timeout in case VK uses the old al_audio.php path
-      setTimeout(() => resolve(null), 10000);
-
-      // Must click Сохранить — without it tracks are NOT persisted. Scoped
-      // to the dialog itself, same reasoning as the create-phase save above.
-      const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
-      const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
-      if (!saveBtn) { console.warn('[vmu] Save button not found in edit dialog'); __editPlaylistCapture = null; resolve(null); return; }
-      console.log('[vmu] Clicking Save');
-      saveBtn.click();
-    });
-
-    await pause(1500);
+    let editPlaylistBody = null;
+    const onCapture = body => { editPlaylistBody = body; };
+    __editPlaylistCapture = onCapture;
+    try {
+      await savePlaylistEditor(dialog);
+    } finally {
+      if (__editPlaylistCapture === onCapture) __editPlaylistCapture = null;
+    }
 
     // Reorder tracks to match album order
     if (editPlaylistBody && (audioIds?.length || trackNames.length) > 1) {
@@ -3250,8 +3178,7 @@
     if (!editBtn) throw new Error('edit_button_not_found');
 
     editBtn.click();
-    const dialog = await waitForEl('.audio_pl_edit_box', 4000);
-    if (!dialog) throw new Error('dialog_not_opened');
+    const dialog = await waitForPlaylistEditor();
 
     // Give VK time to attach event handlers to the dialog
     await pause(1000);
@@ -3313,10 +3240,7 @@
       return 0;
     }
 
-    const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
-    if (!saveBtn) throw new Error('save_btn_not_found');
-    saveBtn.click();
-    await pause(1500);
+    await savePlaylistEditor(dialog);
 
     return selectedCount;
   }
@@ -3675,12 +3599,7 @@
       await pause(150);
     }
     if (!selectedCount) throw new Error('no_matches_relocated');
-
-    const boxLayout = dialog.closest('.box_layout') || dialog.closest('.box_body')?.parentElement;
-    const saveBtn = (boxLayout || dialog).querySelector('.FlatButton--primary');
-    if (!saveBtn) throw new Error('save_btn_not_found');
-    saveBtn.click();
-    await pause(1500);
+    await savePlaylistEditor(dialog);
 
     return selectedCount;
   }
@@ -3689,12 +3608,12 @@
   // MusicPlaylistItem_Cell has data-id="ownerId_playlistId" (e.g. "-206614096_32").
   function findPlaylistInDOMByTitle(title, excludeIds) {
     if (!title) return null;
-    const prefix = title.substring(0, 12).toLowerCase();
+    const wanted = title.trim().toLowerCase();
     for (const cell of document.querySelectorAll('[data-testid="MusicPlaylistItem_Cell"][data-id]')) {
       const id = cell.getAttribute('data-id');
       if (excludeIds && excludeIds.has(id)) continue; // pre-dates this creation — never a match
       const cellTitle = cell.querySelector('[data-testid="MusicPlaylistItem_Title"]')?.textContent?.trim().toLowerCase() || '';
-      if (cellTitle.includes(prefix)) {
+      if (cellTitle === wanted) {
         const m = id?.match(/^([-\d]+)_(\d+)$/);
         if (m) return { ownerId: m[1], playlistId: parseInt(m[2]) };
       }
@@ -3703,7 +3622,7 @@
   }
 
   // Fallback: parse playlist ID from network response text.
-  function parsePlaylistIdFromResponse(responseText) {
+  function parsePlaylistIdFromResponse(responseText, title) {
     const ownerMatch = location.href.match(/audios(-?\d+)/);
     const ownerId = ownerMatch ? ownerMatch[1] : String(window.vk?.id || '');
     try {
@@ -3712,14 +3631,19 @@
       // Look for a key named "id", "playlist_id", or similar first
       const findById = (v, depth = 0) => {
         if (depth > 5 || !v || typeof v !== 'object') return null;
-        for (const [k, val] of Object.entries(v)) {
-          if ((k === 'id' || k === 'playlist_id') && typeof val === 'number' && val > 0 && val < 10_000_000) return val;
+        const matchesTitle = [v.title, v.name].some(value =>
+          typeof value === 'string' && value.trim().toLowerCase() === title.trim().toLowerCase()
+        );
+        const id = Number(v.playlist_id ?? v.id);
+        if (matchesTitle && Number.isInteger(id) && id > 0 &&
+            (v.owner_id == null || String(v.owner_id) === ownerId)) return id;
+        for (const val of Object.values(v)) {
           const found = findById(val, depth + 1);
           if (found) return found;
         }
         return null;
       };
-      const playlistId = findById(Array.isArray(p1) ? p1[0] : p1);
+      const playlistId = findById(p1);
       if (playlistId) return { playlistId, ownerId };
     } catch {}
     // No blind "grab the first DOM cell" fallback here — that cell could be

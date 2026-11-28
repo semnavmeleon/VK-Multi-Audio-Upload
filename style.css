@@ -573,42 +573,6 @@ html.vmu-theme-light {
 .vmu-daily-count-warn { color: #e6a23c; font-weight: 700; }
 .vmu-action-btn svg { display: block; width: 12px; height: 12px; }
 
-/* Tooltip on hover — same VK overlay-style as elsewhere in the plugin */
-.vmu-action-btn::after,
-.vmu-action-btn::before {
-  position: absolute;
-  right: calc(100% + 5px);
-  top: 50%;
-  transform: translateY(-50%);
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity .15s;
-  z-index: 100;
-}
-.vmu-action-btn::after {
-  content: attr(data-vmu-tip);
-  white-space: nowrap;
-  font-size: 13px;
-  background: rgb(50,50,50);
-  /* Fixed light text, not var(--vmu-text) — this bubble is deliberately
-     dark-always (matches VK's own tooltip in both themes, see the note near
-     #vmu-tooltip below), so it must not pick up the light theme's dark
-     text color, which would make it unreadable against its own dark bg. */
-  color: #e1e3e6;
-  padding: 9px 12px 10px;
-  border-radius: 8px;
-  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
-}
-.vmu-action-btn::before {
-  content: '';
-  right: calc(100% - 1px);
-  border: 5px solid transparent;
-  border-left-color: rgb(50,50,50);
-  border-right: none;
-}
-.vmu-action-btn:hover::after,
-.vmu-action-btn:hover::before { opacity: 1; }
-
 /* ── Spinner ──────────────────────────────────────────────────────────────── */
 @keyframes vmu-spin { to { transform: rotate(360deg); } }
 .vmu-spin {
@@ -896,6 +860,14 @@ html.vmu-theme-light {
   padding: 8px 0 0;
 }
 
+.vmu-playlist-actions[data-vmu-playlist-surface="page"] {
+  --vmu-playlist-button-bg: var(--vkui--color_background_secondary_alpha, #e7e8ec);
+  --vmu-playlist-button-hover: var(--vkui--color_background_secondary_alpha--hover, #dfe1e6);
+  --vmu-playlist-button-active: var(--vkui--color_background_secondary_alpha--active, #d6d9df);
+  --vmu-playlist-button-text: var(--vkui--color_button_text, #222);
+  padding-top: 0;
+}
+
 .vmu-dupes-dialog-btn,
 .vmu-dl-dialog-btn {
   display: inline-flex;
@@ -905,8 +877,8 @@ html.vmu-theme-light {
   flex: 1;
   min-width: 0;
   height: 32px;
-  background: #ffffff;
-  color: #000000;
+  background: var(--vmu-playlist-button-bg, #fff);
+  color: var(--vmu-playlist-button-text, #000);
   border: none;
   border-radius: 8px;
   padding: 0;
@@ -916,7 +888,10 @@ html.vmu-theme-light {
 }
 .vmu-dupes-dialog-btn:hover:not(:disabled),
 .vmu-dl-dialog-btn:hover:not(:disabled) {
-  background: #f0f1f3;
+  background: var(--vmu-playlist-button-hover, #f0f1f3);
+}
+.vmu-playlist-actions[data-vmu-playlist-surface="page"] > button:active:not(:disabled) {
+  background: var(--vmu-playlist-button-active);
 }
 .vmu-dupes-dialog-btn:disabled,
 .vmu-dl-dialog-btn:disabled {
@@ -929,50 +904,6 @@ html.vmu-theme-light {
 /* Scanning state — click stops early and shows partial results */
 .vmu-dupes-dialog-btn-scanning { background: rgba(38,136,235,0.12); color: #2688eb; }
 .vmu-dupes-dialog-btn-scanning:hover:not(:disabled) { background: rgba(38,136,235,0.22); }
-
-/* Native-VK-style tooltip on hover for dialog buttons */
-.vmu-dupes-dialog-btn,
-.vmu-dl-dialog-btn { position: relative; }
-.vmu-dupes-dialog-btn::after,
-.vmu-dl-dialog-btn::after,
-.vmu-dupes-dialog-btn::before,
-.vmu-dl-dialog-btn::before {
-  position: absolute;
-  left: 50%;
-  transform: translateX(-50%);
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity .15s;
-  z-index: 100;
-}
-.vmu-dupes-dialog-btn::after,
-.vmu-dl-dialog-btn::after {
-  content: attr(data-vmu-tip);
-  white-space: nowrap;
-  font-weight: 400;
-  font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
-  bottom: calc(100% + 5px);
-  background: rgb(50,50,50);
-  color: #e1e3e6; /* fixed light text — this bubble stays dark-always, see note near #vmu-tooltip */
-  font-size: 13px;
-  padding: 9px 12px 10px;
-  border-radius: 8px;
-  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
-}
-.vmu-dupes-dialog-btn::before,
-.vmu-dl-dialog-btn::before {
-  content: '';
-  border: 6px solid transparent;
-  bottom: calc(100% - 1px);
-  border-top-color: rgb(50,50,50);
-  border-bottom: none;
-}
-.vmu-dupes-dialog-btn:hover:not(:disabled)::after,
-.vmu-dl-dialog-btn:hover:not(:disabled)::after,
-.vmu-dupes-dialog-btn:hover:not(:disabled)::before,
-.vmu-dl-dialog-btn:hover:not(:disabled)::before {
-  opacity: 1;
-}
 
 /* ── Playlist download page button ────────────────────────────────────────── */
 .vmu-dl-page-btn {
@@ -1169,12 +1100,7 @@ html.vmu-theme-light {
      fell through to the row's play surface underneath. Opt back in. */
   pointer-events: auto;
 }
-/* Mirrors VK's own .tt_w.tt_black tooltip (audio rows, top-bar icons, etc.):
-   60 % black, 3 px radius, ~12.5 px white text with 4/7/5/7 padding, no
-   shadow, 5×5 px CSS-triangle tail. The .vmu-tooltip-new modifier swaps to
-   vkui's tooltip look for buttons inside the new playlist modal.
-   .vmu-tooltip-below flips the tail when the tooltip is rendered under the
-   button (used when there's no room above). */
+/* Shared tooltip, positioned by the content script in the body portal. */
 #vmu-tooltip {
   position: fixed;
   top: 0;
@@ -1194,7 +1120,6 @@ html.vmu-theme-light {
   font-family: -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", sans-serif;
   opacity: 0;
   visibility: hidden;
-  transition: opacity .12s;
 }
 #vmu-tooltip::after {
   content: "";
@@ -1210,24 +1135,6 @@ html.vmu-theme-light {
 #vmu-tooltip.vmu-tooltip-below::after {
   top: auto;
   bottom: 100%;
-  border-top-color: transparent;
-  border-bottom-color: rgb(50,50,50);
-}
-#vmu-tooltip.vmu-tooltip-new {
-  background: rgb(50,50,50);
-  color: #e1e3e6; /* fixed light text — dark-always bubble, not theme-adaptive */
-  padding: 9px 12px 10px;
-  border-radius: 8px;
-  font-size: 13px;
-  line-height: 1.2;
-  box-shadow: 0 0 2px rgba(0,0,0,0.3), 0 4px 16px rgba(0,0,0,0.3);
-}
-/* long hints: wrap at explicit line breaks / a narrow width instead of one endless line */
-#vmu-tooltip.vmu-tooltip-new { white-space: pre-line; max-width: 250px; line-height: 1.35; }
-#vmu-tooltip.vmu-tooltip-new::after {
-  border-top-color: rgb(50,50,50);
-}
-#vmu-tooltip.vmu-tooltip-new.vmu-tooltip-below::after {
   border-top-color: transparent;
   border-bottom-color: rgb(50,50,50);
 }
@@ -2877,9 +2784,6 @@ html.vmu-theme-light .vmu-fx-preset-cat:hover,
 html.vmu-theme-light .vmu-check-copy:hover {
   background: #dfe1e5;
 }
-/* Tooltips (#vmu-tooltip, dialog-button ::after bubbles) stay dark-on-any-
-   background by design — matches VK's own tt_w/tt_black tooltip in both
-   themes — so they're deliberately left untouched here. */
 
 /* ── Duplicate-playlist confirmation (showDupPlaylistPrompt) ─────────────────
    Bottom-center slide-up card, styled like VK's own snackbars/dialogs via
